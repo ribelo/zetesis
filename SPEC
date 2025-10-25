@@ -1,0 +1,31 @@
+# Zetesis Specification
+
+## Authoring Guidelines
+- [REQ-ZE-SPEC-FORMAT] Write requirements as `- [slug] Sentence…` bullets grouped under clear headings. Keep slugs uppercase, hyphen-separated, and project-prefixed (e.g., `ZE-AREA-THEME`).
+- [REQ-ZE-SPEC-SCOPE] Document product behavior, constraints, and UX expectations. Leave implementation notes and backlog items for `TODO`.
+- [REQ-ZE-SPEC-TRACE] Reference related backlog items with their identifiers (e.g., `WP-CLI`, `T1`) to maintain traceability between `SPEC` and `TODO`.
+- [REQ-ZE-SPEC-CHANGES] When requirements change, update the relevant bullet in place and append a short `(Updated YYYY-MM-DD — reason)` note for historical context.
+- [REQ-ZE-SPEC-CADENCE] Review SPEC at least once per active sprint; record adjustments immediately so it never trails TODO by more than a day.
+
+### TODO Collaboration
+- [REQ-ZE-TODO-SYNC] Before adding or modifying backlog entries, scan the active requirements and ensure each TODO item points to the requirement it satisfies.
+- [REQ-ZE-TODO-STATUS] Keep TODO status markers (`[ ]`, `[~]`, `[x]`) in sync with progress and avoid removing completed entries; instead mark them `[x]` for traceability.
+- [REQ-ZE-TODO-REVIEWS] When TODO items complete a requirement, annotate the requirement with `(Verified via WP-…/T…)` so SPEC remains the single source of truth.
+
+### Storage & Indexing
+- [REQ-ZE-STORAGE-LMDB] Persist application metadata in LMDB via `heed`, housed at `$XDG_DATA_HOME/zetesis/lmdb/app`. LMDB is the source of truth for documents, chunks, ingest state, and schema version.
+- [REQ-ZE-STORAGE-FS] Store original KIO PDFs on the filesystem using content-addressed paths under `$XDG_DATA_HOME/zetesis/blobs/{silo}/{prefix}/{hash}.pdf`; LMDB tracks the blob location.
+- [REQ-ZE-INDEX-PER-SILO] Create one Milli index **per silo** at `$XDG_DATA_HOME/zetesis/milli/{silo}` using Milli’s LMDB-backed environment. Index paths are derived from the silo slug—do not store them in LMDB.
+- [REQ-ZE-INDEX-EMBEDDER] Configure each Milli index with vector backend Hannoy and a user-provided embedder defined in configuration (initially `gemini-embedding-001`, dimension 768). Manual vectors must appear under `_vectors.{embedder_key}`.
+- [REQ-ZE-INDEX-FIELDS] Chunk documents shall expose flat (or shallow) fields compatible with Milli flattening: `silo`, `case.nos[]`, `ruling.type`, `ruling.date` (ISO), `court.name`, `panel.names[]`, `party.names[]`, `party.roles[]`, `party.kv[]`, `procurement.subject`, `case.sign`, `eu_journal.ref`, `legal.refs[]`, `section`, `ord`, and `content`.
+- [REQ-ZE-INDEX-LITERAL] Store per-chunk embeddings only inside Milli; LMDB should not persist vector data beyond the `_vectors` payload sent to the index.
+
+### KIO Ingestion
+- [REQ-ZE-KIO-INGESTOR] Provide a KIO scraper that enumerates judgments via `POST /Home/GetResults` on https://orzeczenia.uzp.gov.pl/ (Kind=KIO) and walks detail pages for metadata and downloads. The retired FTP flow is not supported. (Updated 2025-10-25 — UZP disabled FTP on 2025-09-30)
+- [REQ-ZE-KIO-DISCOVERY] First-page requests must send `CountStats=True` to capture total hits; subsequent pages toggle `CountStats=False` for throughput. The scraper shall respect the portal’s 10-result page limit and advance with `Pg=1..n` using governed retries.
+- [REQ-ZE-KIO-CONCURRENCY] Implement a two-stage concurrent pipeline: one async task performs discovery and pushes document descriptors onto a bounded channel; N worker tasks (configurable, default ≥4) pull descriptors and download judgment PDFs plus detail HTML, applying `governor` rate limits and `backon` retries.
+- [REQ-ZE-KIO-DOCMETA] For each KIO document, capture multiple case numbers, ruling type (Wyrok/Postanowienie), ISO ruling date, panel names, participant names, procurement subject, case sign, EU journal reference, and extracted legal references before chunking.
+- [REQ-ZE-KIO-ASSETS] Persist only the primary judgment body (`/Home/PdfContent/{id}?Kind=KIO`) to the blob store; skip metrics PDFs unless specifically requested later.
+- [REQ-ZE-KIO-CHUNKS] Split KIO documents using the double-pass chunker into sections (`header`, `sentencja`, `uzasadnienie`, `other`) with stable ordering and byte/token offsets recorded in LMDB.
+- [REQ-ZE-KIO-PIPELINE] The ingest pipeline must: (1) persist doc/chunk metadata in LMDB (status `Pending`), (2) write PDFs to the blob store, (3) embed chunks via `ai-ox` Gemini (IO-bounded with governed concurrency), (4) upsert chunk docs into Milli with `_vectors.{embedder_key}` (configurable), and (5) mark LMDB status `Indexed`.
+- [REQ-ZE-KIO-DELETE] Hard deletes remove LMDB metadata, filesystem blobs, and Milli documents in a single operation.

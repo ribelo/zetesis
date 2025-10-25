@@ -1,0 +1,10 @@
+target/
+**/target/
+.idea/
+.vscode/
+*.swp
+*.swo
+Cargo.lock
+/logs/
+config/settings.toml
+data/

@@ -1,0 +1,63 @@
+[workspace]
+members = [
+    "crates/zetesis-app",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.82"
+
+[workspace.dependencies]
+ai-ox = { path = "../ai-ox/crates/ai-ox" }
+async-stream = "0.3.5"
+async-trait = "0.1.88"
+backon = "1.6.0"
+base64 = "0.22.1"
+bcrypt = "0.17.1"
+bincode = "2.0.1"
+blake3 = "1.8.2"
+bon = "3.8.1"
+bytes = "1.9.0"
+chrono = { version = "0.4.42", features = ["serde"] }
+comfy-table = "7.2.1"
+config = "0.15.18"
+csv = "1.4.0"
+futures = "0.3.31"
+futures-concurrency = "7.6.3"
+axum = { version = "0.7", features = ["http1", "macros", "tokio"] }
+clap = { version = "4.5", features = ["derive"] }
+directories = "6.0.0"
+governor = "0.10.1"
+heed = "0.22.1-nested-rtxns-5"
+milli = { git = "https://github.com/meilisearch/meilisearch.git", tag = "v1.24.0", package = "milli" }
+indoc = "2.0.7"
+itertools = "0.14.0"
+mime = "0.3.17"
+nalgebra = "0.34.1"
+owo-colors = "4.2.3"
+pdfium-render = "0.8.35"
+pulldown-cmark = "0.12.2"
+rayon = "1.11.0"
+regex = "1.12.2"
+reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls", "cookies", "http2"] }
+rustc-hash = "2.1.1"
+schemars = "1.0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.145"
+scraper = "0.24.0"
+strum = "0.27.2"
+strum_macros = "0.27.2"
+tap = "1.0.1"
+tempfile = "3.23.0"
+thiserror = "2.0.17"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
+tokenizers = { version = "0.22.1", default-features = false, features = ["http", "rustls-tls", "fancy-regex"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+unicode-normalization = "0.1.24"
+unicode-segmentation = "1.12.0"
+url = "2.5.2"
+uuid = { version = "1.7.0", features = ["serde", "v7"] }
+indicatif = "0.17.9"

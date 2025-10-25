@@ -1,0 +1,9 @@
+# Zetesis configuration scaffold.
+
+[server]
+# Address the HTTP server will bind to once implemented.
+listen_addr = "127.0.0.1:8080"
+
+[storage]
+# LMDB environment root; omit or comment to use the XDG default (`$XDG_DATA_HOME/zetesis/lmdb`).
+# path = "/home/you/.local/share/zetesis/lmdb"

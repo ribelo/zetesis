@@ -1,0 +1,20 @@
+
+Zetesis Execution Backlog — YYYY-MM-DD
+
+Priority legend: P0 = immediate; P1 = next; P2 = later
+
+Legend: [ ] = open · [~] = in progress · [x] = done
+
+## Authoring Checklist
+- Start each work package with a stable identifier (e.g., `WP-CLI — Command Surface`) so it can be referenced from `SPEC`.
+- Nest work items beneath their work package using `- [ ] ID: description (Pn)` to capture priority and ownership context.
+- When progress updates occur, change only the status marker `[ ]/[~]/[x]` and the trailing note; do not reorder completed items.
+- Link back to requirements in `SPEC` with parenthetical tags like `(covers REQ-ZE-CLI-FIRST)` for traceability.
+- Record handoff notes or follow-ups inline after an em dash (e.g., `— awaiting API keys`) instead of creating new bullets for commentary.
+- Revisit TODO daily on active projects; promote new work only after confirming SPEC stays in sync.
+
+## Work Package Template
+- WP-NAME — Concise title
+  - [ ] T1: Description of the task and acceptance criteria (P0)
+  - [ ] T2: Next task in the same scope (P1)
+  - [ ] Tn: Additional tasks as needed (Pn)
