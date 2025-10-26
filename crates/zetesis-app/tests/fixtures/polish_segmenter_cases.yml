@@ -1,0 +1,112 @@
+- label: legal-abbrev
+  text: >-
+    Zamawiający opisał w art. 24 ust. 1 pkt. 12 pzp. wymogi dot. dokumentów.
+  expected_sentences: 1
+
+- label: scientific-abbrev
+  text: >-
+    Plon wyniósł 500 kg s.m. na hektar. W kolejnych latach wzrósł.
+  expected_sentences: 2
+  expectations:
+    - index: 0
+      contains: "s.m."
+    - index: 1
+      starts_with: "W"
+
+- label: art-99-linebreak
+  text: |-
+    Art. 99 Pzp nakazuje stosować do zawierania
+    umowy ramowej, odpowiednio przepis; dotyczące udzielania zamówienia w trybie m.in.
+    przetargu ograniczonego, stąd uprawnione jest nawiązanie Odwołującego do przepisów
+    dotyczących udzielenia zamówienia publicznego w odniesieniu do postępowania
+    prowadzonego w celu zawarcia umowy ramowej.
+  expected_sentences: 1
+  expectations:
+    - index: 0
+      starts_with: "Art."
+    - index: 0
+      contains: "99 Pzp"
+
+- label: rozdz-bullet
+  text: |-
+    Rozdz.
+
+    8.
+
+    Termin wykonania zamówienia: „Umowa ramowa z Wybranym Oferentem
+    zostanie zawarta na okres prowadzenia inwestycji, wliczając w to okres gwarancji jakości dla
+    robót budowlanych, wykonanych w ramach inwestycji.”
+  expected_sentences: 1
+  expectations:
+    - index: 0
+      equals_normalized: "Rozdz. 8. Termin wykonania zamówienia: „Umowa ramowa z Wybranym Oferentem zostanie zawarta na okres prowadzenia inwestycji, wliczając w to okres gwarancji jakości dla robót budowlanych, wykonanych w ramach inwestycji.”"
+
+- label: comarch-s-a
+  text: |-
+    Co do drugiego dokumentu ComArch S.
+
+    A. wskazał, że przedłożony w ofercie Betacom certyfikat na str.
+
+    59 oferty nie obejmuje obrotu towarami, a taki był wymóg Zamawiającego.
+  expected_sentences: 1
+  expectations:
+    - index: 0
+      contains: "ComArch S. A."
+
+- label: powyzsze-si-wz
+  text: |-
+    Powyższe było w ocenie ComArch S.
+
+    A. niezgodne z wymogami SIWZ, gdzie wskazano, że wykonawcy mają podać „Typ/nazwę producenta przedmiotu dostawy/usługi”, w tym dane dotyczące sprzętu, oprogramowania: typ, nazwa producenta.
+  expected_sentences: 1
+  expectations:
+    - index: 0
+      contains: "ComArch S. A."
+
+- label: tabela-str-105
+  text: |-
+    Odwołujący S&T wskazał natomiast, że w jego ofercie w tabeli na str.
+
+    105 wyszczególnił „kartę dźwiękową: zintegrowaną, zgodnie z SB.
+  expected_sentences: 1
+  expectations:
+    - index: 0
+      contains: "str. 105"
+
+- label: poloczynska-31a
+  text: |-
+    Połczyńska 31A, Warszawa od rozstrzygnięcia przez zamawiającego Komendę Główną Policji, ul. Puławska 148/150 w Warszawie protestów: A. Konsorcjumfirm: S&T Services Polska Sp. z o.o. (Lider Konsorcjum) oraz Young Digital Planet S.
+
+    Az siedzibą dla Lidera Konsorcjumw Warszawie, ul. Młynarska 48 z dnia 23 stycznia 2008 r. B. ComArch S.
+
+    A. Al.
+
+    Jana Pawła II 39AwKrakowie z dnia 23 stycznia 2008 r. przy udziale ComArch S.
+
+    A. Al.
+
+    Jana Pawła II 39AwKrakowie i Konsorcjumfirm: S&T Services Polska Sp. z o.o. (Lider Konsorcjum) oraz Young Digital Planet S.
+
+    Az siedzibą dla Lidera Konsorcjumw Warszawie, ul. Młynarska 48, zgłaszających przystąpienie do postępowania odwoławczego po stronie zamawiającego.
+  expected_sentences: 1
+  expectations:
+    - index: 0
+      contains: "ComArch S. A."
+
+- label: al-jana-pawla
+  text: |-
+    Al. Jana Pawła II 39AwKrakowie z dnia 23 stycznia 2008 r. przy udziale ComArch S.
+
+    A.
+  expected_sentences: 1
+  expectations:
+    - index: 0
+      contains: "ComArch S. A."
+
+- label: poloczynska-uzasadnienie
+  text: |-
+    Połczyńska 31A, Warszawa na rzecz Komendy Głównej Policji, ul. Puławska 148/150 w Warszawie, stanowiącej uzasadnione koszty strony z tytułu wynagrodzenia pełnomocnika; 3) dokonać wpłaty kwoty XXX zł XXX gr (słownie: XXX) na rzecz Urzędu Zamówień Publicznych na rachunek dochodów własnych UZP, w tym A. kwoty XXX zł XXX gr (słownie: XXX) przez XXX B. kwoty XXX zł XXX gr (słownie: XXX) przez XXX 4) dokonać zwrotu kwoty 35 936 zł 00 gr (słownie: trzydzieści pięć tysięcy dziewięćset trzydzieści sześć złotych zero groszy) z rachunku dochodów własnych Urzędu Zamówień Publicznych na rzecz odwołujących się, w tym: A. kwoty 17 963 zł 00 gr (słownie: siedemnaście tysięcy dziewięćset sześćdziesiąt trzy złote zero groszy) na rzecz Konsorcjum firm: S&T Services Polska Sp. z o.o. (Lider Konsorcjum) oraz Young Digital Planet S.Az siedzibą dla Lidera Konsorcjumw Warszawie, ul. Młynarska 48 B. kwoty 17 963 zł 00 gr (słownie: siedemnaście tysięcy dziewięćset sześćdziesiąt trzy złote zero groszy) na rzecz Konsorcjum firm:Betacom S.A. i Instytut Edukacji Interaktywnej estakada.pl Sp. z o.o. z siedzibą dla Lidera Konsorcjum ul. Połczyńska 31A, Warszawa.
+  expected_sentences: 1
+  expectations:
+    - index: 0
+      contains: "Połczyńska 31A"

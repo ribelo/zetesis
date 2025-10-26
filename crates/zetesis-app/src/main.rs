@@ -1,15 +1,20 @@
-use std::{num::NonZeroUsize, pin::Pin, process, time::Duration};
+use std::{
+    env, fs, num::NonZeroUsize, path::Path, path::PathBuf, pin::Pin, process, time::Duration,
+};
 
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use serde_json::json;
 use thiserror::Error;
 use tracing_subscriber::{filter::LevelFilter, fmt};
 use zetesis_app::cli::{
     Cli, Commands, DEFAULT_KIO_SAOS_URL, DEFAULT_KIO_UZP_URL, FetchKioArgs, KioSource,
+    SegmentOutputFormat, SegmentPdfArgs,
 };
 use zetesis_app::ingestion::{
     KioEvent, KioSaosScraper, KioScrapeOptions, KioScraperSummary, KioUzpScraper,
 };
+use zetesis_app::services::{PolishSentenceSegmenter, cleanup_text, extract_text_from_pdf};
 use zetesis_app::{config, ingestion, server};
 
 #[tokio::main]
@@ -40,6 +45,18 @@ enum AppError {
     Server(#[from] server::ServerError),
     #[error(transparent)]
     Ingest(#[from] ingestion::IngestorError),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Pdf(#[from] zetesis_app::services::PdfTextError),
+    #[error("failed to read input file {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to resolve current working directory: {0}")]
+    WorkingDir(#[source] std::io::Error),
 }
 
 async fn run(cli: Cli) -> Result<(), AppError> {
@@ -53,6 +70,9 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Some(Commands::FetchKio(args)) => {
             run_fetch_kio(args, verbosity).await?;
         }
+        Some(Commands::SegmentPdf(args)) => {
+            run_segment_pdf(args)?;
+        }
         None => {
             Cli::print_help();
         }
@@ -63,6 +83,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
 
 async fn run_fetch_kio(args: FetchKioArgs, verbosity: u8) -> Result<(), AppError> {
     let worker_count = NonZeroUsize::new(args.workers.max(1)).expect("workers must always be >= 1");
+    let output_dir = resolve_output_dir(&args.output_path)?;
 
     let base_url = match args.source {
         KioSource::Uzp => args.url.clone(),
@@ -80,11 +101,12 @@ async fn run_fetch_kio(args: FetchKioArgs, verbosity: u8) -> Result<(), AppError
         url = %base_url,
         limit = ?args.limit,
         workers = worker_count.get(),
+        output = %output_dir.display(),
         "starting KIO portal scrape"
     );
 
     let builder = KioScrapeOptions::builder()
-        .output_dir(args.output_path.clone())
+        .output_dir(output_dir.clone())
         .worker_count(worker_count);
     let options = builder.maybe_limit(args.limit).build();
     let show_progress = verbosity == 0;
@@ -223,6 +245,56 @@ async fn run_fetch_kio(args: FetchKioArgs, verbosity: u8) -> Result<(), AppError
     Ok(())
 }
 
+fn run_segment_pdf(args: SegmentPdfArgs) -> Result<(), AppError> {
+    for input in &args.inputs {
+        let bytes = fs::read(input).map_err(|source| AppError::Io {
+            path: input.clone(),
+            source,
+        })?;
+
+        let raw_text = extract_text_from_pdf(&bytes)?;
+        let cleaned = cleanup_text(&raw_text);
+        let sentences = PolishSentenceSegmenter::split(&cleaned)
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+
+        match args.format {
+            SegmentOutputFormat::Text => render_sentences_text(input, &sentences),
+            SegmentOutputFormat::Json => render_sentences_json(input, &sentences)?,
+        }
+    }
+
+    Ok(())
+}
+
+fn render_sentences_text(path: &Path, sentences: &[String]) {
+    println!("== {} ==", path.display());
+    let mut first = true;
+    for sentence in sentences {
+        if !first {
+            println!();
+        }
+        println!("{}", sentence);
+        first = false;
+    }
+    println!();
+}
+
+fn render_sentences_json(path: &Path, sentences: &[String]) -> Result<(), AppError> {
+    let input = path.display().to_string();
+    for (idx, sentence) in sentences.iter().enumerate() {
+        let payload = json!({
+            "input": input,
+            "ord": idx,
+            "content": sentence,
+        });
+        println!("{}", serde_json::to_string(&payload)?);
+    }
+    Ok(())
+}
+
 fn determine_log_level(cli: &Cli) -> LevelFilter {
     match cli.command.as_ref() {
         Some(Commands::FetchKio(_)) => match cli.verbose {
@@ -234,6 +306,12 @@ fn determine_log_level(cli: &Cli) -> LevelFilter {
         Some(Commands::Serve(_)) => match cli.verbose {
             0 => LevelFilter::INFO,
             1 => LevelFilter::DEBUG,
+            _ => LevelFilter::TRACE,
+        },
+        Some(Commands::SegmentPdf(_)) => match cli.verbose {
+            0 => LevelFilter::OFF,
+            1 => LevelFilter::INFO,
+            2 => LevelFilter::DEBUG,
             _ => LevelFilter::TRACE,
         },
         None => match cli.verbose {
@@ -265,4 +343,13 @@ fn effective_length(limit: Option<u64>, hint: Option<u64>) -> Option<u64> {
         (None, Some(h)) => Some(h),
         (None, None) => None,
     }
+}
+
+fn resolve_output_dir(path: &Path) -> Result<PathBuf, AppError> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+
+    let cwd = env::current_dir().map_err(AppError::WorkingDir)?;
+    Ok(cwd.join(path))
 }

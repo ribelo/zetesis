@@ -1,3 +1,6 @@
+use super::pdf::{PdfTextError, extract_text_from_pdf};
+use super::polish_segmenter::PolishSentenceSplit;
+use super::text_cleanup::cleanup_text;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use strum::{AsRefStr, EnumIter, EnumString};
@@ -85,6 +88,12 @@ impl ProcessorError {
     }
 }
 
+impl From<PdfTextError> for ProcessorError {
+    fn from(error: PdfTextError) -> Self {
+        ProcessorError::Message(error.to_string())
+    }
+}
+
 /// Trait implemented by silo-specific processors. All operations are pure and
 /// side-effect free.
 pub trait SiloDocumentProcessor: Send + Sync {
@@ -119,13 +128,23 @@ impl SiloDocumentProcessor for KioProcessor {
     }
 
     fn preprocess(&self, raw: &[u8]) -> Result<Doc, ProcessorError> {
-        let text = String::from_utf8_lossy(raw).into_owned();
-        Ok(Doc::new("", text))
+        let text = extract_text_from_pdf(raw)?;
+        let normalized = cleanup_text(&text);
+        Ok(Doc::new("", normalized))
     }
 
     fn chunk(&self, doc: &Doc) -> Result<Vec<Chunk>, ProcessorError> {
-        let chunk = Chunk::new(Some("full".to_string()), 0, doc.text.clone());
-        Ok(vec![chunk])
+        let mut chunks = Vec::new();
+
+        for (idx, sentence) in doc.text.split_polish_sentences().into_iter().enumerate() {
+            let trimmed = sentence.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            chunks.push(Chunk::new(None::<String>, idx as u32, trimmed));
+        }
+
+        Ok(chunks)
     }
 }
 

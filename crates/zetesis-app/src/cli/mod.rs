@@ -46,6 +46,8 @@ pub enum Commands {
     Serve(ServeArgs),
     /// Fetch KIO documents from upstream sources.
     FetchKio(FetchKioArgs),
+    /// Segment local PDF documents and inspect the resulting sentences.
+    SegmentPdf(SegmentPdfArgs),
 }
 
 #[derive(Debug, Args)]
@@ -79,4 +81,22 @@ pub struct FetchKioArgs {
     /// Upstream source to pull from (`uzp` >= 2021, `saos` < 2021).
     #[arg(long, value_enum, default_value_t = KioSource::Uzp)]
     pub source: KioSource,
+}
+
+/// Segment local documents and print the resulting chunks.
+#[derive(Debug, Args)]
+pub struct SegmentPdfArgs {
+    /// One or more PDF files to inspect.
+    #[arg(required = true)]
+    pub inputs: Vec<PathBuf>,
+    /// Output rendering (human-readable text or JSON lines).
+    #[arg(long, value_enum, default_value_t = SegmentOutputFormat::Text)]
+    pub format: SegmentOutputFormat,
+}
+
+/// How to render chunk output.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum SegmentOutputFormat {
+    Text,
+    Json,
 }

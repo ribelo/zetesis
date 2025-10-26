@@ -57,3 +57,7 @@ unicode-segmentation = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 pulldown-cmark = { workspace = true }
+once_cell = { workspace = true }
+
+[dev-dependencies]
+serde_yaml = "0.9"

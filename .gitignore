@@ -8,3 +8,5 @@ Cargo.lock
 /logs/
 config/settings.toml
 data/
+
+third_party/

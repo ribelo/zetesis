@@ -16,7 +16,7 @@ use governor::{
     clock::DefaultClock,
     state::{InMemoryState, NotKeyed},
 };
-use reqwest::{Client, Url};
+use reqwest::{Client, Url, header};
 use serde::Deserialize;
 use tokio::{
     fs,
@@ -238,14 +238,15 @@ impl KioSaosScraper {
     ) -> Result<DiscoveryStats, KioScrapeError> {
         let mut page = 0usize;
         let mut discovered = 0usize;
-        let target = limit.unwrap_or(usize::MAX);
+        let mut target = compute_discovery_target(limit, None);
         let mut total_available = None;
 
         loop {
             let response = self.fetch_results_page(page).await?;
 
-            if total_available.is_none() && response.total_available.is_some() {
-                total_available = response.total_available;
+            if let Some(total) = response.total_available {
+                total_available = Some(total);
+                target = compute_discovery_target(limit, total_available);
             }
 
             if response.items.is_empty() {
@@ -501,22 +502,92 @@ impl KioSaosScraper {
             .await
     }
 
+    async fn fetch_pdf_len(&self, pdf_path: &str) -> Result<Option<u64>, KioScrapeError> {
+        let url = self
+            .base_url
+            .join(pdf_path)
+            .map_err(|err| KioScrapeError::UrlJoin {
+                path: pdf_path.to_string(),
+                source: Arc::new(err),
+            })?;
+
+        let limiter = self.rate_limiter.clone();
+        let client = self.http.clone();
+        let stage = "saos_pdf_head";
+
+        let attempt = {
+            let limiter = limiter.clone();
+            let client = client.clone();
+            let url = url.clone();
+            move || {
+                let limiter = limiter.clone();
+                let client = client.clone();
+                let url = url.clone();
+                async move {
+                    limiter.until_ready().await;
+                    let response = client
+                        .head(url.clone())
+                        .send()
+                        .await
+                        .map_err(|err| KioScrapeError::request(stage, err))?;
+
+                    let status = response.status();
+                    if !status.is_success() {
+                        return Err(KioScrapeError::HttpStatus {
+                            stage,
+                            status: status.as_u16(),
+                        });
+                    }
+
+                    let len = response
+                        .headers()
+                        .get(header::CONTENT_LENGTH)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok());
+                    Ok(len)
+                }
+            }
+        };
+
+        attempt
+            .retry(self.backoff.clone())
+            .sleep(sleep)
+            .notify(|err: &KioScrapeError, delay: Duration| {
+                warn!(
+                    silo = SILO_SLUG,
+                    stage,
+                    delay_ms = delay.as_millis(),
+                    error = %err,
+                    "retrying SAOS PDF head request"
+                );
+            })
+            .await
+    }
+
     async fn process_task(
         &self,
         task: &SaosDocumentTask,
         output_dir: &Path,
     ) -> Result<ProcessOutcome, KioScrapeError> {
         let output_path = output_dir.join(format!("{}.pdf", task.doc_id));
-        if fs::try_exists(&output_path).await? {
-            info!(
-                silo = SILO_SLUG,
-                stage = "skip_existing",
-                doc_id = task.doc_id,
-                path = %output_path.display(),
-                "skipping existing PDF"
-            );
-            return Ok(ProcessOutcome::SkippedExisting);
-        }
+        let existing_len = if fs::try_exists(&output_path).await? {
+            match fs::metadata(&output_path).await {
+                Ok(meta) => Some(meta.len()),
+                Err(err) => {
+                    warn!(
+                        silo = SILO_SLUG,
+                        stage = "local_metadata_failed",
+                        doc_id = task.doc_id,
+                        path = %output_path.display(),
+                        error = %err,
+                        "failed to read local PDF metadata; re-downloading"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         info!(
             silo = SILO_SLUG,
@@ -534,6 +605,55 @@ impl KioSaosScraper {
 
         let pdf_path =
             build_pdf_path(&detail).map_err(|err| KioScrapeError::parse("pdf_path", err))?;
+
+        if let Some(local_len) = existing_len {
+            match self.fetch_pdf_len(&pdf_path).await {
+                Ok(Some(remote_len)) if remote_len == local_len => {
+                    info!(
+                        silo = SILO_SLUG,
+                        stage = "skip_existing",
+                        doc_id = task.doc_id,
+                        path = %output_path.display(),
+                        local_len,
+                        remote_len,
+                        "skipping existing PDF; size matches upstream"
+                    );
+                    return Ok(ProcessOutcome::SkippedExisting);
+                }
+                Ok(Some(remote_len)) => {
+                    warn!(
+                        silo = SILO_SLUG,
+                        stage = "size_mismatch",
+                        doc_id = task.doc_id,
+                        path = %output_path.display(),
+                        local_len,
+                        remote_len,
+                        "existing PDF size differs from upstream; re-downloading"
+                    );
+                }
+                Ok(None) => {
+                    warn!(
+                        silo = SILO_SLUG,
+                        stage = "size_unknown",
+                        doc_id = task.doc_id,
+                        path = %output_path.display(),
+                        local_len,
+                        "remote PDF size unavailable; re-downloading"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        silo = SILO_SLUG,
+                        stage = "size_check_failed",
+                        doc_id = task.doc_id,
+                        path = %output_path.display(),
+                        local_len,
+                        error = %err,
+                        "failed to inspect remote PDF size; re-downloading"
+                    );
+                }
+            }
+        }
 
         info!(
             silo = SILO_SLUG,
@@ -784,4 +904,38 @@ async fn ensure_dir(dir: &Path) -> Result<(), KioScrapeError> {
     }
     fs::create_dir_all(dir).await?;
     Ok(())
+}
+
+fn compute_discovery_target(limit: Option<usize>, total_available: Option<usize>) -> usize {
+    match (limit, total_available) {
+        (Some(l), Some(t)) => l.min(t),
+        (Some(l), None) => l,
+        (None, Some(t)) => t,
+        (None, None) => usize::MAX,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_discovery_target;
+
+    #[test]
+    fn target_uses_limit_when_only_limit() {
+        assert_eq!(compute_discovery_target(Some(500), None), 500);
+    }
+
+    #[test]
+    fn target_uses_total_when_unbounded() {
+        assert_eq!(compute_discovery_target(None, Some(28860)), 28860);
+    }
+
+    #[test]
+    fn target_uses_min_of_limit_and_total() {
+        assert_eq!(compute_discovery_target(Some(250), Some(28860)), 250);
+    }
+
+    #[test]
+    fn target_defaults_to_max_when_unknown() {
+        assert_eq!(compute_discovery_target(None, None), usize::MAX);
+    }
 }
