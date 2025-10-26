@@ -58,6 +58,7 @@ url = { workspace = true }
 uuid = { workspace = true }
 pulldown-cmark = { workspace = true }
 once_cell = { workspace = true }
+icu_segmenter = { workspace = true }
 
 [dev-dependencies]
 serde_yaml = "0.9"

@@ -13,11 +13,17 @@ fn pdfium_extracts_polish_text() {
     };
 
     assert!(
-        text.contains("Sygn. akt:KIO 2777/11"),
-        "expected case reference in extracted text"
+        text.contains("Sygn. akt: KIO 2777/11"),
+        "expected case reference in extracted text; got snippet: {:?}",
+        &text[..text.len().min(160)]
     );
     assert!(
         text.contains("Pełnomocnik"),
         "expected diacritics in extracted text"
+    );
+    assert!(
+        text.contains("Konsorcjum firm"),
+        "expected glued tokens to be separated; got snippet: {:?}",
+        &text[..text.len().min(200)]
     );
 }

@@ -1,7 +1,8 @@
+use std::cmp::Ordering;
 use std::env;
 use std::path::{Path, PathBuf};
 
-use pdfium_render::prelude::{Pdfium, PdfiumError};
+use pdfium_render::prelude::{PdfRect, Pdfium, PdfiumError};
 use thiserror::Error;
 
 /// Errors emitted while extracting text from PDF documents.
@@ -30,24 +31,198 @@ pub fn extract_text_from_pdf(bytes: &[u8]) -> Result<String, PdfTextError> {
 
     let mut buffer = String::new();
 
-    for (index, page) in document.pages().iter().enumerate() {
-        let page_text = page
-            .text()
-            .map_err(|source| PdfTextError::PageText {
-                page_index: index,
-                source,
-            })?
-            .all();
+    for (page_index, page) in document.pages().iter().enumerate() {
+        let mut page_text = String::new();
+        render_page(&mut page_text, page_index, &page)?;
+
+        if page_text.is_empty() {
+            continue;
+        }
 
         if buffer.is_empty() {
             buffer.push_str(&page_text);
-        } else if !page_text.is_empty() {
+        } else {
             buffer.push_str("\n\n");
             buffer.push_str(&page_text);
         }
     }
 
     Ok(buffer)
+}
+
+fn render_page(
+    out: &mut String,
+    page_index: usize,
+    page: &pdfium_render::prelude::PdfPage,
+) -> Result<(), PdfTextError> {
+    let text = page
+        .text()
+        .map_err(|source| PdfTextError::PageText { page_index, source })?;
+
+    let chars = text.chars();
+    if chars.len() == 0 {
+        return Ok(());
+    }
+
+    let mut glyphs = Vec::with_capacity(chars.len());
+
+    for ch in chars.iter() {
+        let Some(value) = ch.unicode_char() else {
+            continue;
+        };
+
+        // Skip nulls and carriage returns; they do not carry visible content.
+        if value == '\u{0}' || value == '\r' {
+            continue;
+        }
+
+        let rect = ch
+            .tight_bounds()
+            .or_else(|primary| ch.loose_bounds().map_err(|_| primary))
+            .map_err(|source| PdfTextError::PageText { page_index, source })?;
+
+        let baseline = ch
+            .origin_y()
+            .map_err(|source| PdfTextError::PageText { page_index, source })?
+            .value;
+
+        glyphs.push(Glyph {
+            ch: value,
+            rect,
+            baseline,
+        });
+    }
+
+    if glyphs.is_empty() {
+        return Ok(());
+    }
+
+    let mut heights = Vec::with_capacity(glyphs.len());
+    for glyph in &glyphs {
+        let height = glyph.height();
+        if height.is_finite() && height > 0.0 {
+            heights.push(height);
+        }
+    }
+
+    let median_height = median(heights).unwrap_or(8.0);
+    let line_threshold = (median_height * 0.8).max(1.0);
+    let paragraph_threshold = (median_height * 1.8).max(line_threshold * 1.5);
+
+    let mut gap_samples = Vec::new();
+    for pair in glyphs.windows(2) {
+        let prev = &pair[0];
+        let next = &pair[1];
+        if same_line(prev, next, line_threshold) {
+            let gap = next.left() - prev.right();
+            if gap.is_finite() && gap > 0.0 {
+                gap_samples.push(gap);
+            }
+        }
+    }
+
+    let median_gap = median(gap_samples);
+    let default_gap = (median_height * 0.45).max(0.75);
+    let space_threshold = median_gap
+        .map(|gap| gap.max(default_gap * 0.8))
+        .unwrap_or(default_gap);
+
+    let mut prev: Option<&Glyph> = None;
+
+    for glyph in &glyphs {
+        if glyph.ch == '\n' {
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            prev = None;
+            continue;
+        }
+
+        if let Some(prev_glyph) = prev {
+            let baseline_delta = (glyph.baseline - prev_glyph.baseline).abs();
+            if baseline_delta > line_threshold {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                if baseline_delta > paragraph_threshold && !out.ends_with("\n\n") {
+                    out.push('\n');
+                }
+            } else {
+                let gap = glyph.left() - prev_glyph.right();
+                if gap > space_threshold
+                    && !prev_glyph.ch.is_whitespace()
+                    && !glyph.ch.is_whitespace()
+                {
+                    out.push(' ');
+                }
+            }
+        }
+
+        out.push(glyph.ch);
+        prev = Some(glyph);
+    }
+
+    Ok(())
+}
+
+struct Glyph {
+    ch: char,
+    rect: PdfRect,
+    baseline: f32,
+}
+
+impl Glyph {
+    #[inline]
+    fn left(&self) -> f32 {
+        self.rect.left().value
+    }
+
+    #[inline]
+    fn right(&self) -> f32 {
+        self.rect.right().value
+    }
+
+    #[inline]
+    fn height(&self) -> f32 {
+        (self.rect.top().value - self.rect.bottom().value).abs()
+    }
+}
+
+fn same_line(current: &Glyph, previous: &Glyph, threshold: f32) -> bool {
+    (current.baseline - previous.baseline).abs() <= threshold
+}
+
+fn median(values: Vec<f32>) -> Option<f32> {
+    if values.is_empty() {
+        return None;
+    }
+
+    let mut values = values
+        .into_iter()
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+
+    if values.is_empty() {
+        return None;
+    }
+
+    values.sort_by(|a, b| partial_cmp(*a, *b));
+    let mid = values.len() / 2;
+    Some(values[mid])
+}
+
+fn partial_cmp(a: f32, b: f32) -> Ordering {
+    a.partial_cmp(&b).unwrap_or_else(|| {
+        if a.is_nan() && b.is_nan() {
+            Ordering::Equal
+        } else if a.is_nan() {
+            Ordering::Greater
+        } else if b.is_nan() {
+            Ordering::Less
+        } else {
+            Ordering::Equal
+        }
+    })
 }
 
 fn load_pdfium() -> Result<Pdfium, PdfiumError> {

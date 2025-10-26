@@ -27,6 +27,28 @@
     - index: 0
       contains: "99 Pzp"
 
+- label: dz-u-not-break
+  text: |-
+    Stosownie do art. 194 i 195 ustawy z dnia 29 stycznia 2004 r. - Prawo zamówień publicznych (Dz. U. z 2006 r. Nr 164, poz. 1 163, z późn. zm.) na niniejszy wyrok - w terminie 7 dni od dnia jego doręczenia - przysługuje skarga za pośrednictwem Prezesa Urzędu Zamówień Publicznych do Sądu Okręgowego w Warszawie.
+  expected_sentences: 1
+  expectations:
+    - index: 0
+      contains: "Dz. U. z 2006 r."
+
+- label: enumerated-list
+  text: |-
+    Orzeka: 1. oddala odwołania 2. kosztami postępowania obciąża Odwołującego 3) zasądza koszty 4 ) dokonać wpłaty kwoty 100 zł na rzecz Skarbu Państwa. A. kwoty 50 zł przez Odwołującego B. kwoty 50 zł przez Zamawiającego.
+  expected_sentences: 7
+  expectations:
+    - index: 1
+      starts_with: "1. oddala"
+    - index: 4
+      starts_with: "4 )"
+    - index: 5
+      starts_with: "A. kwoty"
+    - index: 6
+      starts_with: "B. kwoty"
+
 - label: rozdz-bullet
   text: |-
     Rozdz.
@@ -88,10 +110,14 @@
     Jana Pawła II 39AwKrakowie i Konsorcjumfirm: S&T Services Polska Sp. z o.o. (Lider Konsorcjum) oraz Young Digital Planet S.
 
     Az siedzibą dla Lidera Konsorcjumw Warszawie, ul. Młynarska 48, zgłaszających przystąpienie do postępowania odwoławczego po stronie zamawiającego.
-  expected_sentences: 1
+  expected_sentences: 9
   expectations:
-    - index: 0
-      contains: "ComArch S. A."
+    - index: 3
+      starts_with: "B. ComArch"
+    - index: 5
+      starts_with: "A. Al. Jana"
+    - index: 8
+      starts_with: "S. Az"
 
 - label: al-jana-pawla
   text: |-
@@ -106,7 +132,13 @@
 - label: poloczynska-uzasadnienie
   text: |-
     Połczyńska 31A, Warszawa na rzecz Komendy Głównej Policji, ul. Puławska 148/150 w Warszawie, stanowiącej uzasadnione koszty strony z tytułu wynagrodzenia pełnomocnika; 3) dokonać wpłaty kwoty XXX zł XXX gr (słownie: XXX) na rzecz Urzędu Zamówień Publicznych na rachunek dochodów własnych UZP, w tym A. kwoty XXX zł XXX gr (słownie: XXX) przez XXX B. kwoty XXX zł XXX gr (słownie: XXX) przez XXX 4) dokonać zwrotu kwoty 35 936 zł 00 gr (słownie: trzydzieści pięć tysięcy dziewięćset trzydzieści sześć złotych zero groszy) z rachunku dochodów własnych Urzędu Zamówień Publicznych na rzecz odwołujących się, w tym: A. kwoty 17 963 zł 00 gr (słownie: siedemnaście tysięcy dziewięćset sześćdziesiąt trzy złote zero groszy) na rzecz Konsorcjum firm: S&T Services Polska Sp. z o.o. (Lider Konsorcjum) oraz Young Digital Planet S.Az siedzibą dla Lidera Konsorcjumw Warszawie, ul. Młynarska 48 B. kwoty 17 963 zł 00 gr (słownie: siedemnaście tysięcy dziewięćset sześćdziesiąt trzy złote zero groszy) na rzecz Konsorcjum firm:Betacom S.A. i Instytut Edukacji Interaktywnej estakada.pl Sp. z o.o. z siedzibą dla Lidera Konsorcjum ul. Połczyńska 31A, Warszawa.
-  expected_sentences: 1
+  expected_sentences: 11
   expectations:
     - index: 0
       contains: "Połczyńska 31A"
+    - index: 1
+      starts_with: "3) dokonać"
+    - index: 3
+      starts_with: "A. kwoty"
+    - index: 5
+      starts_with: "B. kwoty"

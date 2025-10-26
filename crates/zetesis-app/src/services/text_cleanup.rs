@@ -1,22 +1,56 @@
+use bon::Builder;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use unicode_normalization::UnicodeNormalization;
 
+#[derive(Debug, Clone, Builder)]
+pub struct CleanupOptions {
+    #[builder(default = true)]
+    pub unicode_normalize: bool,
+    #[builder(default = true)]
+    pub strip_page_markers: bool,
+    #[builder(default = true)]
+    pub join_hyphenated_breaks: bool,
+    #[builder(default = true)]
+    pub collapse_whitespace: bool,
+}
+
+impl Default for CleanupOptions {
+    fn default() -> Self {
+        Self {
+            unicode_normalize: true,
+            strip_page_markers: true,
+            join_hyphenated_breaks: true,
+            collapse_whitespace: true,
+        }
+    }
+}
+
 /// Normalizes raw document text extracted from PDFs before sentence splitting.
 pub fn cleanup_text(text: &str) -> String {
-    let mut cleaned = text
+    cleanup_text_with_options(text, &CleanupOptions::default())
+}
+
+/// Cleans up text according to the provided [`CleanupOptions`].
+pub fn cleanup_text_with_options(text: &str, options: &CleanupOptions) -> String {
+    let mut cleaned: String = text
         .chars()
         .filter(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r'))
-        .collect::<String>();
+        .collect();
 
-    cleaned = cleaned.nfkc().collect::<String>();
-    cleaned = remove_page_numbers(&cleaned);
-    cleaned = join_hyphenated_words(&cleaned);
-    cleaned = trim_apostrophe_spacing(&cleaned);
-    cleaned = normalize_money_groups(&cleaned);
-
-    cleaned = cleaned.replace('\n', " ");
-    cleaned = collapse_whitespace(&cleaned);
+    if options.unicode_normalize {
+        cleaned = cleaned.nfkc().collect();
+    }
+    if options.strip_page_markers {
+        cleaned = remove_page_numbers(&cleaned);
+    }
+    if options.join_hyphenated_breaks {
+        cleaned = join_hyphenated_words(&cleaned);
+    }
+    cleaned = insert_missing_spaces(&cleaned);
+    if options.collapse_whitespace {
+        cleaned = collapse_whitespace(&cleaned);
+    }
 
     cleaned.trim().to_string()
 }
@@ -31,23 +65,21 @@ fn join_hyphenated_words(input: &str) -> String {
     RE.replace_all(input, "$1$2").into_owned()
 }
 
-fn trim_apostrophe_spacing(input: &str) -> String {
-    static RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+'(\w)").unwrap());
-    RE.replace_all(input, "'$1").into_owned()
-}
-
-fn normalize_money_groups(input: &str) -> String {
-    static RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"(\d{1,3})\s+(\d{3}),\s*(\d{2})\s*(zł)").unwrap());
-    RE.replace_all(input, "$1$2,$3 $4").into_owned()
+fn insert_missing_spaces(input: &str) -> String {
+    static RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"(?u)(\p{Ll})([A-ZŁŚĆŻŹÓĘĄŃ])([ąćęłńóśżź])").unwrap()
+    });
+    RE.replace_all(input, "$1 $2$3").into_owned()
 }
 
 fn collapse_whitespace(input: &str) -> String {
-    input
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .replace('"', "\"")
+    let mut collapsed = Vec::with_capacity(input.len() / 4);
+    for fragment in input.split_whitespace() {
+        if !fragment.is_empty() {
+            collapsed.push(fragment);
+        }
+    }
+    collapsed.join(" ")
 }
 
 #[cfg(test)]
@@ -61,5 +93,11 @@ mod tests {
             cleanup_text(input),
             "Tak informacja odwołującego różniła się."
         );
+    }
+
+    #[test]
+    fn joins_hyphenated_breaks() {
+        let input = "charak-\nter";
+        assert_eq!(cleanup_text(input), "charakter");
     }
 }

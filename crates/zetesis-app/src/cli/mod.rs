@@ -92,6 +92,9 @@ pub struct SegmentPdfArgs {
     /// Output rendering (human-readable text or JSON lines).
     #[arg(long, value_enum, default_value_t = SegmentOutputFormat::Text)]
     pub format: SegmentOutputFormat,
+    /// Include byte offsets for each segment.
+    #[arg(long)]
+    pub with_offsets: bool,
 }
 
 /// How to render chunk output.

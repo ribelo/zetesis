@@ -12,10 +12,10 @@ pub use context::{
 pub use normalize::{ChunkNormalizer, DocNormalizer};
 pub use orchestrator::run_for_silo;
 pub use pdf::{PdfTextError, extract_text_from_pdf};
-pub use polish_segmenter::{PolishSentenceSegmenter, PolishSentenceSplit};
+pub use polish_segmenter::{PolishSentenceSegmenter, PolishSentenceSplit, SegmenterOptions};
 pub use processor::processor_for;
 pub use processor::{
     Chunk, Doc, IndexRecord, KioProcessor, ProcessorError, Silo, SiloDocumentProcessor,
     ToIndexRecord,
 };
-pub use text_cleanup::cleanup_text;
+pub use text_cleanup::{CleanupOptions, cleanup_text, cleanup_text_with_options};

@@ -1,5 +1,6 @@
 use std::{
-    env, fs, num::NonZeroUsize, path::Path, path::PathBuf, pin::Pin, process, time::Duration,
+    env, fs, num::NonZeroUsize, ops::Range, path::Path, path::PathBuf, pin::Pin, process,
+    time::Duration,
 };
 
 use futures::StreamExt;
@@ -254,43 +255,61 @@ fn run_segment_pdf(args: SegmentPdfArgs) -> Result<(), AppError> {
 
         let raw_text = extract_text_from_pdf(&bytes)?;
         let cleaned = cleanup_text(&raw_text);
-        let sentences = PolishSentenceSegmenter::split(&cleaned)
+        let segments = PolishSentenceSegmenter::ranges(&cleaned)
             .into_iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+            .map(|range| {
+                let content = cleaned[range.clone()].to_string();
+                (range, content)
+            })
+            .filter(|(_, content)| !content.is_empty())
             .collect::<Vec<_>>();
 
         match args.format {
-            SegmentOutputFormat::Text => render_sentences_text(input, &sentences),
-            SegmentOutputFormat::Json => render_sentences_json(input, &sentences)?,
+            SegmentOutputFormat::Text => render_sentences_text(input, &segments, args.with_offsets),
+            SegmentOutputFormat::Json => {
+                render_sentences_json(input, &segments, args.with_offsets)?
+            }
         }
     }
 
     Ok(())
 }
 
-fn render_sentences_text(path: &Path, sentences: &[String]) {
+fn render_sentences_text(path: &Path, segments: &[(Range<usize>, String)], with_offsets: bool) {
     println!("== {} ==", path.display());
     let mut first = true;
-    for sentence in sentences {
+    for (range, sentence) in segments {
         if !first {
             println!();
         }
-        println!("{}", sentence);
+        if with_offsets {
+            println!("{:>8}..{:>8} {}", range.start, range.end, sentence);
+        } else {
+            println!("{}", sentence);
+        }
         first = false;
     }
     println!();
 }
 
-fn render_sentences_json(path: &Path, sentences: &[String]) -> Result<(), AppError> {
+fn render_sentences_json(
+    path: &Path,
+    segments: &[(Range<usize>, String)],
+    with_offsets: bool,
+) -> Result<(), AppError> {
     let input = path.display().to_string();
-    for (idx, sentence) in sentences.iter().enumerate() {
-        let payload = json!({
-            "input": input,
-            "ord": idx,
-            "content": sentence,
-        });
-        println!("{}", serde_json::to_string(&payload)?);
+    for (idx, (range, sentence)) in segments.iter().enumerate() {
+        let mut payload = serde_json::Map::new();
+        payload.insert("input".to_string(), json!(&input));
+        payload.insert("ord".to_string(), json!(idx));
+        payload.insert("content".to_string(), json!(sentence));
+
+        if with_offsets {
+            payload.insert("start".to_string(), json!(range.start));
+            payload.insert("end".to_string(), json!(range.end));
+        }
+
+        println!("{}", serde_json::Value::Object(payload).to_string());
     }
     Ok(())
 }
