@@ -2,7 +2,9 @@ use std::cmp::Ordering;
 use std::env;
 use std::path::{Path, PathBuf};
 
-use pdfium_render::prelude::{PdfRect, Pdfium, PdfiumError};
+use image::codecs::png::PngEncoder;
+use image::{ColorType, ImageEncoder};
+use pdfium_render::prelude::{PdfRect, PdfRenderConfig, Pdfium, PdfiumError};
 use thiserror::Error;
 
 /// Errors emitted while extracting text from PDF documents.
@@ -20,6 +22,39 @@ pub enum PdfTextError {
         #[source]
         source: PdfiumError,
     },
+}
+
+/// Errors emitted while rendering PDF pages into PNG images.
+#[derive(Debug, Error)]
+pub enum PdfRenderError {
+    #[error("failed to load Pdfium runtime: {0}")]
+    Library(#[from] PdfiumError),
+
+    #[error("failed to load PDF document: {0}")]
+    Document(#[source] PdfiumError),
+
+    #[error("failed to render page {page_index}: {source}")]
+    PageRender {
+        page_index: usize,
+        #[source]
+        source: PdfiumError,
+    },
+
+    #[error("failed to encode page {page_index} as PNG: {source}")]
+    Encode {
+        page_index: usize,
+        #[source]
+        source: image::ImageError,
+    },
+}
+
+/// In-memory representation of a rendered PDF page.
+#[derive(Debug, Clone)]
+pub struct PdfPageImage {
+    pub page_index: usize,
+    pub width: u32,
+    pub height: u32,
+    pub png_data: Vec<u8>,
 }
 
 /// Extracts UTF-8 text from a PDF byte slice using Pdfium while preserving Polish diacritics.
@@ -48,6 +83,46 @@ pub fn extract_text_from_pdf(bytes: &[u8]) -> Result<String, PdfTextError> {
     }
 
     Ok(buffer)
+}
+
+/// Renders each page of a PDF into a PNG image with the requested target width.
+pub fn render_pdf_to_png_images(
+    bytes: &[u8],
+    target_width: u32,
+) -> Result<Vec<PdfPageImage>, PdfRenderError> {
+    let pdfium = load_pdfium()?;
+    let document = pdfium
+        .load_pdf_from_byte_slice(bytes, None)
+        .map_err(PdfRenderError::Document)?;
+
+    let mut images = Vec::with_capacity(document.pages().len() as usize);
+
+    for (page_index, page) in document.pages().iter().enumerate() {
+        let render_config = PdfRenderConfig::new().set_target_width(target_width as i32);
+
+        let bitmap = page
+            .render_with_config(&render_config)
+            .map_err(|source| PdfRenderError::PageRender { page_index, source })?;
+
+        let width = bitmap.width() as u32;
+        let height = bitmap.height() as u32;
+        let rgba = bitmap.as_rgba_bytes();
+
+        let mut encoded = Vec::new();
+        let encoder = PngEncoder::new(&mut encoded);
+        encoder
+            .write_image(&rgba, width, height, ColorType::Rgba8.into())
+            .map_err(|source| PdfRenderError::Encode { page_index, source })?;
+
+        images.push(PdfPageImage {
+            page_index,
+            width,
+            height,
+            png_data: encoded,
+        });
+    }
+
+    Ok(images)
 }
 
 fn render_page(

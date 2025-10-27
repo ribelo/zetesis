@@ -518,7 +518,10 @@ fn preceding_allows_marker(slice: &str, offset: usize) -> bool {
         .rev()
         .find(|ch| !ch.is_whitespace())
         .map_or(true, |ch| {
-            matches!(ch, ':' | ';' | '(' | ')' | '[' | ']' | '-' | '–' | '—' | '\n')
+            matches!(
+                ch,
+                ':' | ';' | '(' | ')' | '[' | ']' | '-' | '–' | '—' | '\n'
+            )
         })
 }
 

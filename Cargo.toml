@@ -11,6 +11,7 @@ rust-version = "1.82"
 
 [workspace.dependencies]
 ai-ox = { path = "../ai-ox/crates/ai-ox" }
+deepinfra-ox = { path = "../ai-ox/crates/deepinfra-ox" }
 async-stream = "0.3.5"
 async-trait = "0.1.88"
 backon = "1.6.0"
@@ -61,5 +62,5 @@ unicode-segmentation = "1.12.0"
 url = "2.5.2"
 uuid = { version = "1.7.0", features = ["serde", "v7"] }
 indicatif = "0.17.9"
-once_cell = "1.19.0"
 icu_segmenter = { version = "2.0.0", default-features = false, features = ["compiled_data"] }
+image = { version = "0.25.4", default-features = false, features = ["png"] }

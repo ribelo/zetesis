@@ -1,5 +1,6 @@
 pub mod context;
 pub mod normalize;
+pub mod ocr;
 pub mod orchestrator;
 pub mod pdf;
 pub mod polish_segmenter;
@@ -10,8 +11,11 @@ pub use context::{
     EmbedClient, EmbedService, Governors, PipelineContext, PipelineError, PipelineResult,
 };
 pub use normalize::{ChunkNormalizer, DocNormalizer};
+pub use ocr::{OcrConfig, OcrError, OcrPageResult, OcrSpan, run_ocr_document};
 pub use orchestrator::run_for_silo;
-pub use pdf::{PdfTextError, extract_text_from_pdf};
+pub use pdf::{
+    PdfPageImage, PdfRenderError, PdfTextError, extract_text_from_pdf, render_pdf_to_png_images,
+};
 pub use polish_segmenter::{PolishSentenceSegmenter, PolishSentenceSplit, SegmenterOptions};
 pub use processor::processor_for;
 pub use processor::{

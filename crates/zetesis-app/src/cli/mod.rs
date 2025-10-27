@@ -48,6 +48,8 @@ pub enum Commands {
     FetchKio(FetchKioArgs),
     /// Segment local PDF documents and inspect the resulting sentences.
     SegmentPdf(SegmentPdfArgs),
+    /// Render a PDF page-by-page, OCR via DeepInfra, and emit JSON results.
+    OcrPdf(OcrPdfArgs),
 }
 
 #[derive(Debug, Args)]
@@ -95,6 +97,29 @@ pub struct SegmentPdfArgs {
     /// Include byte offsets for each segment.
     #[arg(long)]
     pub with_offsets: bool,
+}
+
+/// OCR a PDF via DeepInfra and print JSON to stdout.
+#[derive(Debug, Args)]
+pub struct OcrPdfArgs {
+    /// PDF document to process.
+    #[arg(value_name = "PDF")]
+    pub input: PathBuf,
+    /// Override the DeepInfra model identifier.
+    #[arg(long, default_value = "deepseek-ai/DeepSeek-OCR")]
+    pub model: String,
+    /// Target width (pixels) when rasterizing each PDF page.
+    #[arg(long, default_value_t = 2048)]
+    pub render_width: u32,
+    /// Maximum edge length (pixels) when preparing images for OCR.
+    #[arg(long, default_value_t = 1280)]
+    pub image_max_edge: u32,
+    /// Optional image detail hint passed to the model (`low`, `high`, `auto`).
+    #[arg(long)]
+    pub detail: Option<String>,
+    /// Maximum tokens requested from the model.
+    #[arg(long, default_value_t = 4096)]
+    pub max_tokens: u32,
 }
 
 /// How to render chunk output.

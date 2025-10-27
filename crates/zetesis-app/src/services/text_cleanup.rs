@@ -1,6 +1,6 @@
 use bon::Builder;
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Clone, Builder)]
@@ -56,19 +56,19 @@ pub fn cleanup_text_with_options(text: &str, options: &CleanupOptions) -> String
 }
 
 fn remove_page_numbers(input: &str) -> String {
-    static RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n\s*\d+\s*(?:/\s*\d+)?\s*\n").unwrap());
+    static RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\n\s*\d+\s*(?:/\s*\d+)?\s*\n").unwrap());
     RE.replace_all(input, "\n").into_owned()
 }
 
 fn join_hyphenated_words(input: &str) -> String {
-    static RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)(\w+)-\s*\n\s*(\w+)").unwrap());
+    static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)(\w+)-\s*\n\s*(\w+)").unwrap());
     RE.replace_all(input, "$1$2").into_owned()
 }
 
 fn insert_missing_spaces(input: &str) -> String {
-    static RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"(?u)(\p{Ll})([A-ZŁŚĆŻŹÓĘĄŃ])([ąćęłńóśżź])").unwrap()
-    });
+    static RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?u)(\p{Ll})([A-ZŁŚĆŻŹÓĘĄŃ])([ąćęłńóśżź])").unwrap());
     RE.replace_all(input, "$1 $2$3").into_owned()
 }
 

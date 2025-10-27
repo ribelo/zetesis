@@ -9,13 +9,16 @@ use serde_json::json;
 use thiserror::Error;
 use tracing_subscriber::{filter::LevelFilter, fmt};
 use zetesis_app::cli::{
-    Cli, Commands, DEFAULT_KIO_SAOS_URL, DEFAULT_KIO_UZP_URL, FetchKioArgs, KioSource,
+    Cli, Commands, DEFAULT_KIO_SAOS_URL, DEFAULT_KIO_UZP_URL, FetchKioArgs, KioSource, OcrPdfArgs,
     SegmentOutputFormat, SegmentPdfArgs,
 };
 use zetesis_app::ingestion::{
     KioEvent, KioSaosScraper, KioScrapeOptions, KioScraperSummary, KioUzpScraper,
 };
-use zetesis_app::services::{PolishSentenceSegmenter, cleanup_text, extract_text_from_pdf};
+use zetesis_app::services::{
+    OcrConfig, OcrError, PolishSentenceSegmenter, cleanup_text, extract_text_from_pdf,
+    run_ocr_document,
+};
 use zetesis_app::{config, ingestion, server};
 
 #[tokio::main]
@@ -50,6 +53,10 @@ enum AppError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Pdf(#[from] zetesis_app::services::PdfTextError),
+    #[error(transparent)]
+    PdfRender(#[from] zetesis_app::services::PdfRenderError),
+    #[error(transparent)]
+    Ocr(#[from] OcrError),
     #[error("failed to read input file {path}: {source}")]
     Io {
         path: PathBuf,
@@ -73,6 +80,9 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         }
         Some(Commands::SegmentPdf(args)) => {
             run_segment_pdf(args)?;
+        }
+        Some(Commands::OcrPdf(args)) => {
+            run_ocr_pdf(args).await?;
         }
         None => {
             Cli::print_help();
@@ -275,6 +285,25 @@ fn run_segment_pdf(args: SegmentPdfArgs) -> Result<(), AppError> {
     Ok(())
 }
 
+async fn run_ocr_pdf(args: OcrPdfArgs) -> Result<(), AppError> {
+    let config = OcrConfig {
+        model: args.model.clone(),
+        render_width: args.render_width,
+        image_max_edge: args.image_max_edge,
+        detail: args.detail.clone(),
+        max_tokens: args.max_tokens,
+    };
+
+    let results = run_ocr_document(&args.input, &config).await?;
+
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    serde_json::to_writer_pretty(&mut handle, &results)?;
+    println!();
+
+    Ok(())
+}
+
 fn render_sentences_text(path: &Path, segments: &[(Range<usize>, String)], with_offsets: bool) {
     println!("== {} ==", path.display());
     let mut first = true;
@@ -328,6 +357,12 @@ fn determine_log_level(cli: &Cli) -> LevelFilter {
             _ => LevelFilter::TRACE,
         },
         Some(Commands::SegmentPdf(_)) => match cli.verbose {
+            0 => LevelFilter::OFF,
+            1 => LevelFilter::INFO,
+            2 => LevelFilter::DEBUG,
+            _ => LevelFilter::TRACE,
+        },
+        Some(Commands::OcrPdf(_)) => match cli.verbose {
             0 => LevelFilter::OFF,
             1 => LevelFilter::INFO,
             2 => LevelFilter::DEBUG,
