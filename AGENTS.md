@@ -100,6 +100,7 @@
 - `cargo build` compiles debug binaries; `cargo run -- <cmd>` invokes CLI helpers.
 - `cargo fmt` (or `-- --check`) and `cargo clippy --all-targets --all-features` enforce style.
 - `cargo test` runs unit/integration suites; narrow scope with module paths while iterating.
+- We use `jj` (Jujutsu) for version control; prefer `jj st`, `jj commit`, and `jj squash` flows over direct Git porcelain. Keep the Git mirror clean by syncing via `jj git push`.
 
 ## Style & Boundaries
 - Trust rustfmt (4 spaces): `snake_case` functions, `CamelCase` types, SCREAMING_SNAKE_CASE constants.
