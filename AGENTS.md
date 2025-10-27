@@ -1,13 +1,5 @@
 # Engineering Workflow and Safety Guidelines
 
-## 0) Workflow: Reason → Decision → Plan → Code (in this order)
-- **Start with a concise checklist (3-7 bullets) outlining high-level sub-tasks before substantive work; keep items conceptual.**
-- **State all constraints, invariants, and budgets** (latency, throughput, memory). List unknowns and explicit assumptions.
-- **Compare 1–2 minimal designs.** For each, identify failure modes and document architectural commitments (timeouts, backpressure, cancellation).
-- **After the above, outline modules and tests. Write code last.**
-
----
-
 ## 1) Safety Rules
 
 - **Simple control flow only:** no `goto`, recursion, or equivalents. Maintain an acyclic call graph for provable boundedness.

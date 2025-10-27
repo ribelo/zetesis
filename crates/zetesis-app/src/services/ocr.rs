@@ -1,4 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::{
+    io::Cursor,
+    num::NonZeroU32,
+    path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
+};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -8,17 +13,31 @@ use deepinfra_ox::{
     MessageContent as DeepInfraMessageContent, MessageContentPart as DeepInfraMessageContentPart,
     TokenUsage,
 };
+use governor::{
+    Quota, RateLimiter,
+    clock::DefaultClock,
+    state::{InMemoryState, NotKeyed},
+};
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngDecoder;
 use image::imageops::FilterType;
 use image::{GenericImageView, ImageDecoder};
 use regex::Regex;
 use serde::Serialize;
-use std::io::Cursor;
-use std::sync::OnceLock;
 use thiserror::Error;
 
 use super::{PdfPageImage, render_pdf_to_png_images};
+
+type OcrRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
+
+fn deepinfra_rate_limiter() -> &'static Arc<OcrRateLimiter> {
+    static LIMITER: OnceLock<Arc<OcrRateLimiter>> = OnceLock::new();
+    LIMITER.get_or_init(|| {
+        let quota = Quota::per_second(NonZeroU32::new(200).expect("non-zero quota"))
+            .allow_burst(NonZeroU32::new(200).expect("non-zero burst"));
+        Arc::new(RateLimiter::direct(quota))
+    })
+}
 
 /// Result produced for each OCR-processed page.
 #[derive(Debug, Clone, Serialize)]
@@ -122,6 +141,7 @@ pub async fn run_ocr_document(
     };
 
     let client = DeepInfra::load_from_env().map_err(|_| OcrError::MissingApiKey)?;
+    let limiter = Arc::clone(deepinfra_rate_limiter());
 
     let mut results = Vec::with_capacity(pages.len());
 
@@ -149,6 +169,7 @@ pub async fn run_ocr_document(
         request.max_tokens = Some(config.max_tokens);
         request.temperature = Some(0.0);
 
+        limiter.until_ready().await;
         let response = client.send(&request).await?;
 
         let content = response
