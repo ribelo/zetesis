@@ -26,6 +26,7 @@ use image::{ColorType, GenericImageView, ImageDecoder, ImageEncoder};
 use regex::Regex;
 use serde::Serialize;
 use thiserror::Error;
+use tracing::{debug, warn};
 
 use super::{PdfPageImage, render_pdf_to_png_images};
 
@@ -219,68 +220,8 @@ impl OcrService for DeepInfraOcr {
             let mut page_results = Vec::with_capacity(pages.len());
 
             for page in pages {
-                let prepared = prepare_image_for_ocr(
-                    &input.id,
-                    page.page_index,
-                    &page,
-                    config.image_max_edge,
-                )?;
-
-                let mut parts = Vec::with_capacity(2);
-                let mut image_url = ImageUrl::new(format!(
-                    "data:{};base64,{}",
-                    prepared.mime_type,
-                    BASE64_STANDARD.encode(&prepared.data)
-                ));
-
-                if let Some(detail) = config.detail.as_ref() {
-                    image_url = image_url.with_detail(detail.to_string());
-                }
-
-                parts.push(DeepInfraMessageContentPart::ImageUrl { image_url });
-                parts.push(DeepInfraMessageContentPart::Text {
-                    text: "<|grounding|>Convert the document to markdown.".to_string(),
-                });
-
-                let message = DeepInfraMessage::user(DeepInfraMessageContent::Parts(parts));
-                let mut request = DeepInfraChatRequest::new(config.model.clone(), vec![message]);
-                request.max_tokens = Some(config.max_tokens);
-                request.temperature = Some(0.0);
-
-                self.limiter.until_ready().await;
-                let response = self.client.send(&request).await?;
-
-                let content = response
-                    .choices
-                    .first()
-                    .and_then(|choice| choice.message.content.clone());
-
-                let raw_text = content
-                    .as_ref()
-                    .and_then(|content| flatten_message_content_text(content));
-
-                let (plain_text_str, spans) = match raw_text.as_deref() {
-                    Some(raw) => parse_deepseek_output(raw, prepared.width, prepared.height),
-                    None => (String::new(), Vec::new()),
-                };
-
-                let plain_text = if plain_text_str.trim().is_empty() {
-                    None
-                } else {
-                    Some(plain_text_str)
-                };
-
-                page_results.push(OcrPageResult {
-                    page_index: page.page_index,
-                    render_width: page.width,
-                    render_height: page.height,
-                    ocr_width: prepared.width,
-                    ocr_height: prepared.height,
-                    mime_type: prepared.mime_type,
-                    plain_text,
-                    spans,
-                    usage: response.usage.clone(),
-                });
+                let result = self.process_page(input, config, &page).await?;
+                page_results.push(result);
             }
 
             docs.push(OcrDocumentResult {
@@ -290,6 +231,124 @@ impl OcrService for DeepInfraOcr {
         }
 
         Ok(docs)
+    }
+}
+
+impl DeepInfraOcr {
+    async fn process_page(
+        &self,
+        input: &OcrInput,
+        config: &OcrConfig,
+        page: &PdfPageImage,
+    ) -> Result<OcrPageResult, OcrError> {
+        let prepared =
+            prepare_image_for_ocr(&input.id, page.page_index, page, config.image_max_edge)?;
+
+        let default_prompt = config
+            .detail
+            .clone()
+            .unwrap_or_else(|| "<|grounding|>Convert the document to markdown.".to_string());
+        let fallback_prompt = "<|grounding|>OCR this image.".to_string();
+
+        let mut attempt = 0;
+        let mut prompt = default_prompt.clone();
+        let mut max_tokens = config.max_tokens;
+
+        loop {
+            let response = self
+                .invoke_model(&prepared, &prompt, max_tokens, &config.model)
+                .await?;
+
+            let usage = response.usage.clone();
+            let content = response
+                .choices
+                .first()
+                .and_then(|choice| choice.message.content.clone());
+
+            let raw_text = content.as_ref().and_then(flatten_message_content_text);
+
+            let (plain_text_str, spans) = match raw_text.as_deref() {
+                Some(raw) => parse_deepseek_output(raw, prepared.width, prepared.height),
+                None => (String::new(), Vec::new()),
+            };
+
+            let plain_text = if plain_text_str.trim().is_empty() {
+                None
+            } else {
+                Some(plain_text_str.clone())
+            };
+
+            let truncated = usage
+                .as_ref()
+                .and_then(|u| u.completion_tokens)
+                .map_or(false, |tokens| tokens >= u64::from(max_tokens));
+            let looks_noise = plain_text.as_deref().map_or(false, text_is_numeric_noise);
+
+            if attempt == 0 && (truncated || looks_noise) {
+                warn!(
+                    doc_id = %input.id,
+                    page = page.page_index,
+                    truncated,
+                    looks_noise,
+                    "retrying OCR page with fallback prompt",
+                );
+                attempt += 1;
+                prompt = fallback_prompt.clone();
+                max_tokens = max_tokens.min(2048).max(512);
+                continue;
+            }
+
+            return Ok(OcrPageResult {
+                page_index: page.page_index,
+                render_width: page.width,
+                render_height: page.height,
+                ocr_width: prepared.width,
+                ocr_height: prepared.height,
+                mime_type: prepared.mime_type,
+                plain_text,
+                spans,
+                usage,
+            });
+        }
+    }
+
+    async fn invoke_model(
+        &self,
+        prepared: &PreparedOcrImage,
+        prompt: &str,
+        max_tokens: u32,
+        model: &str,
+    ) -> Result<deepinfra_ox::ChatCompletionResponse, OcrError> {
+        let mut parts = Vec::with_capacity(2);
+        let image_url = ImageUrl::new(format!(
+            "data:{};base64,{}",
+            prepared.mime_type,
+            BASE64_STANDARD.encode(&prepared.data)
+        ));
+
+        parts.push(DeepInfraMessageContentPart::ImageUrl { image_url });
+        parts.push(DeepInfraMessageContentPart::Text {
+            text: prompt.to_string(),
+        });
+
+        let message = DeepInfraMessage::user(DeepInfraMessageContent::Parts(parts));
+        let mut request = DeepInfraChatRequest::new(model.to_string(), vec![message]);
+        request.max_tokens = Some(max_tokens);
+        request.temperature = Some(0.0);
+
+        self.limiter.until_ready().await;
+        let response = self.client.send(&request).await?;
+        if let Some(usage) = response.usage.as_ref() {
+            debug!(
+                prompt = prompt,
+                max_tokens,
+                completion_tokens = usage.completion_tokens,
+                prompt_tokens = usage.prompt_tokens,
+                total_tokens = usage.total_tokens,
+                "deepinfra ocr invocation usage"
+            );
+        }
+        Ok(response)
     }
 }
 
@@ -510,4 +569,28 @@ fn jpeg_bytes_to_page(id: &str, bytes: &[u8]) -> Result<PdfPageImage, OcrError> 
         height,
         png_data,
     })
+}
+
+fn text_is_numeric_noise(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let mut has_alpha = false;
+    let mut has_digit = false;
+
+    for ch in trimmed.chars() {
+        if ch.is_ascii_alphabetic() {
+            has_alpha = true;
+            break;
+        } else if ch.is_ascii_digit() {
+            has_digit = true;
+        } else if !(ch.is_whitespace() || matches!(ch, '.' | ',' | '-' | '_' | ':' | ';')) {
+            // presence of other symbols means it's probably real text
+            return false;
+        }
+    }
+
+    !has_alpha && has_digit
 }
