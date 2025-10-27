@@ -1,6 +1,5 @@
 use std::{
-    env, fs, num::NonZeroUsize, ops::Range, path::Path, path::PathBuf, pin::Pin, process,
-    time::Duration,
+    env, fs, num::NonZeroUsize, ops::Range, path::Path, path::PathBuf, process, time::Duration,
 };
 
 use futures::StreamExt;
@@ -95,17 +94,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
 async fn run_fetch_kio(args: FetchKioArgs, verbosity: u8) -> Result<(), AppError> {
     let worker_count = NonZeroUsize::new(args.workers.max(1)).expect("workers must always be >= 1");
     let output_dir = resolve_output_dir(&args.output_path)?;
-
-    let base_url = match args.source {
-        KioSource::Uzp => args.url.clone(),
-        KioSource::Saos => {
-            if args.url == DEFAULT_KIO_UZP_URL {
-                DEFAULT_KIO_SAOS_URL.to_string()
-            } else {
-                args.url.clone()
-            }
-        }
-    };
+    let base_url = resolve_kio_base_url(&args);
 
     tracing::info!(
         source = ?args.source,
@@ -116,47 +105,109 @@ async fn run_fetch_kio(args: FetchKioArgs, verbosity: u8) -> Result<(), AppError
         "starting KIO portal scrape"
     );
 
-    let builder = KioScrapeOptions::builder()
+    let options = KioScrapeOptions::builder()
         .output_dir(output_dir.clone())
-        .worker_count(worker_count);
-    let options = builder.maybe_limit(args.limit).build();
-    let show_progress = verbosity == 0;
-    enum SelectedScraper {
-        Uzp(KioUzpScraper),
-        Saos(KioSaosScraper),
+        .worker_count(worker_count)
+        .maybe_limit(args.limit)
+        .build();
+    let progress = (verbosity == 0).then_some(make_progress_bar());
+    let mut tracker = ProgressTracker::new(progress.clone(), args.limit.map(|l| l as u64));
+    let summary = match args.source {
+        KioSource::Uzp => {
+            let scraper = KioUzpScraper::new(&base_url)?;
+            let mut stream = Box::pin(scraper.scrape_stream(options.clone()));
+            process_kio_stream(&mut stream, &mut tracker).await?
+        }
+        KioSource::Saos => {
+            let scraper = KioSaosScraper::new(&base_url)?;
+            let mut stream = Box::pin(scraper.scrape_stream(options));
+            process_kio_stream(&mut stream, &mut tracker).await?
+        }
+    };
+    finish_kio_progress(progress, &tracker, &summary);
+
+    if !tracker.has_progress_bar() {
+        tracing::info!(
+            downloaded = summary.downloaded,
+            discovered = summary.discovered,
+            skipped = summary.skipped_existing,
+            "KIO scrape completed successfully"
+        );
     }
 
-    let scraper = match args.source {
-        KioSource::Uzp => SelectedScraper::Uzp(KioUzpScraper::new(&base_url)?),
-        KioSource::Saos => SelectedScraper::Saos(KioSaosScraper::new(&base_url)?),
-    };
+    Ok(())
+}
 
-    let mut stream: Pin<
-        Box<dyn futures::Stream<Item = Result<KioEvent, ingestion::IngestorError>> + Send>,
-    > = match &scraper {
-        SelectedScraper::Uzp(scraper) => Box::pin(scraper.scrape_stream(options.clone())),
-        SelectedScraper::Saos(scraper) => Box::pin(scraper.scrape_stream(options)),
-    };
+fn resolve_kio_base_url(args: &FetchKioArgs) -> String {
+    match args.source {
+        KioSource::Uzp => args.url.clone(),
+        KioSource::Saos => {
+            if args.url == DEFAULT_KIO_UZP_URL {
+                DEFAULT_KIO_SAOS_URL.to_string()
+            } else {
+                args.url.clone()
+            }
+        }
+    }
+}
 
-    let progress = show_progress.then_some(make_progress_bar());
-    let mut summary: Option<KioScraperSummary> = None;
-    let target_limit = args.limit.map(|l| l as u64);
-    let mut pb_len_set = false;
-    let mut completed = 0u64;
-
+async fn process_kio_stream<S>(
+    stream: &mut S,
+    tracker: &mut ProgressTracker,
+) -> Result<KioScraperSummary, AppError>
+where
+    S: futures::Stream<Item = Result<KioEvent, ingestion::IngestorError>> + Unpin,
+{
     while let Some(event) = stream.next().await {
-        let event = event?;
+        let summary = tracker.handle_event(event?)?;
+        if let Some(summary) = summary {
+            return Ok(summary);
+        }
+    }
+
+    Err(AppError::Ingest(ingestion::IngestorError::ChannelClosed))
+}
+
+fn finish_kio_progress(
+    progress: Option<ProgressBar>,
+    tracker: &ProgressTracker,
+    summary: &KioScraperSummary,
+) {
+    if let Some(pb) = progress {
+        tracker.ensure_length(&pb, summary.discovered as u64);
+        pb.finish_with_message(format!(
+            "Completed: {}/{} downloaded ({} skipped)",
+            summary.downloaded, summary.discovered, summary.skipped_existing
+        ));
+    }
+}
+
+struct ProgressTracker {
+    progress: Option<ProgressBar>,
+    target_limit: Option<u64>,
+    pb_len_set: bool,
+    completed: u64,
+}
+
+impl ProgressTracker {
+    fn new(progress: Option<ProgressBar>, target_limit: Option<u64>) -> Self {
+        Self {
+            progress,
+            target_limit,
+            pb_len_set: false,
+            completed: 0,
+        }
+    }
+
+    fn has_progress_bar(&self) -> bool {
+        self.progress.is_some()
+    }
+
+    fn handle_event(&mut self, event: KioEvent) -> Result<Option<KioScraperSummary>, AppError> {
         match event {
             KioEvent::DiscoveryStarted { limit } => {
-                if let Some(pb) = progress.as_ref() {
-                    if !pb_len_set {
-                        if let Some(length) =
-                            effective_length(target_limit, limit.map(|v| v as u64))
-                        {
-                            pb.set_length(length.max(1));
-                            pb_len_set = true;
-                        }
-                    }
+                self.update_length(limit.map(|v| v as u64));
+                if let Some(pb) = self.progress.as_ref() {
                     pb.set_message("Discovering judgments".to_string());
                 } else {
                     tracing::info!(limit, "discovery started");
@@ -168,15 +219,8 @@ async fn run_fetch_kio(args: FetchKioArgs, verbosity: u8) -> Result<(), AppError
                 total_hint,
                 metadata,
             } => {
-                if let Some(pb) = progress.as_ref() {
-                    if !pb_len_set {
-                        if let Some(length) =
-                            effective_length(target_limit, total_hint.map(|v| v as u64))
-                        {
-                            pb.set_length(length.max(1));
-                            pb_len_set = true;
-                        }
-                    }
+                self.update_length(total_hint.map(|v| v as u64));
+                if let Some(pb) = self.progress.as_ref() {
                     pb.set_message(format!("queued {} (page {page})", metadata.doc_id));
                 } else {
                     tracing::debug!(
@@ -191,69 +235,66 @@ async fn run_fetch_kio(args: FetchKioArgs, verbosity: u8) -> Result<(), AppError
                 }
             }
             KioEvent::WorkerStarted { worker, doc_id } => {
-                if let Some(pb) = progress.as_ref() {
+                if let Some(pb) = self.progress.as_ref() {
                     pb.set_message(format!("processing {doc_id}"));
                 } else {
                     tracing::debug!(worker, doc_id = %doc_id, "worker picked up document");
                 }
             }
             KioEvent::DownloadSkipped { doc_id } => {
-                if let Some(pb) = progress.as_ref() {
-                    completed += 1;
-                    if pb_len_set {
-                        pb.set_position(completed);
-                    } else {
-                        pb.inc(1);
-                    }
+                self.bump_position();
+                if let Some(pb) = self.progress.as_ref() {
                     pb.set_message(format!("cached {doc_id}"));
                 } else {
                     tracing::info!(doc_id = %doc_id, "document already cached");
                 }
             }
             KioEvent::DownloadCompleted { doc_id, bytes } => {
-                if let Some(pb) = progress.as_ref() {
-                    completed += 1;
-                    if pb_len_set {
-                        pb.set_position(completed);
-                    } else {
-                        pb.inc(1);
-                    }
+                self.bump_position();
+                if let Some(pb) = self.progress.as_ref() {
                     pb.set_message(format!("saved {doc_id} ({bytes} bytes)"));
                 } else {
                     tracing::info!(doc_id = %doc_id, bytes, "downloaded document");
                 }
             }
-            KioEvent::Completed { summary: s } => {
-                summary = Some(s);
-                break;
+            KioEvent::Completed { summary } => return Ok(Some(summary)),
+        }
+
+        Ok(None)
+    }
+
+    fn update_length(&mut self, hint: Option<u64>) {
+        if self.pb_len_set {
+            return;
+        }
+        if let Some(pb) = self.progress.as_ref() {
+            if let Some(length) = effective_length(self.target_limit, hint) {
+                pb.set_length(length.max(1));
+                self.pb_len_set = true;
             }
         }
     }
 
-    let summary =
-        summary.ok_or_else(|| AppError::Ingest(ingestion::IngestorError::ChannelClosed))?;
-
-    if let Some(pb) = progress {
-        if !pb_len_set {
-            let length = completed.max(summary.discovered as u64);
-            if length > 0 {
-                pb.set_length(length);
+    fn bump_position(&mut self) {
+        if let Some(pb) = self.progress.as_ref() {
+            self.completed += 1;
+            if self.pb_len_set {
+                pb.set_position(self.completed);
+            } else {
+                pb.inc(1);
             }
         }
-        pb.finish_with_message(format!(
-            "Completed: {}/{} downloaded ({} skipped)",
-            summary.downloaded, summary.discovered, summary.skipped_existing
-        ));
-    } else {
-        tracing::info!(
-            downloaded = summary.downloaded,
-            discovered = summary.discovered,
-            skipped = summary.skipped_existing,
-            "KIO scrape completed successfully"
-        );
     }
 
-    Ok(())
+    fn ensure_length(&self, pb: &ProgressBar, discovered: u64) {
+        if self.pb_len_set {
+            return;
+        }
+        let length = self.completed.max(discovered);
+        if length > 0 {
+            pb.set_length(length);
+        }
+    }
 }
 
 fn run_segment_pdf(args: SegmentPdfArgs) -> Result<(), AppError> {

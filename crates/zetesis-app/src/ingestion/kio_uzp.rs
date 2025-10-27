@@ -505,70 +505,95 @@ impl KioUzpScraper {
         output_dir: &Path,
     ) -> Result<ProcessOutcome, KioScrapeError> {
         let output_path = output_dir.join(format!("kio_{}.pdf", task.doc_id));
-        if fs::try_exists(&output_path).await? {
-            match fs::metadata(&output_path).await {
-                Ok(meta) => {
-                    let local_len = meta.len();
-                    match self.fetch_pdf_len(&task.pdf_path).await {
-                        Ok(Some(remote_len)) if remote_len == local_len => {
-                            info!(
-                                silo = SILO_SLUG,
-                                stage = "skip_existing",
-                                doc_id = task.doc_id,
-                                path = %output_path.display(),
-                                local_len,
-                                remote_len,
-                                "skipping existing PDF; size matches upstream"
-                            );
-                            return Ok(ProcessOutcome::SkippedExisting);
-                        }
-                        Ok(Some(remote_len)) => {
-                            warn!(
-                                silo = SILO_SLUG,
-                                stage = "size_mismatch",
-                                doc_id = task.doc_id,
-                                path = %output_path.display(),
-                                local_len,
-                                remote_len,
-                                "existing PDF size differs from upstream; re-downloading"
-                            );
-                        }
-                        Ok(None) => {
-                            warn!(
-                                silo = SILO_SLUG,
-                                stage = "size_unknown",
-                                doc_id = task.doc_id,
-                                path = %output_path.display(),
-                                local_len,
-                                "remote PDF size unavailable; re-downloading"
-                            );
-                        }
-                        Err(err) => {
-                            warn!(
-                                silo = SILO_SLUG,
-                                stage = "size_check_failed",
-                                doc_id = task.doc_id,
-                                path = %output_path.display(),
-                                local_len,
-                                error = %err,
-                                "failed to inspect remote PDF size; re-downloading"
-                            );
-                        }
-                    }
-                }
-                Err(err) => {
-                    warn!(
-                        silo = SILO_SLUG,
-                        stage = "local_metadata_failed",
-                        doc_id = task.doc_id,
-                        path = %output_path.display(),
-                        error = %err,
-                        "failed to read local PDF metadata; re-downloading"
-                    );
-                }
-            }
+
+        if let Some(outcome) = self.check_existing_pdf(task, &output_path).await? {
+            return Ok(outcome);
         }
 
+        self.download_and_store_pdf(task, &output_path).await
+    }
+
+    async fn check_existing_pdf(
+        &self,
+        task: &KioDocumentTask,
+        output_path: &Path,
+    ) -> Result<Option<ProcessOutcome>, KioScrapeError> {
+        if !fs::try_exists(output_path).await? {
+            return Ok(None);
+        }
+
+        match fs::metadata(output_path).await {
+            Ok(meta) => {
+                let local_len = meta.len();
+                match self.fetch_pdf_len(&task.pdf_path).await {
+                    Ok(Some(remote_len)) if remote_len == local_len => {
+                        info!(
+                            silo = SILO_SLUG,
+                            stage = "skip_existing",
+                            doc_id = task.doc_id,
+                            path = %output_path.display(),
+                            local_len,
+                            remote_len,
+                            "skipping existing PDF; size matches upstream"
+                        );
+                        Ok(Some(ProcessOutcome::SkippedExisting))
+                    }
+                    Ok(Some(remote_len)) => {
+                        warn!(
+                            silo = SILO_SLUG,
+                            stage = "size_mismatch",
+                            doc_id = task.doc_id,
+                            path = %output_path.display(),
+                            local_len,
+                            remote_len,
+                            "existing PDF size differs from upstream; re-downloading"
+                        );
+                        Ok(None)
+                    }
+                    Ok(None) => {
+                        warn!(
+                            silo = SILO_SLUG,
+                            stage = "size_unknown",
+                            doc_id = task.doc_id,
+                            path = %output_path.display(),
+                            local_len,
+                            "remote PDF size unavailable; re-downloading"
+                        );
+                        Ok(None)
+                    }
+                    Err(err) => {
+                        warn!(
+                            silo = SILO_SLUG,
+                            stage = "size_check_failed",
+                            doc_id = task.doc_id,
+                            path = %output_path.display(),
+                            local_len,
+                            error = %err,
+                            "failed to inspect remote PDF size; re-downloading"
+                        );
+                        Ok(None)
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(
+                    silo = SILO_SLUG,
+                    stage = "local_metadata_failed",
+                    doc_id = task.doc_id,
+                    path = %output_path.display(),
+                    error = %err,
+                    "failed to read local PDF metadata; re-downloading"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    async fn download_and_store_pdf(
+        &self,
+        task: &KioDocumentTask,
+        output_path: &Path,
+    ) -> Result<ProcessOutcome, KioScrapeError> {
         info!(
             silo = SILO_SLUG,
             stage = "detail_fetch_start",
@@ -592,7 +617,7 @@ impl KioUzpScraper {
             "downloading judgment PDF"
         );
         let pdf = self.fetch_pdf(&task.pdf_path).await?;
-        fs::write(&output_path, &pdf).await?;
+        fs::write(output_path, &pdf).await?;
         info!(
             silo = SILO_SLUG,
             stage = "pdf_stored",
@@ -665,78 +690,101 @@ fn spawn_workers(
         let output_dir = Arc::clone(&output_dir);
         let stats = stats.clone();
 
-        join_set.spawn(async move {
-            loop {
-                let next = {
-                    let mut guard = rx.lock().await;
-                    guard.recv().await
-                };
-
-                let Some(task) = next else {
-                    debug!(
-                        silo = SILO_SLUG,
-                        stage = "worker_shutdown",
-                        worker = worker_idx,
-                        "worker terminating (channel closed)"
-                    );
-                    break Ok(());
-                };
-
-                let doc_id = task.doc_id.clone();
-                info!(
-                    silo = SILO_SLUG,
-                    stage = "worker_start",
-                    worker = worker_idx,
-                    doc_id = %doc_id,
-                    "worker picked up document"
-                );
-                send_event(
-                    &stats.event_tx,
-                    KioEvent::WorkerStarted {
-                        worker: worker_idx,
-                        doc_id: doc_id.clone(),
-                    },
-                )
-                .await?;
-
-                match scraper.process_task(&task, &output_dir).await {
-                    Ok(ProcessOutcome::Downloaded { bytes }) => {
-                        stats.downloaded.fetch_add(1, Ordering::Relaxed);
-                        debug!(
-                            silo = SILO_SLUG,
-                            stage = "worker_done",
-                            worker = worker_idx,
-                            doc_id = %doc_id,
-                            bytes,
-                            "worker finished download"
-                        );
-                        send_event(
-                            &stats.event_tx,
-                            KioEvent::DownloadCompleted { doc_id, bytes },
-                        )
-                        .await?;
-                    }
-                    Ok(ProcessOutcome::SkippedExisting) => {
-                        stats.skipped_existing.fetch_add(1, Ordering::Relaxed);
-                        send_event(&stats.event_tx, KioEvent::DownloadSkipped { doc_id }).await?;
-                    }
-                    Err(err) => {
-                        warn!(
-                            silo = SILO_SLUG,
-                            stage = "worker_error",
-                            worker = worker_idx,
-                            doc_id = %doc_id,
-                            error = %err,
-                            "worker encountered error"
-                        );
-                        return Err(err);
-                    }
-                }
-            }
-        });
+        join_set.spawn(async move { run_worker(worker_idx, rx, scraper, output_dir, stats).await });
     }
 
     join_set
+}
+
+async fn run_worker(
+    worker_idx: usize,
+    receiver: Arc<Mutex<mpsc::Receiver<KioDocumentTask>>>,
+    scraper: KioUzpScraper,
+    output_dir: Arc<PathBuf>,
+    stats: WorkerStats,
+) -> Result<(), KioScrapeError> {
+    loop {
+        let Some(task) = receive_task(&receiver).await else {
+            debug!(
+                silo = SILO_SLUG,
+                stage = "worker_shutdown",
+                worker = worker_idx,
+                "worker terminating (channel closed)"
+            );
+            break;
+        };
+
+        process_worker_task(worker_idx, &scraper, &output_dir, &stats, task).await?;
+    }
+    Ok(())
+}
+
+async fn receive_task(
+    receiver: &Arc<Mutex<mpsc::Receiver<KioDocumentTask>>>,
+) -> Option<KioDocumentTask> {
+    let mut guard = receiver.lock().await;
+    guard.recv().await
+}
+
+async fn process_worker_task(
+    worker_idx: usize,
+    scraper: &KioUzpScraper,
+    output_dir: &Path,
+    stats: &WorkerStats,
+    task: KioDocumentTask,
+) -> Result<(), KioScrapeError> {
+    let doc_id = task.doc_id.clone();
+    info!(
+        silo = SILO_SLUG,
+        stage = "worker_start",
+        worker = worker_idx,
+        doc_id = %doc_id,
+        "worker picked up document"
+    );
+    send_event(
+        &stats.event_tx,
+        KioEvent::WorkerStarted {
+            worker: worker_idx,
+            doc_id: doc_id.clone(),
+        },
+    )
+    .await?;
+
+    match scraper.process_task(&task, output_dir).await {
+        Ok(ProcessOutcome::Downloaded { bytes }) => {
+            stats.downloaded.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                silo = SILO_SLUG,
+                stage = "worker_done",
+                worker = worker_idx,
+                doc_id = %doc_id,
+                bytes,
+                "worker finished download"
+            );
+            send_event(
+                &stats.event_tx,
+                KioEvent::DownloadCompleted { doc_id, bytes },
+            )
+            .await?;
+            Ok(())
+        }
+        Ok(ProcessOutcome::SkippedExisting) => {
+            stats.skipped_existing.fetch_add(1, Ordering::Relaxed);
+            send_event(&stats.event_tx, KioEvent::DownloadSkipped { doc_id }).await?;
+            Ok(())
+        }
+        Err(err) => {
+            warn!(
+                silo = SILO_SLUG,
+                stage = "worker_error",
+                worker = worker_idx,
+                doc_id = %doc_id,
+                error = %err,
+                "worker encountered error"
+            );
+            Err(err)
+        }
+    }
 }
 
 fn to_scraper_join_error(err: tokio::task::JoinError) -> KioScrapeError {
@@ -770,72 +818,98 @@ fn build_search_form(page: usize, count_stats: bool) -> Vec<(String, String)> {
 
 fn parse_results_page(html: &str) -> Result<KioSearchPage, KioScrapeError> {
     let document = Html::parse_document(html);
-    let item_selector =
-        Selector::parse("div.search-list-item").map_err(|err| parse_err("discover", err))?;
-    let detail_selector =
-        Selector::parse("a.link-details").map_err(|err| parse_err("discover", err))?;
-    let paragraph_selector = Selector::parse("p").map_err(|err| parse_err("discover", err))?;
-    let label_selector = Selector::parse("label").map_err(|err| parse_err("discover", err))?;
-    let counts_selector =
-        Selector::parse("input#resultCounts").map_err(|err| parse_err("discover", err))?;
+    let selectors = KioResultsSelectors::new()?;
 
     let mut items = Vec::new();
-    for element in document.select(&item_selector) {
-        let detail = element
-            .select(&detail_selector)
-            .next()
-            .and_then(|n| n.value().attr("href"))
-            .ok_or_else(|| KioScrapeError::parse("discover", "result missing detail link"))?;
-
-        let doc_id = extract_doc_id(detail)?;
-        let pdf_path = format!("{PDF_PATH_PREFIX}{doc_id}?Kind={KIND_PARAM}");
-
-        let mut sygnatura = None;
-        let mut decision_type = None;
-
-        for paragraph in element.select(&paragraph_selector) {
-            if let Some(label) = paragraph.select(&label_selector).next() {
-                let label_text = text_content(&label);
-                let paragraph_text = text_content(&paragraph);
-                let value = paragraph_text
-                    .trim_start_matches(&label_text)
-                    .trim_matches(|c: char| c == ':' || c.is_whitespace())
-                    .trim()
-                    .to_string();
-
-                if label_text.contains("Sygnatura") {
-                    sygnatura = Some(value);
-                } else if label_text.contains("Rodzaj dokumentu") {
-                    decision_type = Some(value);
-                }
-            }
-        }
-
-        let detail_path = format!("{DETAILS_PATH_PREFIX}{doc_id}");
-
-        items.push(KioDocumentTask {
-            doc_id,
-            detail_path,
-            pdf_path,
-            sygnatura,
-            decision_type,
-        });
+    for element in document.select(&selectors.item) {
+        items.push(parse_result_item(&selectors, element)?);
     }
 
-    let total_available = document
-        .select(&counts_selector)
-        .next()
-        .and_then(|node| node.value().attr("value"))
-        .and_then(|value| {
-            value
-                .split(',')
-                .filter_map(|s| s.trim().parse::<usize>().ok())
-                .nth(1)
-        });
+    let total_available = selectors.extract_total(&document);
 
     Ok(KioSearchPage {
         items,
         total_available,
+    })
+}
+
+struct KioResultsSelectors {
+    item: Selector,
+    detail: Selector,
+    paragraph: Selector,
+    label: Selector,
+    counts: Selector,
+}
+
+impl KioResultsSelectors {
+    fn new() -> Result<Self, KioScrapeError> {
+        Ok(Self {
+            item: Selector::parse("div.search-list-item")
+                .map_err(|err| parse_err("discover", err))?,
+            detail: Selector::parse("a.link-details").map_err(|err| parse_err("discover", err))?,
+            paragraph: Selector::parse("p").map_err(|err| parse_err("discover", err))?,
+            label: Selector::parse("label").map_err(|err| parse_err("discover", err))?,
+            counts: Selector::parse("input#resultCounts")
+                .map_err(|err| parse_err("discover", err))?,
+        })
+    }
+
+    fn extract_total(&self, document: &Html) -> Option<usize> {
+        document
+            .select(&self.counts)
+            .next()
+            .and_then(|node| node.value().attr("value"))
+            .and_then(|value| {
+                value
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<usize>().ok())
+                    .nth(1)
+            })
+    }
+}
+
+fn parse_result_item(
+    selectors: &KioResultsSelectors,
+    element: scraper::ElementRef<'_>,
+) -> Result<KioDocumentTask, KioScrapeError> {
+    let detail = element
+        .select(&selectors.detail)
+        .next()
+        .and_then(|n| n.value().attr("href"))
+        .ok_or_else(|| KioScrapeError::parse("discover", "result missing detail link"))?;
+
+    let doc_id = extract_doc_id(detail)?;
+    let pdf_path = format!("{PDF_PATH_PREFIX}{doc_id}?Kind={KIND_PARAM}");
+
+    let mut sygnatura = None;
+    let mut decision_type = None;
+
+    for paragraph in element.select(&selectors.paragraph) {
+        if let Some(label) = paragraph.select(&selectors.label).next() {
+            let label_text = text_content(&label);
+            let paragraph_text = text_content(&paragraph);
+            let value = paragraph_text
+                .trim_start_matches(&label_text)
+                .trim_matches(|c: char| c == ':' || c.is_whitespace())
+                .trim()
+                .to_string();
+
+            if label_text.contains("Sygnatura") {
+                sygnatura = Some(value);
+            } else if label_text.contains("Rodzaj dokumentu") {
+                decision_type = Some(value);
+            }
+        }
+    }
+
+    let detail_path = format!("{DETAILS_PATH_PREFIX}{doc_id}");
+
+    Ok(KioDocumentTask {
+        doc_id,
+        detail_path,
+        pdf_path,
+        sygnatura,
+        decision_type,
     })
 }
 

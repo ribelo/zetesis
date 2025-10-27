@@ -1,4 +1,100 @@
-# Repository Guidelines
+# Engineering Workflow and Safety Guidelines
+
+## 0) Workflow: Reason → Decision → Plan → Code (in this order)
+- **Start with a concise checklist (3-7 bullets) outlining high-level sub-tasks before substantive work; keep items conceptual.**
+- **State all constraints, invariants, and budgets** (latency, throughput, memory). List unknowns and explicit assumptions.
+- **Compare 1–2 minimal designs.** For each, identify failure modes and document architectural commitments (timeouts, backpressure, cancellation).
+- **After the above, outline modules and tests. Write code last.**
+
+---
+
+## 1) Safety Rules
+
+- **Simple control flow only:** no `goto`, recursion, or equivalents. Maintain an acyclic call graph for provable boundedness.
+- **Bound every loop:** Provide static justification for upper bounds. Enforce hard limits if iteration counts are uncertain.
+- **No dynamic allocation after initialization** in critical/long-running paths; design memory upfront with arenas/pools/fixed capacities.
+- **Small functions:** keep below ~60 logical lines. Larger functions often signal unclear structure.
+- **Average 2+ side-effect-free assertions per function; trigger explicit recovery on failure.**
+- **Declare variables in narrowest possible scope. Don't reuse variables for multiple purposes.**
+- **Always check results, validate inputs, and propagate errors explicitly. Never ignore results without clear justification.**
+- **Limit metaprogramming and macros. Avoid complex conditional compilation or macro-based DSLs.**
+- **Avoid raw pointers/function-style indirection on critical paths; prefer static dispatch/generics.**
+- **Zero warnings, continuous strict static analysis. Rewrite code for clarity if analysis/tools incorrectly warn.**
+
+> **Favor strict, safety-conscious guidelines over idiomatic shortcuts that sacrifice resilience.**
+
+---
+
+## 2) Extensions
+
+- **Prioritize:** Safety → Performance → Developer Experience.
+- **Pair assertions at caller/callee to enforce contracts; check required/forbidden behaviors at compile time when possible.**
+- **Prefer static memory after initialization; avoid reallocations in hot paths.**
+- **Centralize control/state at parent; keep leaf functions pure; batch ops to amortize cost.**
+- **Set a hard ceiling of ~70 lines per function. Move significant logic up (`if`) or down (`for`) to minimize live variables.**
+- **Sketch performance: estimate bandwidth/latency for network, disk, memory, CPU. Optimize the slowest/highest-frequency resource.**
+- **Buffer/batch to bound work; don't react immediately to interrupts.**
+- **Prefer explicit call-site options over defaults to avoid subtle behavior.**
+- **Favor explicitly sized types (e.g., `u32`) for protocols/storage over arch-dependent ones.**
+
+---
+
+## 3) Pragmatism and Simplicity
+
+- **Avoid unnecessary features/abstraction; pursue the 80/20 solution.**
+- **Abstractions must earn their keep—prefer boring, simple solutions.**
+- **Delete unjustified complexity and legacy shims. Ship the simplest design.**
+- **Respect data/layout/hardware constraints. Minimize indirection and do IO at boundaries.**
+- **Favor referentially transparent/pure functions over hidden state or mutation.**
+- **If confused, stop and fix (Kill FOLD).**
+- **Prototype minimal demos when stuck to expose real constraints.**
+- **Invest in robust, human-friendly logging; debugging is a major time expense.**
+- **Use generics moderately; avoid over-complex type-level tricks.**
+
+---
+
+## 4) Language-Specific Conventions
+
+- **Only use unsafe when necessary; isolate and document invariants/assertions/tests in minimal modules.**
+- **Prefer borrowing to cloning; limit ownership/lifetime complexity.**
+- **Pre-allocate buffers, arrays, slabs, arenas; avoid heap growth post-init on critical paths.**
+- **Default to static dispatch; restrict trait objects on hot paths unless strictly needed and justified.**
+- **Keep macros trivial; don't stack `cfg` attributes/explode test matrix.**
+- **Idiomatic, explicit names with unit suffixes for clarity (e.g., `_ms`).**
+
+---
+
+## 5) Testing, Verification, and Observability
+
+- **Test negative as rigorously as positive cases: model boundaries, use property/fuzz testing to find bugs.**
+- **Fix bugs by first writing failing regression tests.**
+- **Handle all errors. Never ignore Results. Use structured, context-rich logs for debugging.**
+- **After edits or tests, validate outcomes and document next steps; self-correct if validation fails.**
+
+---
+
+## 6) Communication & Collaboration
+
+- **Ask clarifying questions if any aspect is unclear or ambiguous before proceeding.**
+- **Propose or advise simpler, more maintainable solutions when requested approach is overly complex; reject unnecessary complexity.**
+- **Use external resources instead of reinventing solutions when unfamiliar requirements arise.**
+
+---
+
+## 7) PR Format & Pre-Merge Checklist
+
+- **PR template:** Reasoning → Decision → Plan (tests/telemetry) → Result.
+- **Checklist:**
+  - [ ] Bounds everywhere
+  - [ ] ≥2 assertions/function
+  - [ ] ≤60 lines/function
+  - [ ] Zero warnings
+  - [ ] Static analysis clean
+  - [ ] Negative tests present
+  - [ ] Actionable logs
+- **Conventional prefixes (`feat:`, `fix:`, `docs:`, `chore:`); single-purpose commits.**
+
+---
 
 ## Project Structure & Module Organization
 - Keep `SPEC` ahead of code; mirror slugs in `TODO` and review daily on active work.
@@ -43,7 +139,7 @@
 
 ## Complexity Discipline
 - Cut scope before adding knobs; every line must earn its keep.
-- Say “no” to features/abstractions unless simplification is obvious.
+- Say "no" to features/abstractions unless simplification is obvious.
 - Kill FOLD: if it feels confusing, stop and fix it.
 
 ## Testing Guidelines
