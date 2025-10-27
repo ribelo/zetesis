@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bon::Builder;
@@ -37,6 +38,31 @@ fn deepinfra_rate_limiter() -> &'static Arc<OcrRateLimiter> {
             .allow_burst(NonZeroU32::new(200).expect("non-zero burst"));
         Arc::new(RateLimiter::direct(quota))
     })
+}
+
+#[async_trait]
+pub trait OcrService: Send + Sync {
+    async fn run_document(
+        &self,
+        path: &Path,
+        config: &OcrConfig,
+    ) -> Result<Vec<OcrPageResult>, OcrError>;
+}
+
+#[derive(Clone)]
+pub struct DeepInfraOcr {
+    client: Arc<DeepInfra>,
+    limiter: Arc<OcrRateLimiter>,
+}
+
+impl DeepInfraOcr {
+    pub fn from_env() -> Result<Self, OcrError> {
+        let client = DeepInfra::load_from_env().map_err(|_| OcrError::MissingApiKey)?;
+        Ok(Self {
+            client: Arc::new(client),
+            limiter: Arc::clone(deepinfra_rate_limiter()),
+        })
+    }
 }
 
 /// Result produced for each OCR-processed page.
@@ -119,93 +145,94 @@ pub enum OcrError {
     MissingApiKey,
 }
 
-/// Run OCR for the given document path using the supplied configuration.
-pub async fn run_ocr_document(
-    path: &Path,
-    config: &OcrConfig,
-) -> Result<Vec<OcrPageResult>, OcrError> {
-    let bytes = std::fs::read(path).map_err(|source| OcrError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+#[async_trait]
+impl OcrService for DeepInfraOcr {
+    async fn run_document(
+        &self,
+        path: &Path,
+        config: &OcrConfig,
+    ) -> Result<Vec<OcrPageResult>, OcrError> {
+        let bytes = std::fs::read(path).map_err(|source| OcrError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
 
-    let ext = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase());
+        let ext = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase());
 
-    let pages = match ext.as_deref() {
-        Some("pdf") => render_pdf_to_png_images(&bytes, config.render_width)?,
-        Some("png") => vec![png_bytes_to_page(path, bytes)?],
-        _ => return Err(OcrError::UnsupportedInput(path.to_path_buf())),
-    };
+        let pages = match ext.as_deref() {
+            Some("pdf") => render_pdf_to_png_images(&bytes, config.render_width)?,
+            Some("png") => vec![png_bytes_to_page(path, bytes)?],
+            _ => return Err(OcrError::UnsupportedInput(path.to_path_buf())),
+        };
 
-    let client = DeepInfra::load_from_env().map_err(|_| OcrError::MissingApiKey)?;
-    let limiter = Arc::clone(deepinfra_rate_limiter());
+        let mut results = Vec::with_capacity(pages.len());
 
-    let mut results = Vec::with_capacity(pages.len());
+        for page in pages {
+            let prepared =
+                prepare_image_for_ocr(path, page.page_index, &page, config.image_max_edge)?;
 
-    for page in pages {
-        let prepared = prepare_image_for_ocr(path, page.page_index, &page, config.image_max_edge)?;
+            let mut parts = Vec::with_capacity(2);
+            let mut image_url = ImageUrl::new(format!(
+                "data:{};base64,{}",
+                prepared.mime_type,
+                BASE64_STANDARD.encode(&prepared.data)
+            ));
 
-        let mut parts = Vec::with_capacity(2);
-        let mut image_url = ImageUrl::new(format!(
-            "data:{};base64,{}",
-            prepared.mime_type,
-            BASE64_STANDARD.encode(&prepared.data)
-        ));
+            if let Some(detail) = config.detail.as_ref() {
+                image_url = image_url.with_detail(detail.to_string());
+            }
 
-        if let Some(detail) = config.detail.as_ref() {
-            image_url = image_url.with_detail(detail.to_string());
+            parts.push(DeepInfraMessageContentPart::ImageUrl { image_url });
+            parts.push(DeepInfraMessageContentPart::Text {
+                text: "<|grounding|>Convert the document to markdown.".to_string(),
+            });
+
+            let message = DeepInfraMessage::user(DeepInfraMessageContent::Parts(parts));
+            let mut request = DeepInfraChatRequest::new(config.model.clone(), vec![message]);
+            request.max_tokens = Some(config.max_tokens);
+            request.temperature = Some(0.0);
+
+            self.limiter.until_ready().await;
+            let response = self.client.send(&request).await?;
+
+            let content = response
+                .choices
+                .first()
+                .and_then(|choice| choice.message.content.clone());
+
+            let raw_text = content
+                .as_ref()
+                .and_then(|content| flatten_message_content_text(content));
+
+            let (plain_text_str, spans) = match raw_text.as_deref() {
+                Some(raw) => parse_deepseek_output(raw, prepared.width, prepared.height),
+                None => (String::new(), Vec::new()),
+            };
+
+            let plain_text = if plain_text_str.trim().is_empty() {
+                None
+            } else {
+                Some(plain_text_str)
+            };
+
+            results.push(OcrPageResult {
+                page_index: page.page_index,
+                render_width: page.width,
+                render_height: page.height,
+                ocr_width: prepared.width,
+                ocr_height: prepared.height,
+                mime_type: prepared.mime_type,
+                plain_text,
+                spans,
+                usage: response.usage.clone(),
+            });
         }
 
-        parts.push(DeepInfraMessageContentPart::ImageUrl { image_url });
-        parts.push(DeepInfraMessageContentPart::Text {
-            text: "<|grounding|>Convert the document to markdown.".to_string(),
-        });
-
-        let message = DeepInfraMessage::user(DeepInfraMessageContent::Parts(parts));
-        let mut request = DeepInfraChatRequest::new(config.model.clone(), vec![message]);
-        request.max_tokens = Some(config.max_tokens);
-        request.temperature = Some(0.0);
-
-        limiter.until_ready().await;
-        let response = client.send(&request).await?;
-
-        let content = response
-            .choices
-            .first()
-            .and_then(|choice| choice.message.content.clone());
-
-        let raw_text = content
-            .as_ref()
-            .and_then(|content| flatten_message_content_text(content));
-
-        let (plain_text_str, spans) = match raw_text.as_deref() {
-            Some(raw) => parse_deepseek_output(raw, prepared.width, prepared.height),
-            None => (String::new(), Vec::new()),
-        };
-
-        let plain_text = if plain_text_str.trim().is_empty() {
-            None
-        } else {
-            Some(plain_text_str)
-        };
-
-        results.push(OcrPageResult {
-            page_index: page.page_index,
-            render_width: page.width,
-            render_height: page.height,
-            ocr_width: prepared.width,
-            ocr_height: prepared.height,
-            mime_type: prepared.mime_type,
-            plain_text,
-            spans,
-            usage: response.usage.clone(),
-        });
+        Ok(results)
     }
-
-    Ok(results)
 }
 
 fn prepare_image_for_ocr(

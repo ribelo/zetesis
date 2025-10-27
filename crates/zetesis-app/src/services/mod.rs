@@ -11,7 +11,7 @@ pub use context::{
     EmbedClient, EmbedService, Governors, PipelineContext, PipelineError, PipelineResult,
 };
 pub use normalize::{ChunkNormalizer, DocNormalizer};
-pub use ocr::{OcrConfig, OcrError, OcrPageResult, OcrSpan, run_ocr_document};
+pub use ocr::{DeepInfraOcr, OcrConfig, OcrError, OcrPageResult, OcrService, OcrSpan};
 pub use orchestrator::run_for_silo;
 pub use pdf::{
     PdfPageImage, PdfRenderError, PdfTextError, extract_text_from_pdf, render_pdf_to_png_images,

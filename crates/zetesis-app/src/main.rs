@@ -15,8 +15,8 @@ use zetesis_app::ingestion::{
     KioEvent, KioSaosScraper, KioScrapeOptions, KioScraperSummary, KioUzpScraper,
 };
 use zetesis_app::services::{
-    OcrConfig, OcrError, PolishSentenceSegmenter, cleanup_text, extract_text_from_pdf,
-    run_ocr_document,
+    DeepInfraOcr, OcrConfig, OcrError, OcrService, PolishSentenceSegmenter, cleanup_text,
+    extract_text_from_pdf,
 };
 use zetesis_app::{config, ingestion, server};
 
@@ -335,7 +335,8 @@ async fn run_ocr_pdf(args: OcrPdfArgs) -> Result<(), AppError> {
         max_tokens: args.max_tokens,
     };
 
-    let results = run_ocr_document(&args.input, &config).await?;
+    let service = DeepInfraOcr::from_env()?;
+    let results = service.run_document(&args.input, &config).await?;
 
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
