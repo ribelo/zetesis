@@ -1,7 +1,7 @@
 use std::{
     io::Cursor,
     num::NonZeroU32,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, OnceLock},
 };
 
@@ -20,9 +20,9 @@ use governor::{
     state::{InMemoryState, NotKeyed},
 };
 use image::codecs::jpeg::JpegEncoder;
-use image::codecs::png::PngDecoder;
+use image::codecs::png::{PngDecoder, PngEncoder};
 use image::imageops::FilterType;
-use image::{GenericImageView, ImageDecoder};
+use image::{ColorType, GenericImageView, ImageDecoder, ImageEncoder};
 use regex::Regex;
 use serde::Serialize;
 use thiserror::Error;
@@ -42,11 +42,26 @@ fn deepinfra_rate_limiter() -> &'static Arc<OcrRateLimiter> {
 
 #[async_trait]
 pub trait OcrService: Send + Sync {
-    async fn run_document(
+    async fn run_batch(
         &self,
-        path: &Path,
+        inputs: &[OcrInput],
         config: &OcrConfig,
-    ) -> Result<Vec<OcrPageResult>, OcrError>;
+    ) -> Result<Vec<OcrDocumentResult>, OcrError>;
+
+    async fn run_single(
+        &self,
+        input: &OcrInput,
+        config: &OcrConfig,
+    ) -> Result<OcrDocumentResult, OcrError> {
+        let results = self.run_batch(std::slice::from_ref(input), config).await?;
+        results
+            .into_iter()
+            .next()
+            .ok_or_else(|| OcrError::UnsupportedInput {
+                id: input.id.clone(),
+                mime_type: input.mime_type.to_string(),
+            })
+    }
 }
 
 #[derive(Clone)]
@@ -110,6 +125,51 @@ pub struct OcrConfig {
     pub max_tokens: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OcrMimeType {
+    Pdf,
+    Png,
+    Jpeg,
+}
+
+impl OcrMimeType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pdf => "application/pdf",
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+        }
+    }
+
+    pub fn from_extension(ext: &str) -> Option<Self> {
+        match ext {
+            "pdf" => Some(Self::Pdf),
+            "png" => Some(Self::Png),
+            "jpg" | "jpeg" => Some(Self::Jpeg),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for OcrMimeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OcrInput {
+    pub id: String,
+    pub bytes: Vec<u8>,
+    pub mime_type: OcrMimeType,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OcrDocumentResult {
+    pub id: String,
+    pub pages: Vec<OcrPageResult>,
+}
+
 /// Errors produced by the OCR service.
 #[derive(Debug, Error)]
 pub enum OcrError {
@@ -125,18 +185,18 @@ pub enum OcrError {
         #[source]
         source: std::io::Error,
     },
-    #[error("unsupported input format for OCR: {0}")]
-    UnsupportedInput(PathBuf),
-    #[error("failed to decode image data for {path} (page {page_index}): {source}")]
+    #[error("unsupported input format for {id}: {mime_type}")]
+    UnsupportedInput { id: String, mime_type: String },
+    #[error("failed to decode image data for {id} (page {page_index}): {source}")]
     ImageDecode {
-        path: PathBuf,
+        id: String,
         page_index: usize,
         #[source]
         source: image::ImageError,
     },
-    #[error("failed to encode image data for {path} (page {page_index}): {source}")]
+    #[error("failed to encode image data for {id} (page {page_index}): {source}")]
     ImageEncode {
-        path: PathBuf,
+        id: String,
         page_index: usize,
         #[source]
         source: image::ImageError,
@@ -147,103 +207,109 @@ pub enum OcrError {
 
 #[async_trait]
 impl OcrService for DeepInfraOcr {
-    async fn run_document(
+    async fn run_batch(
         &self,
-        path: &Path,
+        inputs: &[OcrInput],
         config: &OcrConfig,
-    ) -> Result<Vec<OcrPageResult>, OcrError> {
-        let bytes = std::fs::read(path).map_err(|source| OcrError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    ) -> Result<Vec<OcrDocumentResult>, OcrError> {
+        let mut docs = Vec::with_capacity(inputs.len());
 
-        let ext = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.to_ascii_lowercase());
+        for input in inputs {
+            let pages = collect_pages(input, config)?;
+            let mut page_results = Vec::with_capacity(pages.len());
 
-        let pages = match ext.as_deref() {
-            Some("pdf") => render_pdf_to_png_images(&bytes, config.render_width)?,
-            Some("png") => vec![png_bytes_to_page(path, bytes)?],
-            _ => return Err(OcrError::UnsupportedInput(path.to_path_buf())),
-        };
+            for page in pages {
+                let prepared = prepare_image_for_ocr(
+                    &input.id,
+                    page.page_index,
+                    &page,
+                    config.image_max_edge,
+                )?;
 
-        let mut results = Vec::with_capacity(pages.len());
+                let mut parts = Vec::with_capacity(2);
+                let mut image_url = ImageUrl::new(format!(
+                    "data:{};base64,{}",
+                    prepared.mime_type,
+                    BASE64_STANDARD.encode(&prepared.data)
+                ));
 
-        for page in pages {
-            let prepared =
-                prepare_image_for_ocr(path, page.page_index, &page, config.image_max_edge)?;
+                if let Some(detail) = config.detail.as_ref() {
+                    image_url = image_url.with_detail(detail.to_string());
+                }
 
-            let mut parts = Vec::with_capacity(2);
-            let mut image_url = ImageUrl::new(format!(
-                "data:{};base64,{}",
-                prepared.mime_type,
-                BASE64_STANDARD.encode(&prepared.data)
-            ));
+                parts.push(DeepInfraMessageContentPart::ImageUrl { image_url });
+                parts.push(DeepInfraMessageContentPart::Text {
+                    text: "<|grounding|>Convert the document to markdown.".to_string(),
+                });
 
-            if let Some(detail) = config.detail.as_ref() {
-                image_url = image_url.with_detail(detail.to_string());
+                let message = DeepInfraMessage::user(DeepInfraMessageContent::Parts(parts));
+                let mut request = DeepInfraChatRequest::new(config.model.clone(), vec![message]);
+                request.max_tokens = Some(config.max_tokens);
+                request.temperature = Some(0.0);
+
+                self.limiter.until_ready().await;
+                let response = self.client.send(&request).await?;
+
+                let content = response
+                    .choices
+                    .first()
+                    .and_then(|choice| choice.message.content.clone());
+
+                let raw_text = content
+                    .as_ref()
+                    .and_then(|content| flatten_message_content_text(content));
+
+                let (plain_text_str, spans) = match raw_text.as_deref() {
+                    Some(raw) => parse_deepseek_output(raw, prepared.width, prepared.height),
+                    None => (String::new(), Vec::new()),
+                };
+
+                let plain_text = if plain_text_str.trim().is_empty() {
+                    None
+                } else {
+                    Some(plain_text_str)
+                };
+
+                page_results.push(OcrPageResult {
+                    page_index: page.page_index,
+                    render_width: page.width,
+                    render_height: page.height,
+                    ocr_width: prepared.width,
+                    ocr_height: prepared.height,
+                    mime_type: prepared.mime_type,
+                    plain_text,
+                    spans,
+                    usage: response.usage.clone(),
+                });
             }
 
-            parts.push(DeepInfraMessageContentPart::ImageUrl { image_url });
-            parts.push(DeepInfraMessageContentPart::Text {
-                text: "<|grounding|>Convert the document to markdown.".to_string(),
-            });
-
-            let message = DeepInfraMessage::user(DeepInfraMessageContent::Parts(parts));
-            let mut request = DeepInfraChatRequest::new(config.model.clone(), vec![message]);
-            request.max_tokens = Some(config.max_tokens);
-            request.temperature = Some(0.0);
-
-            self.limiter.until_ready().await;
-            let response = self.client.send(&request).await?;
-
-            let content = response
-                .choices
-                .first()
-                .and_then(|choice| choice.message.content.clone());
-
-            let raw_text = content
-                .as_ref()
-                .and_then(|content| flatten_message_content_text(content));
-
-            let (plain_text_str, spans) = match raw_text.as_deref() {
-                Some(raw) => parse_deepseek_output(raw, prepared.width, prepared.height),
-                None => (String::new(), Vec::new()),
-            };
-
-            let plain_text = if plain_text_str.trim().is_empty() {
-                None
-            } else {
-                Some(plain_text_str)
-            };
-
-            results.push(OcrPageResult {
-                page_index: page.page_index,
-                render_width: page.width,
-                render_height: page.height,
-                ocr_width: prepared.width,
-                ocr_height: prepared.height,
-                mime_type: prepared.mime_type,
-                plain_text,
-                spans,
-                usage: response.usage.clone(),
+            docs.push(OcrDocumentResult {
+                id: input.id.clone(),
+                pages: page_results,
             });
         }
 
-        Ok(results)
+        Ok(docs)
+    }
+}
+
+fn collect_pages(input: &OcrInput, config: &OcrConfig) -> Result<Vec<PdfPageImage>, OcrError> {
+    match input.mime_type {
+        OcrMimeType::Pdf => Ok(render_pdf_to_png_images(&input.bytes, config.render_width)?),
+        OcrMimeType::Png => Ok(vec![png_bytes_to_page(&input.id, &input.bytes)?]),
+        OcrMimeType::Jpeg => Ok(vec![jpeg_bytes_to_page(&input.id, &input.bytes)?]),
     }
 }
 
 fn prepare_image_for_ocr(
-    input_path: &Path,
+    input_id: &str,
     page_index: usize,
     image: &PdfPageImage,
     max_edge: u32,
 ) -> Result<PreparedOcrImage, OcrError> {
     let mut dyn_image =
         image::load_from_memory(&image.png_data).map_err(|source| OcrError::ImageDecode {
-            path: input_path.to_path_buf(),
+            id: input_id.to_string(),
             page_index,
             source,
         })?;
@@ -266,7 +332,7 @@ fn prepare_image_for_ocr(
     encoder
         .encode_image(&dyn_image)
         .map_err(|source| OcrError::ImageEncode {
-            path: input_path.to_path_buf(),
+            id: input_id.to_string(),
             page_index,
             source,
         })?;
@@ -400,10 +466,10 @@ fn finalize_span(span: SpanBuilder, spans: &mut Vec<OcrSpan>, width: u32, height
     });
 }
 
-fn png_bytes_to_page(path: &Path, bytes: Vec<u8>) -> Result<PdfPageImage, OcrError> {
-    let cursor = Cursor::new(bytes.as_slice());
+fn png_bytes_to_page(id: &str, bytes: &[u8]) -> Result<PdfPageImage, OcrError> {
+    let cursor = Cursor::new(bytes);
     let decoder = PngDecoder::new(cursor).map_err(|source| OcrError::ImageDecode {
-        path: path.to_path_buf(),
+        id: id.to_string(),
         page_index: 0,
         source,
     })?;
@@ -413,6 +479,35 @@ fn png_bytes_to_page(path: &Path, bytes: Vec<u8>) -> Result<PdfPageImage, OcrErr
         page_index: 0,
         width,
         height,
-        png_data: bytes,
+        png_data: bytes.to_vec(),
+    })
+}
+
+fn jpeg_bytes_to_page(id: &str, bytes: &[u8]) -> Result<PdfPageImage, OcrError> {
+    let image = image::load_from_memory(bytes).map_err(|source| OcrError::ImageDecode {
+        id: id.to_string(),
+        page_index: 0,
+        source,
+    })?;
+
+    let (width, height) = image.dimensions();
+    let rgba = image.to_rgba8();
+    let mut png_data = Vec::new();
+    {
+        let encoder = PngEncoder::new(&mut png_data);
+        encoder
+            .write_image(rgba.as_raw(), width, height, ColorType::Rgba8.into())
+            .map_err(|source| OcrError::ImageEncode {
+                id: id.to_string(),
+                page_index: 0,
+                source,
+            })?;
+    }
+
+    Ok(PdfPageImage {
+        page_index: 0,
+        width,
+        height,
+        png_data,
     })
 }

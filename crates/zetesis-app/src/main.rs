@@ -15,8 +15,8 @@ use zetesis_app::ingestion::{
     KioEvent, KioSaosScraper, KioScrapeOptions, KioScraperSummary, KioUzpScraper,
 };
 use zetesis_app::services::{
-    DeepInfraOcr, OcrConfig, OcrError, OcrService, PolishSentenceSegmenter, cleanup_text,
-    extract_text_from_pdf,
+    DeepInfraOcr, OcrConfig, OcrError, OcrInput, OcrMimeType, OcrService, PolishSentenceSegmenter,
+    cleanup_text, extract_text_from_pdf,
 };
 use zetesis_app::{config, ingestion, server};
 
@@ -336,7 +336,37 @@ async fn run_ocr_pdf(args: OcrPdfArgs) -> Result<(), AppError> {
     };
 
     let service = DeepInfraOcr::from_env()?;
-    let results = service.run_document(&args.input, &config).await?;
+    let bytes = fs::read(&args.input).map_err(|source| AppError::Io {
+        path: args.input.clone(),
+        source,
+    })?;
+
+    let mime_type = args
+        .input
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .and_then(|ext| OcrMimeType::from_extension(&ext.to_ascii_lowercase()))
+        .ok_or_else(|| {
+            AppError::Ocr(OcrError::UnsupportedInput {
+                id: args.input.display().to_string(),
+                mime_type: "unknown".to_string(),
+            })
+        })?;
+
+    let input = OcrInput {
+        id: args.input.display().to_string(),
+        bytes,
+        mime_type,
+    };
+    let inputs = vec![input];
+    let mut documents = service.run_batch(&inputs, &config).await?;
+    let document = documents.pop().ok_or_else(|| {
+        AppError::Ocr(OcrError::UnsupportedInput {
+            id: args.input.display().to_string(),
+            mime_type: mime_type.to_string(),
+        })
+    })?;
+    let results = document.pages;
 
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
