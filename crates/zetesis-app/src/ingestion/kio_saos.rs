@@ -11,6 +11,7 @@ use std::{
 use async_stream::try_stream;
 use backon::{ExponentialBuilder, Retryable};
 use bytes::Bytes;
+use futures_util::stream::Stream;
 use governor::{
     Quota, RateLimiter,
     clock::DefaultClock,
@@ -158,7 +159,7 @@ impl KioSaosScraper {
     pub fn scrape_stream(
         &self,
         opts: KioScrapeOptions,
-    ) -> impl futures_lite::stream::Stream<Item = Result<KioEvent, KioScrapeError>> {
+    ) -> impl Stream<Item = Result<KioEvent, KioScrapeError>> {
         let capacity = opts.channel_capacity.max(1);
         let (event_tx, event_rx) = mpsc::channel(capacity);
         let scraper = self.clone();

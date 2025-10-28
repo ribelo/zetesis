@@ -2,7 +2,7 @@ use std::{
     env, fs, num::NonZeroUsize, ops::Range, path::Path, path::PathBuf, process, time::Duration,
 };
 
-use futures_lite::{StreamExt, stream::Stream};
+use futures_util::stream::{Stream, StreamExt};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde_json::json;
 use thiserror::Error;

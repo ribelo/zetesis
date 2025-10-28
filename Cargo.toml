@@ -52,7 +52,10 @@ strum_macros = "0.27.2"
 tap = "1.0.1"
 tempfile = "3.23.0"
 thiserror = "2.0.17"
-tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures-util = "0.3"
+futures-concurrency = "7.6.3"
 tokenizers = { version = "0.22.1", default-features = false, features = ["http", "rustls-tls", "fancy-regex"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
