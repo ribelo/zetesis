@@ -23,8 +23,7 @@ comfy-table = { workspace = true }
 config = { workspace = true }
 csv = { workspace = true }
 directories = { workspace = true }
-futures = { workspace = true }
-futures-concurrency = { workspace = true }
+futures-lite = { workspace = true }
 governor = { workspace = true }
 heed = { workspace = true }
 indicatif = { workspace = true }

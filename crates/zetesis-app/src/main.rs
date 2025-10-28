@@ -2,7 +2,7 @@ use std::{
     env, fs, num::NonZeroUsize, ops::Range, path::Path, path::PathBuf, process, time::Duration,
 };
 
-use futures::StreamExt;
+use futures_lite::{StreamExt, stream::Stream};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde_json::json;
 use thiserror::Error;
@@ -156,7 +156,7 @@ async fn process_kio_stream<S>(
     tracker: &mut ProgressTracker,
 ) -> Result<KioScraperSummary, AppError>
 where
-    S: futures::Stream<Item = Result<KioEvent, ingestion::IngestorError>> + Unpin,
+    S: Stream<Item = Result<KioEvent, ingestion::IngestorError>> + Unpin,
 {
     while let Some(event) = stream.next().await {
         let summary = tracker.handle_event(event?)?;

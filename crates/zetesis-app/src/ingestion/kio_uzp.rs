@@ -108,7 +108,7 @@ impl KioUzpScraper {
     pub fn scrape_stream(
         &self,
         opts: KioScrapeOptions,
-    ) -> impl futures::Stream<Item = Result<KioEvent, KioScrapeError>> {
+    ) -> impl futures_lite::stream::Stream<Item = Result<KioEvent, KioScrapeError>> {
         let capacity = opts.channel_capacity.max(1);
         let (event_tx, event_rx) = mpsc::channel(capacity);
         let scraper = self.clone();

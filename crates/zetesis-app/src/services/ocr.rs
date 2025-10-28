@@ -3,9 +3,11 @@ use std::{
     num::NonZeroU32,
     path::PathBuf,
     sync::{Arc, OnceLock},
+    time::Duration,
 };
 
 use async_trait::async_trait;
+use backon::{ExponentialBuilder, Retryable};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bon::Builder;
@@ -26,6 +28,7 @@ use image::{ColorType, GenericImageView, ImageDecoder, ImageEncoder};
 use regex::Regex;
 use serde::Serialize;
 use thiserror::Error;
+use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
 use super::{PdfPageImage, render_pdf_to_png_images};
@@ -69,14 +72,21 @@ pub trait OcrService: Send + Sync {
 pub struct DeepInfraOcr {
     client: Arc<DeepInfra>,
     limiter: Arc<OcrRateLimiter>,
+    backoff: ExponentialBuilder,
 }
 
 impl DeepInfraOcr {
     pub fn from_env() -> Result<Self, OcrError> {
         let client = DeepInfra::load_from_env().map_err(|_| OcrError::MissingApiKey)?;
+        let backoff = ExponentialBuilder::default()
+            .with_min_delay(Duration::from_millis(200))
+            .with_max_delay(Duration::from_secs(5))
+            .with_max_times(5)
+            .with_jitter();
         Ok(Self {
             client: Arc::new(client),
             limiter: Arc::clone(deepinfra_rate_limiter()),
+            backoff,
         })
     }
 }
@@ -204,6 +214,8 @@ pub enum OcrError {
     },
     #[error("missing DEEPINFRA_API_KEY environment variable")]
     MissingApiKey,
+    #[error("OCR task join failed: {0}")]
+    TaskJoin(#[from] tokio::task::JoinError),
 }
 
 #[async_trait]
@@ -214,18 +226,31 @@ impl OcrService for DeepInfraOcr {
         config: &OcrConfig,
     ) -> Result<Vec<OcrDocumentResult>, OcrError> {
         let mut docs = Vec::with_capacity(inputs.len());
+        let config_arc = Arc::new(config.clone());
 
         for input in inputs {
             let pages = collect_pages(input, config)?;
-            let mut page_results = Vec::with_capacity(pages.len());
+            let doc_id = input.id.clone();
+            let input_arc = Arc::new(input.clone());
+            let cfg_arc = Arc::clone(&config_arc);
 
+            let mut join_set = JoinSet::new();
             for page in pages {
-                let result = self.process_page(input, config, &page).await?;
-                page_results.push(result);
+                let svc = self.clone();
+                let input = Arc::clone(&input_arc);
+                let cfg = Arc::clone(&cfg_arc);
+                join_set.spawn(async move { svc.process_page(input, cfg, page).await });
             }
 
+            let mut page_results = Vec::with_capacity(join_set.len());
+            while let Some(res) = join_set.join_next().await {
+                let result = res.map_err(OcrError::TaskJoin)??;
+                page_results.push(result);
+            }
+            page_results.sort_by_key(|res| res.page_index);
+
             docs.push(OcrDocumentResult {
-                id: input.id.clone(),
+                id: doc_id,
                 pages: page_results,
             });
         }
@@ -237,12 +262,12 @@ impl OcrService for DeepInfraOcr {
 impl DeepInfraOcr {
     async fn process_page(
         &self,
-        input: &OcrInput,
-        config: &OcrConfig,
-        page: &PdfPageImage,
+        input: Arc<OcrInput>,
+        config: Arc<OcrConfig>,
+        page: PdfPageImage,
     ) -> Result<OcrPageResult, OcrError> {
-        let prepared =
-            prepare_image_for_ocr(&input.id, page.page_index, page, config.image_max_edge)?;
+        let page_index = page.page_index;
+        let prepared = prepare_image_for_ocr(&input.id, page_index, &page, config.image_max_edge)?;
 
         let default_prompt = config
             .detail
@@ -256,7 +281,7 @@ impl DeepInfraOcr {
 
         loop {
             let response = self
-                .invoke_model(&prepared, &prompt, max_tokens, &config.model)
+                .call_with_backoff(&prepared, &prompt, max_tokens, &config.model)
                 .await?;
 
             let usage = response.usage.clone();
@@ -287,7 +312,7 @@ impl DeepInfraOcr {
             if attempt == 0 && (truncated || looks_noise) {
                 warn!(
                     doc_id = %input.id,
-                    page = page.page_index,
+                    page = page_index,
                     truncated,
                     looks_noise,
                     "retrying OCR page with fallback prompt",
@@ -299,7 +324,7 @@ impl DeepInfraOcr {
             }
 
             return Ok(OcrPageResult {
-                page_index: page.page_index,
+                page_index,
                 render_width: page.width,
                 render_height: page.height,
                 ocr_width: prepared.width,
@@ -312,6 +337,18 @@ impl DeepInfraOcr {
         }
     }
 
+    async fn call_with_backoff(
+        &self,
+        prepared: &PreparedOcrImage,
+        prompt: &str,
+        max_tokens: u32,
+        model: &str,
+    ) -> Result<deepinfra_ox::ChatCompletionResponse, OcrError> {
+        let attempt = || async { self.invoke_model(prepared, prompt, max_tokens, model).await };
+
+        attempt.retry(self.backoff.clone()).await
+    }
+
     async fn invoke_model(
         &self,
         prepared: &PreparedOcrImage,
@@ -320,11 +357,14 @@ impl DeepInfraOcr {
         model: &str,
     ) -> Result<deepinfra_ox::ChatCompletionResponse, OcrError> {
         let mut parts = Vec::with_capacity(2);
-        let image_url = ImageUrl::new(format!(
+        let mut image_url = ImageUrl::new(format!(
             "data:{};base64,{}",
             prepared.mime_type,
             BASE64_STANDARD.encode(&prepared.data)
         ));
+        if !prompt.is_empty() {
+            image_url = image_url.with_detail(prompt.to_string());
+        }
 
         parts.push(DeepInfraMessageContentPart::ImageUrl { image_url });
         parts.push(DeepInfraMessageContentPart::Text {
