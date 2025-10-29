@@ -9,8 +9,8 @@ use serde_json::json;
 use thiserror::Error;
 use tracing_subscriber::{filter::LevelFilter, fmt};
 use zetesis_app::cli::{
-    Cli, Commands, DEFAULT_KIO_SAOS_URL, DEFAULT_KIO_UZP_URL, FetchKioArgs, KioSource, OcrPdfArgs,
-    OcrProviderKind, SegmentOutputFormat, SegmentPdfArgs,
+    Cli, Commands, DEFAULT_KIO_SAOS_URL, DEFAULT_KIO_UZP_URL, ExtractStructuredArgs, FetchKioArgs,
+    KioSource, OcrPdfArgs, OcrProviderKind, SegmentOutputFormat, SegmentPdfArgs,
 };
 use zetesis_app::ingestion::{
     KioEvent, KioSaosScraper, KioScrapeOptions, KioScraperSummary, KioUzpScraper,
@@ -18,6 +18,7 @@ use zetesis_app::ingestion::{
 use zetesis_app::pdf::{PdfRenderError, PdfTextError, extract_text_from_pdf};
 use zetesis_app::services::{
     DeepInfraOcr, GeminiOcr, OcrConfig, OcrError, OcrInput, OcrMimeType, OcrService,
+    StructuredExtractError, StructuredExtractor,
 };
 use zetesis_app::text::{PolishSentenceSegmenter, cleanup_text};
 use zetesis_app::{config, ingestion, server};
@@ -58,6 +59,8 @@ enum AppError {
     PdfRender(#[from] PdfRenderError),
     #[error(transparent)]
     Ocr(#[from] OcrError),
+    #[error(transparent)]
+    Structured(#[from] StructuredExtractError),
     #[error("failed to read input file {path}: {source}")]
     Io {
         path: PathBuf,
@@ -84,6 +87,9 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         }
         Some(Commands::OcrPdf(args)) => {
             run_ocr_pdf(args).await?;
+        }
+        Some(Commands::ExtractStructured(args)) => {
+            run_extract_structured(args).await?;
         }
         None => {
             Cli::print_help();
@@ -398,6 +404,31 @@ async fn run_ocr_pdf(args: OcrPdfArgs) -> Result<(), AppError> {
     Ok(())
 }
 
+async fn run_extract_structured(args: ExtractStructuredArgs) -> Result<(), AppError> {
+    let bytes = fs::read(&args.input).map_err(|source| AppError::Io {
+        path: args.input.clone(),
+        source,
+    })?;
+    let text = extract_text_from_pdf(&bytes)?;
+
+    let extractor = StructuredExtractor::from_env(&args.model)?;
+    let result = extractor.extract(&text).await?;
+
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    serde_json::to_writer_pretty(&mut handle, &result.decision)?;
+    println!();
+
+    eprintln!(
+        "prompt_tokens={} completion_tokens={} total_tokens={}",
+        result.usage.input_tokens(),
+        result.usage.output_tokens(),
+        result.usage.total_tokens()
+    );
+
+    Ok(())
+}
+
 fn render_sentences_text(path: &Path, segments: &[(Range<usize>, String)], with_offsets: bool) {
     println!("== {} ==", path.display());
     let mut first = true;
@@ -457,6 +488,12 @@ fn determine_log_level(cli: &Cli) -> LevelFilter {
             _ => LevelFilter::TRACE,
         },
         Some(Commands::OcrPdf(_)) => match cli.verbose {
+            0 => LevelFilter::OFF,
+            1 => LevelFilter::INFO,
+            2 => LevelFilter::DEBUG,
+            _ => LevelFilter::TRACE,
+        },
+        Some(Commands::ExtractStructured(_)) => match cli.verbose {
             0 => LevelFilter::OFF,
             1 => LevelFilter::INFO,
             2 => LevelFilter::DEBUG,

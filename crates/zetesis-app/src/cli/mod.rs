@@ -50,6 +50,8 @@ pub enum Commands {
     SegmentPdf(SegmentPdfArgs),
     /// Render a PDF page-by-page, OCR via a selected provider, and emit JSON results.
     OcrPdf(OcrPdfArgs),
+    /// Extract structured KIO decision data from a PDF using Gemini structured output.
+    ExtractStructured(ExtractStructuredArgs),
 }
 
 #[derive(Debug, Args)]
@@ -130,6 +132,17 @@ pub struct OcrPdfArgs {
     /// Maximum tokens requested from the model.
     #[arg(long, default_value_t = 4096)]
     pub max_tokens: u32,
+}
+
+/// Extract structured decision data from a PDF.
+#[derive(Debug, Args)]
+pub struct ExtractStructuredArgs {
+    /// PDF document to process.
+    #[arg(value_name = "PDF")]
+    pub input: PathBuf,
+    /// Gemini model identifier to use for structured extraction.
+    #[arg(long, default_value = "gemini-2.5-flash-lite-preview-09-2025")]
+    pub model: String,
 }
 
 /// How to render chunk output.

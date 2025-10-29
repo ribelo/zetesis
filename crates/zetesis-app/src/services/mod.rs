@@ -8,6 +8,7 @@
 pub mod context;
 pub mod ocr;
 pub mod orchestrator;
+pub mod structured;
 
 pub use context::{
     EmbedClient, EmbedService, Governors, PipelineContext, PipelineError, PipelineResult,
@@ -17,3 +18,4 @@ pub use ocr::{
     OcrPageResult, OcrService, OcrSpan,
 };
 pub use orchestrator::run_for_silo;
+pub use structured::{StructuredExtractError, StructuredExtraction, StructuredExtractor};

@@ -3,7 +3,6 @@
 //! Modules under this namespace must remain free of IO and external side effects
 //! so they can be reused across batch orchestrators and test harnesses.
 
-pub mod extract;
 pub mod processor;
 pub mod structured;
 
