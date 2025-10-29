@@ -1,4 +1,4 @@
-use zetesis_app::services::pdf::{PdfTextError, extract_text_from_pdf};
+use zetesis_app::pdf::{PdfTextError, extract_text_from_pdf};
 
 #[test]
 fn pdfium_extracts_polish_text() {

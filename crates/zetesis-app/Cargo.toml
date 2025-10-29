@@ -6,7 +6,7 @@ authors = ["ribelo"]
 license = "MIT"
 
 [dependencies]
-ai-ox = { workspace = true }
+ai-ox = { workspace = true, features = ["gemini"] }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
@@ -61,6 +61,7 @@ pulldown-cmark = { workspace = true }
 icu_segmenter = { workspace = true }
 image = { workspace = true }
 deepinfra-ox = { workspace = true }
+gemini-ox = { workspace = true }
 
 [dev-dependencies]
 serde_yaml = "0.9"

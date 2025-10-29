@@ -189,7 +189,11 @@ impl KioSaosScraper {
         send_event(&event_tx, KioEvent::DiscoveryStarted { limit: opts.limit }).await?;
 
         let worker_count = opts.worker_count.get();
-        let (sender, receiver) = mpsc::channel(opts.channel_capacity);
+        let channel_capacity = opts.channel_capacity.max(1);
+        let mut discovery_concurrency = opts.discovery_concurrency.get();
+        discovery_concurrency = discovery_concurrency.min(worker_count);
+        discovery_concurrency = discovery_concurrency.min(channel_capacity);
+        let (sender, receiver) = mpsc::channel(channel_capacity);
 
         let downloaded = Arc::new(AtomicUsize::new(0));
         let skipped_existing = Arc::new(AtomicUsize::new(0));
@@ -200,6 +204,11 @@ impl KioSaosScraper {
             event_tx.clone(),
         );
 
+        assert!(
+            discovery_concurrency > 0,
+            "discovery concurrency must be positive"
+        );
+
         let mut join_set = spawn_workers(
             self.clone(),
             receiver,
@@ -208,7 +217,9 @@ impl KioSaosScraper {
             worker_stats,
         );
 
-        let discovery = self.run_discovery(&sender, opts.limit, &event_tx).await?;
+        let discovery = self
+            .run_discovery(&sender, opts.limit, discovery_concurrency, &event_tx)
+            .await?;
 
         drop(sender);
 
@@ -235,60 +246,91 @@ impl KioSaosScraper {
         &self,
         sender: &mpsc::Sender<SaosDocumentTask>,
         limit: Option<usize>,
+        discovery_concurrency: usize,
         event_tx: &EventSender,
     ) -> Result<DiscoveryStats, KioScrapeError> {
-        let mut page = 0usize;
+        assert!(
+            discovery_concurrency > 0,
+            "discovery concurrency must be non-zero"
+        );
+
         let mut discovered = 0usize;
         let mut target = compute_discovery_target(limit, None);
         let mut total_available = None;
+        let mut next_page = 0usize;
+        let mut should_stop = false;
 
-        loop {
-            let response = self.fetch_results_page(page).await?;
+        let mut join_set = JoinSet::new();
+        let mut inflight = 0usize;
 
-            if let Some(total) = response.total_available {
-                total_available = Some(total);
-                target = compute_discovery_target(limit, total_available);
-            }
+        // See kio_uzp discovery notes: JoinSet keeps bounded fan-out with early cancellation
+        // when we reach the discovery target. futures-concurrency collectors would decouple
+        // fetch completion from spawn decisions, so JoinSet remains the clearer choice.
+        for _ in 0..discovery_concurrency {
+            join_set.spawn(fetch_saos_discovery_page(self.clone(), next_page));
+            next_page += 1;
+            inflight += 1;
+        }
 
-            if response.items.is_empty() {
-                break;
-            }
+        while let Some(result) = join_set.join_next().await {
+            inflight -= 1;
+            let (page, response) = match result {
+                Ok(Ok(value)) => value,
+                Ok(Err(err)) => return Err(err),
+                Err(join_err) => return Err(to_scraper_join_error(join_err)),
+            };
 
-            for task in response.items.into_iter() {
-                if discovered >= target {
-                    break;
+            if !should_stop {
+                if let Some(total) = response.total_available {
+                    total_available = Some(total);
+                    target = compute_discovery_target(limit, total_available);
                 }
 
-                let metadata = KioDocumentMetadata {
-                    doc_id: task.doc_id.clone(),
-                    sygnatura: task.case_number.clone(),
-                    decision_type: task.judgment_type.clone(),
-                };
+                if response.items.is_empty() {
+                    should_stop = true;
+                } else {
+                    for task in response.items {
+                        if discovered >= target {
+                            should_stop = true;
+                            break;
+                        }
 
-                send_event(
-                    event_tx,
-                    KioEvent::Discovered {
-                        ordinal: discovered + 1,
-                        page: page + 1,
-                        total_hint: total_available,
-                        metadata,
-                    },
-                )
-                .await?;
+                        let metadata = KioDocumentMetadata {
+                            doc_id: task.doc_id.clone(),
+                            sygnatura: task.case_number.clone(),
+                            decision_type: task.judgment_type.clone(),
+                        };
 
-                sender
-                    .send(task)
-                    .await
-                    .map_err(|_| KioScrapeError::ChannelClosed)?;
+                        send_event(
+                            event_tx,
+                            KioEvent::Discovered {
+                                ordinal: discovered + 1,
+                                page: page + 1,
+                                total_hint: total_available,
+                                metadata,
+                            },
+                        )
+                        .await?;
 
-                discovered += 1;
+                        sender
+                            .send(task)
+                            .await
+                            .map_err(|_| KioScrapeError::ChannelClosed)?;
+
+                        discovered += 1;
+                    }
+                }
             }
 
-            if discovered >= target {
+            if !should_stop {
+                join_set.spawn(fetch_saos_discovery_page(self.clone(), next_page));
+                next_page += 1;
+                inflight += 1;
+            }
+
+            if inflight == 0 {
                 break;
             }
-
-            page += 1;
         }
 
         Ok(DiscoveryStats {
@@ -896,6 +938,14 @@ fn to_scraper_join_error(err: tokio::task::JoinError) -> KioScrapeError {
     } else {
         KioScrapeError::parse("worker_join", "worker aborted unexpectedly")
     }
+}
+
+async fn fetch_saos_discovery_page(
+    scraper: KioSaosScraper,
+    page: usize,
+) -> Result<(usize, SaosSearchPage), KioScrapeError> {
+    let response = scraper.fetch_results_page(page).await?;
+    Ok((page, response))
 }
 
 fn transform_search_response(response: SearchResponse) -> SaosSearchPage {

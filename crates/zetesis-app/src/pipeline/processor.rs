@@ -1,6 +1,5 @@
-use super::pdf::{PdfTextError, extract_text_from_pdf};
-use super::polish_segmenter::PolishSentenceSplit;
-use super::text_cleanup::cleanup_text;
+use crate::pdf::{PdfTextError, extract_text_from_pdf};
+use crate::text::{PolishSentenceSplit, cleanup_text};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use strum::{AsRefStr, EnumIter, EnumString};

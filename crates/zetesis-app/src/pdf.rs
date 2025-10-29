@@ -1,3 +1,5 @@
+//! PDF helpers for extracting text and rendering page images.
+
 use std::cmp::Ordering;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -188,7 +190,7 @@ fn render_page(
     for pair in glyphs.windows(2) {
         let prev = &pair[0];
         let next = &pair[1];
-        if same_line(prev, next, line_threshold) {
+        if same_line(next, prev, line_threshold) {
             let gap = next.left() - prev.right();
             if gap.is_finite() && gap > 0.0 {
                 gap_samples.push(gap);

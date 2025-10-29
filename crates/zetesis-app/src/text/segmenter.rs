@@ -1,3 +1,5 @@
+//! Sentence segmentation tuned for Polish legal documents.
+
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::{Arc, LazyLock};

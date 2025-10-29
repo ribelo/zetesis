@@ -21,9 +21,7 @@
 
 - **Prioritize:** Safety → Performance → Developer Experience.
 - **Pair assertions at caller/callee to enforce contracts; check required/forbidden behaviors at compile time when possible.**
-- **Prefer static memory after initialization; avoid reallocations in hot paths.**
 - **Centralize control/state at parent; keep leaf functions pure; batch ops to amortize cost.**
-- **Set a hard ceiling of ~70 lines per function. Move significant logic up (`if`) or down (`for`) to minimize live variables.**
 - **Sketch performance: estimate bandwidth/latency for network, disk, memory, CPU. Optimize the slowest/highest-frequency resource.**
 - **Buffer/batch to bound work; don't react immediately to interrupts.**
 - **Prefer explicit call-site options over defaults to avoid subtle behavior.**
@@ -85,13 +83,17 @@
   - [ ] Negative tests present
   - [ ] Actionable logs
 - **Conventional prefixes (`feat:`, `fix:`, `docs:`, `chore:`); single-purpose commits.**
+ - **PR hygiene:** Link relevant TODO items, include validation commands, and record follow-ups in TODO instead of the PR thread.
 
 ---
 
 ## Project Structure & Module Organization
 - Keep `SPEC` ahead of code; mirror slugs in `TODO` and review daily on active work.
 - Shared crates live under `crates/`; add only once code proves reusable.
-- Layout: CLI in `src/cli/`, services in `src/services/`, shared logic in `src/lib.rs`, integration suites in `tests/`, docs in `docs/`.
+- Layout: CLI in `src/cli/`; orchestration-only services in `src/services/`; pure transforms/utilities in `src/text/`, `src/pdf.rs`, and `src/pipeline/`; integration suites in `tests/`; docs in `docs/`. New code must respect this boundary.
+- OCR providers plug into `services::ocr` via the `PageProvider` trait and `OcrEngine`; reuse the shared concurrency/rate-limiting pipeline instead of cloning ad-hoc loops.
+- Gemini OCR pricing (Gemini API paid tier, per 1 M tokens): input text/image/video $0.10, output (incl. thinking) $0.40. Batch API halves this ($0.05 / $0.20). Free tier is zero-cost but rate-limited.
+- DeepSeek-OCR on DeepInfra (per 1 M tokens): input $0.03, output $0.10. OlmOCR pricing is not currently published on DeepInfra—confirm with dashboards before committing workloads.
 
 ## Communication Defaults
 - Lead with the answer, then evidence; numbered questions keep alignment and force plain speech.
@@ -139,9 +141,7 @@
 - Co-locate fast tests via `#[cfg(test)]`; scenario tests live in `tests/<feature>_spec.rs` using `tokio::test`.
 - Reference SPEC slugs (e.g., `covers REQ-ZE-CLI-FIRST`) to keep traceability.
 
-## Commit & Pull Request Guidelines
-- Use conventional prefixes (`feat:`, `fix:`, `docs:`, `chore:`) and single-purpose commits.
-- PRs must link TODO items, list validation commands, and capture follow-ups in TODO instead of the PR thread.
+
 
 ## Preferred Libraries
 - Async & concurrency: Tokio with `futures-concurrency`, `async-trait`.
@@ -150,3 +150,9 @@
 - Text & search: `scraper`, `pulldown-cmark`, `itertools`, `indoc`, `strum`, `unicode-*`, `regex`, `milli`, `tokenizers`.
 - Networking & resilience: `reqwest` (rustls), `governor`, `backon`, `rayon`, `csv`, `chrono`, `uuid`, `bytes`, `tempfile`, `mime`, `nalgebra`, `pdfium-render`, `base64`, `bcrypt`.
 - AI & embeddings: reuse `../ai-ox`.
+
+## Async Stack Defaults
+- **Purpose:** pick async tools that match Tokio-first apps without smuggling extra complexity.
+- **Tokio runtime:** use Tokio end-to-end for scheduling, timers, I/O, channels, cancellations, and multithreaded spawning (`Send + 'static`). Keep `tokio`, `tokio-util`, and `tokio-stream` in scope; add `futures-util` only when you need adapters like `for_each_concurrent`.
+- **Prefer futures-concurrency:** default to `futures-concurrency` for orchestration whenever you do not need explicit parallel task spawns. Use its `join`, `try_join`, and `race` utilities for fixed sets; reach for `into_co_stream` + `.limit()` when you must process collections with bounded concurrency.
+- **Parallel hot paths:** when true parallelism or task spawning is required, stay on Tokio primitives (`tokio::try_join!`, `tokio::task::JoinSet`) and ensure spawned futures are `Send + 'static`. Combine with `futures-concurrency` only where borrowing-friendly combinators help.

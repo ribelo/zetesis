@@ -3,7 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use zetesis_app::services::{PolishSentenceSegmenter, cleanup_text, extract_text_from_pdf};
+use zetesis_app::pdf::extract_text_from_pdf;
+use zetesis_app::text::{PolishSentenceSegmenter, cleanup_text};
 
 #[test]
 fn splits_real_kio_pdf_smoke() -> Result<(), Box<dyn Error>> {

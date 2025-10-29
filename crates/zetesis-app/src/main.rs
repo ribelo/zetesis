@@ -1,5 +1,6 @@
 use std::{
-    env, fs, num::NonZeroUsize, ops::Range, path::Path, path::PathBuf, process, time::Duration,
+    env, fs, num::NonZeroUsize, ops::Range, path::Path, path::PathBuf, process, sync::Arc,
+    time::Duration,
 };
 
 use futures_util::stream::{Stream, StreamExt};
@@ -9,15 +10,16 @@ use thiserror::Error;
 use tracing_subscriber::{filter::LevelFilter, fmt};
 use zetesis_app::cli::{
     Cli, Commands, DEFAULT_KIO_SAOS_URL, DEFAULT_KIO_UZP_URL, FetchKioArgs, KioSource, OcrPdfArgs,
-    SegmentOutputFormat, SegmentPdfArgs,
+    OcrProviderKind, SegmentOutputFormat, SegmentPdfArgs,
 };
 use zetesis_app::ingestion::{
     KioEvent, KioSaosScraper, KioScrapeOptions, KioScraperSummary, KioUzpScraper,
 };
+use zetesis_app::pdf::{PdfRenderError, PdfTextError, extract_text_from_pdf};
 use zetesis_app::services::{
-    DeepInfraOcr, OcrConfig, OcrError, OcrInput, OcrMimeType, OcrService, PolishSentenceSegmenter,
-    cleanup_text, extract_text_from_pdf,
+    DeepInfraOcr, GeminiOcr, OcrConfig, OcrError, OcrInput, OcrMimeType, OcrService,
 };
+use zetesis_app::text::{PolishSentenceSegmenter, cleanup_text};
 use zetesis_app::{config, ingestion, server};
 
 #[tokio::main]
@@ -51,9 +53,9 @@ enum AppError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
-    Pdf(#[from] zetesis_app::services::PdfTextError),
+    Pdf(#[from] PdfTextError),
     #[error(transparent)]
-    PdfRender(#[from] zetesis_app::services::PdfRenderError),
+    PdfRender(#[from] PdfRenderError),
     #[error(transparent)]
     Ocr(#[from] OcrError),
     #[error("failed to read input file {path}: {source}")]
@@ -327,19 +329,30 @@ fn run_segment_pdf(args: SegmentPdfArgs) -> Result<(), AppError> {
 }
 
 async fn run_ocr_pdf(args: OcrPdfArgs) -> Result<(), AppError> {
+    let selected_model = if matches!(args.provider, OcrProviderKind::Gemini)
+        && args.model == "allenai/olmOCR-2-7B-1025"
+    {
+        "gemini-2.5-flash-lite-preview-09-2025".to_string()
+    } else {
+        args.model.clone()
+    };
+
     let config = OcrConfig {
-        model: args.model.clone(),
+        model: selected_model.clone(),
         render_width: args.render_width,
         image_max_edge: args.image_max_edge,
         detail: args.detail.clone(),
         max_tokens: args.max_tokens,
+        docs_concurrency: NonZeroUsize::new(2).expect("non-zero docs concurrency"),
+        pages_concurrency: NonZeroUsize::new(8).expect("non-zero pages concurrency"),
+        max_inflight_requests: NonZeroUsize::new(16).expect("non-zero inflight budget"),
     };
 
-    let service = DeepInfraOcr::from_env()?;
     let bytes = fs::read(&args.input).map_err(|source| AppError::Io {
         path: args.input.clone(),
         source,
     })?;
+    let bytes: Arc<[u8]> = Arc::from(bytes);
 
     let mime_type = args
         .input
@@ -359,7 +372,16 @@ async fn run_ocr_pdf(args: OcrPdfArgs) -> Result<(), AppError> {
         mime_type,
     };
     let inputs = vec![input];
-    let mut documents = service.run_batch(&inputs, &config).await?;
+    let mut documents = match args.provider {
+        OcrProviderKind::Deepinfra => {
+            let service = DeepInfraOcr::from_env()?;
+            service.run_batch(inputs, &config).await?
+        }
+        OcrProviderKind::Gemini => {
+            let service = GeminiOcr::from_env(selected_model.clone(), config.max_tokens)?;
+            service.run_batch(inputs, &config).await?
+        }
+    };
     let document = documents.pop().ok_or_else(|| {
         AppError::Ocr(OcrError::UnsupportedInput {
             id: args.input.display().to_string(),

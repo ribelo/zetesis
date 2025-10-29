@@ -4,5 +4,8 @@ pub mod constants;
 pub mod index;
 pub mod ingestion;
 pub mod paths;
+pub mod pdf;
+pub mod pipeline;
 pub mod server;
 pub mod services;
+pub mod text;

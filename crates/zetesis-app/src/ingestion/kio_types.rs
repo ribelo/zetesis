@@ -14,6 +14,33 @@ pub struct KioScrapeOptions {
     pub worker_count: NonZeroUsize,
     #[builder(default = 64)]
     pub channel_capacity: usize,
+    #[builder(default = NonZeroUsize::new(2).unwrap())]
+    pub discovery_concurrency: NonZeroUsize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KioScrapeOptions;
+    use std::{num::NonZeroUsize, path::PathBuf};
+
+    #[test]
+    fn builder_defaults_discovery_concurrency() {
+        let options = KioScrapeOptions::builder()
+            .output_dir(PathBuf::from("/tmp"))
+            .build();
+
+        assert_eq!(options.discovery_concurrency.get(), 2);
+    }
+
+    #[test]
+    fn builder_overrides_discovery_concurrency() {
+        let options = KioScrapeOptions::builder()
+            .output_dir(PathBuf::from("/tmp"))
+            .discovery_concurrency(NonZeroUsize::new(3).unwrap())
+            .build();
+
+        assert_eq!(options.discovery_concurrency.get(), 3);
+    }
 }
 
 /// Basic KIO metadata emitted during discovery.

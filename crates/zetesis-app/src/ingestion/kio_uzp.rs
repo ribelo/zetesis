@@ -139,7 +139,11 @@ impl KioUzpScraper {
         send_event(&event_tx, KioEvent::DiscoveryStarted { limit: opts.limit }).await?;
 
         let worker_count = opts.worker_count.get();
-        let (sender, receiver) = mpsc::channel(opts.channel_capacity);
+        let channel_capacity = opts.channel_capacity.max(1);
+        let mut discovery_concurrency = opts.discovery_concurrency.get();
+        discovery_concurrency = discovery_concurrency.min(worker_count);
+        discovery_concurrency = discovery_concurrency.min(channel_capacity);
+        let (sender, receiver) = mpsc::channel(channel_capacity);
 
         let downloaded = Arc::new(AtomicUsize::new(0));
         let skipped_existing = Arc::new(AtomicUsize::new(0));
@@ -150,6 +154,11 @@ impl KioUzpScraper {
             event_tx.clone(),
         );
 
+        assert!(
+            discovery_concurrency > 0,
+            "discovery concurrency must be positive"
+        );
+
         let mut join_set = spawn_workers(
             self.clone(),
             receiver,
@@ -158,7 +167,9 @@ impl KioUzpScraper {
             worker_stats,
         );
 
-        let discovery = self.run_discovery(&sender, opts.limit, &event_tx).await?;
+        let discovery = self
+            .run_discovery(&sender, opts.limit, discovery_concurrency, &event_tx)
+            .await?;
 
         drop(sender);
 
@@ -185,63 +196,92 @@ impl KioUzpScraper {
         &self,
         sender: &mpsc::Sender<KioDocumentTask>,
         limit: Option<usize>,
+        discovery_concurrency: usize,
         event_tx: &EventSender,
     ) -> Result<DiscoveryStats, KioScrapeError> {
-        let mut page = 1usize;
+        assert!(
+            discovery_concurrency > 0,
+            "discovery concurrency must be non-zero"
+        );
+
         let mut discovered = 0usize;
         let mut target = compute_discovery_target(limit, None);
         let mut total_available = None;
+        let mut next_page = 1usize;
+        let mut should_stop = false;
 
-        loop {
-            let count_stats = page == 1;
-            let form = build_search_form(page, count_stats);
-            let html = self.fetch_results_page(form, page).await?;
+        let mut join_set = JoinSet::new();
+        let mut inflight = 0usize;
 
-            let parsed = parse_results_page(&html)?;
-            if let Some(total) = parsed.total_available {
-                total_available = Some(total);
-                target = compute_discovery_target(limit, total_available);
-            }
+        // JoinSet keeps bounded, cancellable fan-out: async fetches are long-lived IO tasks,
+        // and we want the ability to stop spawning once the discovery target or empty page is hit.
+        // futures-concurrency's collectors would buffer completions without letting us interleave
+        // "spawn next" decisions, so JoinSet stays here for clarity and cancellation semantics.
+        for _ in 0..discovery_concurrency {
+            join_set.spawn(fetch_discovery_page(self.clone(), next_page));
+            next_page += 1;
+            inflight += 1;
+        }
 
-            if parsed.items.is_empty() {
-                break;
-            }
+        while let Some(result) = join_set.join_next().await {
+            inflight -= 1;
+            let (page, parsed) = match result {
+                Ok(Ok(value)) => value,
+                Ok(Err(err)) => return Err(err),
+                Err(join_err) => return Err(to_scraper_join_error(join_err)),
+            };
 
-            for task in parsed.items.into_iter() {
-                if discovered >= target {
-                    break;
+            if !should_stop {
+                if let Some(total) = parsed.total_available {
+                    total_available = Some(total);
+                    target = compute_discovery_target(limit, total_available);
                 }
 
-                let metadata = KioDocumentMetadata {
-                    doc_id: task.doc_id.clone(),
-                    sygnatura: task.sygnatura.clone(),
-                    decision_type: task.decision_type.clone(),
-                };
+                if parsed.items.is_empty() {
+                    should_stop = true;
+                } else {
+                    for task in parsed.items {
+                        if discovered >= target {
+                            should_stop = true;
+                            break;
+                        }
 
-                send_event(
-                    event_tx,
-                    KioEvent::Discovered {
-                        ordinal: discovered + 1,
-                        page,
-                        total_hint: total_available,
-                        metadata,
-                    },
-                )
-                .await?;
+                        let metadata = KioDocumentMetadata {
+                            doc_id: task.doc_id.clone(),
+                            sygnatura: task.sygnatura.clone(),
+                            decision_type: task.decision_type.clone(),
+                        };
 
-                sender
-                    .send(task)
-                    .await
-                    .map_err(|_| KioScrapeError::ChannelClosed)?;
+                        send_event(
+                            event_tx,
+                            KioEvent::Discovered {
+                                ordinal: discovered + 1,
+                                page,
+                                total_hint: total_available,
+                                metadata,
+                            },
+                        )
+                        .await?;
 
-                discovered += 1;
+                        sender
+                            .send(task)
+                            .await
+                            .map_err(|_| KioScrapeError::ChannelClosed)?;
+
+                        discovered += 1;
+                    }
+                }
             }
 
-            if discovered >= target {
+            if !should_stop {
+                join_set.spawn(fetch_discovery_page(self.clone(), next_page));
+                next_page += 1;
+                inflight += 1;
+            }
+
+            if inflight == 0 {
                 break;
             }
-
-            page += 1;
         }
 
         Ok(DiscoveryStats {
@@ -935,6 +975,16 @@ fn text_content(element: &scraper::ElementRef<'_>) -> String {
         .join("")
         .trim()
         .to_string()
+}
+
+async fn fetch_discovery_page(
+    scraper: KioUzpScraper,
+    page: usize,
+) -> Result<(usize, KioSearchPage), KioScrapeError> {
+    let form = build_search_form(page, page == 1);
+    let html = scraper.fetch_results_page(form, page).await?;
+    let parsed = parse_results_page(&html)?;
+    Ok((page, parsed))
 }
 
 fn parse_err(stage: &'static str, err: impl fmt::Display) -> KioScrapeError {

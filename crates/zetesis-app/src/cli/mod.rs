@@ -48,7 +48,7 @@ pub enum Commands {
     FetchKio(FetchKioArgs),
     /// Segment local PDF documents and inspect the resulting sentences.
     SegmentPdf(SegmentPdfArgs),
-    /// Render a PDF page-by-page, OCR via DeepInfra, and emit JSON results.
+    /// Render a PDF page-by-page, OCR via a selected provider, and emit JSON results.
     OcrPdf(OcrPdfArgs),
 }
 
@@ -99,14 +99,24 @@ pub struct SegmentPdfArgs {
     pub with_offsets: bool,
 }
 
-/// OCR a PDF via DeepInfra and print JSON to stdout.
+/// Available OCR backends exposed through the CLI.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum OcrProviderKind {
+    Deepinfra,
+    Gemini,
+}
+
+/// OCR a PDF via the selected provider and print JSON to stdout.
 #[derive(Debug, Args)]
 pub struct OcrPdfArgs {
     /// PDF document to process.
     #[arg(value_name = "PDF")]
     pub input: PathBuf,
-    /// Override the DeepInfra model identifier.
-    #[arg(long, default_value = "deepseek-ai/DeepSeek-OCR")]
+    /// OCR provider used to send page renders.
+    #[arg(long = "ocr-provider", value_enum, default_value_t = OcrProviderKind::Deepinfra)]
+    pub provider: OcrProviderKind,
+    /// Override the model identifier for the selected provider.
+    #[arg(long = "ocr-model", default_value = "allenai/olmOCR-2-7B-1025")]
     pub model: String,
     /// Target width (pixels) when rasterizing each PDF page.
     #[arg(long, default_value_t = 2048)]

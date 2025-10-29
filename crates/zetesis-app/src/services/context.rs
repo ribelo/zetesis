@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::index::milli::{MilliBootstrapError, ensure_index};
 use crate::paths::{AppPaths, PathError};
-use crate::services::processor::Silo;
+use crate::pipeline::Silo;
 
 pub type GenericRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
