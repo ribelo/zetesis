@@ -440,7 +440,6 @@ impl DeepInfraProvider {
         max_tokens: u32,
         model: &str,
     ) -> Result<deepinfra_ox::ChatCompletionResponse, OcrError> {
-        let mut parts = Vec::with_capacity(2);
         let mut image_url = ImageUrl::new(format!(
             "data:{};base64,{}",
             prepared.mime_type,
@@ -448,12 +447,11 @@ impl DeepInfraProvider {
         ));
         image_url = image_url.with_detail("auto");
 
-        parts.push(DeepInfraMessageContentPart::ImageUrl { image_url });
-        parts.push(DeepInfraMessageContentPart::Text {
-            text: prompt.to_string(),
-        });
-
-        let message = DeepInfraMessage::user(DeepInfraMessageContent::Parts(parts));
+        let parts = vec![
+            DeepInfraMessageContentPart::image_url(image_url),
+            DeepInfraMessageContentPart::text(prompt.to_string()),
+        ];
+        let message = DeepInfraMessage::user(DeepInfraMessageContent::new(parts));
         let mut request = DeepInfraChatRequest::new(model.to_string(), vec![message]);
         request.max_tokens = Some(max_tokens);
         request.temperature = Some(0.0);
@@ -915,25 +913,26 @@ fn prepare_image_for_ocr(
 }
 
 fn flatten_message_content_text(content: &DeepInfraMessageContent) -> Option<String> {
-    match content {
-        DeepInfraMessageContent::Text(text) => Some(text.clone()),
-        DeepInfraMessageContent::Parts(parts) => {
-            let mut buffer = String::new();
-            for part in parts {
-                if let DeepInfraMessageContentPart::Text { text } = part {
-                    if !buffer.is_empty() {
-                        buffer.push('\n');
-                    }
-                    buffer.push_str(text);
-                }
-            }
+    if let Some(text) = content.as_text() {
+        return Some(text.to_string());
+    }
 
-            if buffer.is_empty() {
-                None
-            } else {
-                Some(buffer)
+    let mut buffer = String::new();
+    for part in content.parts() {
+        if let DeepInfraMessageContentPart::Text { text, .. } = part {
+            if !buffer.is_empty() {
+                buffer.push('\n');
             }
+            buffer.push_str(text);
+        } else {
+            return None;
         }
+    }
+
+    if buffer.is_empty() {
+        None
+    } else {
+        Some(buffer)
     }
 }
 

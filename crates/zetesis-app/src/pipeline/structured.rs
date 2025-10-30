@@ -42,6 +42,9 @@ pub struct StructuredDecision {
     /// High-level issues describing the subject of the dispute.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub issues: Vec<IssueTag>,
+    /// Semantic chunks covering the entire decision text (body text only) in order.
+    #[serde(default)]
+    pub chunks: Vec<SemanticChunk>,
     /// Short summary (1–2 sentences) capturing the essence of the ruling.
     #[serde(default)]
     pub summary_short: String,
@@ -98,6 +101,28 @@ impl StructuredDecision {
         for (idx, mention) in self.issues.iter().enumerate() {
             if mention.confidence > 100 {
                 issues.push(format!("issues[{idx}].confidence must be <= 100"));
+            }
+        }
+
+        if self.chunks.is_empty() {
+            issues.push("chunks must contain at least one semantic chunk".to_string());
+        } else {
+            let mut expected_position: u16 = 1;
+            for (idx, chunk) in self.chunks.iter().enumerate() {
+                if chunk.position != expected_position {
+                    issues.push(format!(
+                        "chunks[{idx}].position must equal {expected_position}"
+                    ));
+                }
+                if let Some(section) = chunk.section.as_ref() {
+                    if section.trim().is_empty() {
+                        issues.push(format!("chunks[{idx}].section must not be empty"));
+                    }
+                }
+                if chunk.body.trim().is_empty() {
+                    issues.push(format!("chunks[{idx}].body must not be empty"));
+                }
+                expected_position = expected_position.saturating_add(1);
             }
         }
 
@@ -174,7 +199,9 @@ pub struct Procurement {
     /// Tender identifier or internal case number, if provided.
     pub tender_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    /// CPV codes linked to the procurement scope.
+    /// CPV codes linked to the procurement scope. Accepts either the canonical
+    /// 8-digit form (e.g., "39120000") or the common hyphenated form with a
+    /// trailing check digit (e.g., "39120000-3").
     pub cpv_codes: Vec<String>,
 }
 
@@ -194,7 +221,10 @@ impl Procurement {
         let mut issues = Vec::new();
         for (idx, cpv) in self.cpv_codes.iter().enumerate() {
             if !is_valid_cpv(cpv) {
-                issues.push(format!("cpv_codes[{idx}] must be 8 digits, got '{cpv}'"));
+                issues.push(format!(
+                    "cpv_codes[{idx}] must match NNNNNNNN or NNNNNNNN-X, got '{}'",
+                    cpv
+                ));
             }
         }
         if issues.is_empty() {
@@ -249,6 +279,18 @@ pub struct IssueTag {
     #[serde(default)]
     /// Confidence score (0-100) for the assigned label.
     pub confidence: u8,
+}
+
+/// Semantic representation of a contiguous text fragment.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SemanticChunk {
+    /// 1-based order of the chunk as it appears in the document.
+    pub position: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Logical section label (e.g., "sentencja", "uzasadnienie").
+    pub section: Option<String>,
+    /// Full body text for the chunk.
+    pub body: String,
 }
 
 /// Result of the decision regarding the appeal.
@@ -549,8 +591,10 @@ fn is_valid_currency(value: &str) -> bool {
 }
 
 fn is_valid_cpv(value: &str) -> bool {
+    // Accept either plain 8 digits (canonical) or 8 digits followed by a hyphen and a
+    // single check digit, which is a common presentation in source documents.
     static CPV_RE: OnceLock<Regex> = OnceLock::new();
-    let regex = CPV_RE.get_or_init(|| Regex::new(r"^\d{8}$").expect("cpv regex compiles"));
+    let regex = CPV_RE.get_or_init(|| Regex::new(r"^\d{8}(-\d)?$").expect("cpv regex compiles"));
     regex.is_match(value)
 }
 
@@ -603,6 +647,18 @@ mod tests {
                 issue_key: IssueKey::EvaluationCriteria,
                 confidence: 80,
             }],
+            chunks: vec![
+                SemanticChunk {
+                    position: 1,
+                    section: Some("sentencja".to_string()),
+                    body: "Opis przebiegu postępowania wraz z uczestnikami.".to_string(),
+                },
+                SemanticChunk {
+                    position: 2,
+                    section: Some("uzasadnienie".to_string()),
+                    body: "Szczegółowe uzasadnienie z podstawą prawną.".to_string(),
+                },
+            ],
             summary_short: "Izba uwzględniła odwołanie i nakazała powtórzenie oceny ofert."
                 .to_string(),
         }
@@ -622,6 +678,9 @@ mod tests {
         decision.procurement.cpv_codes.push("12A".to_string());
         decision.summary_short.clear();
         decision.costs[0].currency = "pln".to_string();
+        decision.chunks[0].body.clear();
+        decision.chunks[1].position = 4;
+        decision.chunks[0].section = Some("".to_string());
 
         let error = decision.validate().expect_err("validation must fail");
         assert!(
@@ -661,6 +720,29 @@ mod tests {
             "{:?}",
             error.issues
         );
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.contains("chunks[0].body")),
+            "{:?}",
+            error.issues
+        );
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.contains("chunks[1].position")),
+            "{:?}",
+            error.issues
+        );
+    }
+
+    #[test]
+    fn accepts_hyphenated_cpv() {
+        let mut decision = make_valid_decision();
+        decision.procurement.cpv_codes = vec!["39120000-3".to_string(), "72222300".to_string()];
+        assert!(decision.validate().is_ok());
     }
 
     #[test]

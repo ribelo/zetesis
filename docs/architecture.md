@@ -6,21 +6,21 @@ Zetesis is a lightweight SaaS for full-text and similarity search over documents
 ## 2. System Components
 - **Server (`zetesis-app`)**: Single binary exposing both the Axum HTTP API and a Clap-powered maintenance CLI.
 - **CLI Commands**: Share the binary entry point; subcommands such as `serve`, `documents add`, and `scrape ...` will be introduced once requirements solidify.
-- **Storage**: LMDB via the `heed` crate stores canonical documents, metadata, and index snapshots.
-- **Search Index**: The `milli` engine (from Meilisearch) provides full-text and vector-similarity search, embedded alongside LMDB.
+- **Storage / Search**: A single Milli index (backed by LMDB internally) stores canonical structured documents, chunk records, and user-provided vectors.
+- **Blob Store**: Original PDFs are written to the filesystem using content-addressed paths under the XDG data directory.
 - **AI & Embeddings**: The local `ai-ox` crate supplies LLM utilities and embedding models; treat it as the sole integration point for AI tasks.
 - **Configuration**: Loaded with the `config` crate, resolved through XDG directories via `directories`; defaults live in `config/settings.example.toml`.
 
 ## 3. Data & Storage Strategy
-- LMDB is the authoritative store: one environment under `${XDG_DATA_HOME}/zetesis/lmdb`.
-- Document ingestion will normalize content, persist the canonical form in LMDB, and emit an index update into milli.
-- Index snapshots mirror LMDB transactions to keep writes atomic; cross-reference keys should remain simple strings (`doc:{id}`).
+- The Milli index is the authoritative store for structured documents and chunk records. All canonical JSON lands here and is queryable directly.
+- Original PDFs are stored on disk (`${XDG_DATA_HOME}/zetesis/blobs/{silo}/{prefix}/{hash}.pdf`) with stable identifiers linking them to Milli documents.
+- Auxiliary application metadata (e.g., configuration caches, counters) may live in separate LMDB environments, but documents themselves never leave Milli.
 
 ## 4. Ingest & Search Pipeline
 1. **Scrape**: Fetch documents (HTML, Markdown, PDF). TODO: choose extraction tooling (e.g., `scraper`, `selectolax`, or external services).
 2. **Normalize**: Convert to clean text, capture metadata (title, URL, tags).
-3. **Persist**: Store normalized documents in LMDB.
-4. **Index**: Push records into milli, configuring searchable fields, ranking rules, and embedding vectors generated through `ai-ox`.
+3. **Persist**: Upsert canonical structured documents into Milli (doc record) and derived chunk records with vectors.
+4. **Index**: Configure Milli searchable/filterable fields and user-provided vectors generated through `ai-ox`.
 5. **Query**: HTTP endpoints and CLI utilities route queries through milli, returning ranked results with metadata pulled from LMDB.
 
 ## 5. Interfaces

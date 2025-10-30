@@ -2,7 +2,7 @@
 
 This note captures the pricing mechanics and back-of-the-envelope totals for our
 current OCR providers. Numbers come from the sample run on
-`data/kio/kio_5430.pdf` (11 pages); adjust if token characteristics change.
+`data/kio/raw/kio/kio_5430.pdf` (11 pages); adjust if token characteristics change.
 
 ## Pricing Cheat Sheet
 

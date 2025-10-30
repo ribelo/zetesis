@@ -156,3 +156,19 @@
 - **Tokio runtime:** use Tokio end-to-end for scheduling, timers, I/O, channels, cancellations, and multithreaded spawning (`Send + 'static`). Keep `tokio`, `tokio-util`, and `tokio-stream` in scope; add `futures-util` only when you need adapters like `for_each_concurrent`.
 - **Prefer futures-concurrency:** default to `futures-concurrency` for orchestration whenever you do not need explicit parallel task spawns. Use its `join`, `try_join`, and `race` utilities for fixed sets; reach for `into_co_stream` + `.limit()` when you must process collections with bounded concurrency.
 - **Parallel hot paths:** when true parallelism or task spawning is required, stay on Tokio primitives (`tokio::try_join!`, `tokio::task::JoinSet`) and ensure spawned futures are `Send + 'static`. Combine with `futures-concurrency` only where borrowing-friendly combinators help.
+
+---
+
+## Canonical Identity & Deduplication
+
+- Canonical doc identity must be BLAKE3 of the exact original content bytes.
+  - Use lowercase hex digest as `doc_id`.
+  - Never derive identity from filenames, URLs, upstream IDs, or user input.
+  - Treat all third‑party identifiers strictly as metadata/aliases (e.g., under `identifiers.*`).
+- All ingest paths (scrapers, CLI, batch jobs) must compute and use the same BLAKE3 `doc_id` before indexing.
+  - If an upstream ID is available, persist it as metadata only; it must not influence primary keys.
+- Indexing must be idempotent: rely on deterministic `{silo}-{doc_id}-doc` and `{silo}-{doc_id}-chunk-{ord}` keys and use ReplaceDocuments semantics.
+- Add regression tests to prove:
+  - Same bytes under different filenames map to the same `doc_id`.
+  - Same upstream item via different sources resolves to the same `doc_id`.
+  - Modified content produces a different `doc_id`.

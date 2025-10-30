@@ -53,6 +53,11 @@ impl AppPaths {
         self.ensure_child(&["lmdb", "app"])
     }
 
+    /// LMDB directory dedicated to embedding job metadata (`.../lmdb/jobs`).
+    pub fn embedding_jobs_lmdb_dir(&self) -> Result<PathBuf, PathError> {
+        self.ensure_child(&["lmdb", "jobs"])
+    }
+
     /// Base directory for Milli indices (`.../milli`).
     pub fn milli_base_dir(&self) -> Result<PathBuf, PathError> {
         self.ensure_child(&["milli"])
@@ -71,6 +76,31 @@ impl AppPaths {
     /// Directory for blobs belonging to a silo (`.../blobs/{silo}`).
     pub fn blobs_silo_dir<S: AsRef<str>>(&self, silo: S) -> Result<PathBuf, PathError> {
         let segments = vec!["blobs".to_string(), normalize_slug(silo.as_ref())];
+        self.ensure_dynamic(&segments)
+    }
+
+    /// Base directory for embedding job staging (`.../jobs`).
+    pub fn embedding_jobs_base_dir(&self) -> Result<PathBuf, PathError> {
+        self.ensure_child(&["jobs"])
+    }
+
+    /// Directory where raw payloads for embedding jobs are staged (`.../jobs/payloads/{silo}`).
+    pub fn embedding_jobs_payload_dir<S: AsRef<str>>(&self, silo: S) -> Result<PathBuf, PathError> {
+        let segments = vec![
+            "jobs".to_string(),
+            "payloads".to_string(),
+            normalize_slug(silo.as_ref()),
+        ];
+        self.ensure_dynamic(&segments)
+    }
+
+    /// Directory where embedding results are staged (`.../jobs/results/{silo}`).
+    pub fn embedding_jobs_results_dir<S: AsRef<str>>(&self, silo: S) -> Result<PathBuf, PathError> {
+        let segments = vec![
+            "jobs".to_string(),
+            "results".to_string(),
+            normalize_slug(silo.as_ref()),
+        ];
         self.ensure_dynamic(&segments)
     }
 

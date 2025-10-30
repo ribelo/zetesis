@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::pipeline::structured::{StructuredDecision, StructuredValidationError};
 
-const SYSTEM_PROMPT: &str = "Jesteś ekspertem analizującym orzeczenia KIO. Odpowiadasz wyłącznie w formacie JSON zgodnym ze schematem przekazanym przez API.";
+const SYSTEM_PROMPT: &str = "Jesteś ekspertem analizującym orzeczenia KIO. Odpowiadasz wyłącznie w formacie JSON zgodnym ze schematem przekazanym przez API. Pole `chunks` musi zawierać wszystkie fragmenty tekstu w kolejności i obejmować pełny tekst dokumentu.";
 const RETRY_SUFFIX: &str =
     "\n\nUWAGA: Poprzednia odpowiedź była niepoprawna. Zwróć wyłącznie poprawny JSON.";
 const DEFAULT_MAX_ATTEMPTS: u8 = 2;
@@ -55,23 +55,28 @@ impl StructuredExtractor {
         &self,
         text: &str,
     ) -> Result<StructuredExtraction, StructuredExtractError> {
+        self.extract_with_context(text, &[], Some(text)).await
+    }
+
+    pub async fn extract_with_context(
+        &self,
+        message_text: &str,
+        attachments: &[Part],
+        coverage_text: Option<&str>,
+    ) -> Result<StructuredExtraction, StructuredExtractError> {
         let mut attempt = 0;
         let mut last_error: Option<StructuredExtractError> = None;
+        let attachments = attachments.to_vec();
 
         while attempt < self.max_attempts {
-            if attempt == 0 {
-                let schema = schemars::schema_for!(StructuredDecision);
-                let schema_json =
-                    serde_json::to_value(&schema).expect("structured decision schema serializable");
-                dbg!(schema_json);
+            let mut user_parts = attachments.clone();
+            let mut payload_text = message_text.to_owned();
+            if attempt > 0 {
+                payload_text.push_str(RETRY_SUFFIX);
             }
-            let user_text = if attempt == 0 {
-                text.to_owned()
-            } else {
-                format!("{text}{RETRY_SUFFIX}")
-            };
+            user_parts.push(Part::text(payload_text));
 
-            let messages = vec![Message::new(MessageRole::User, vec![Part::text(user_text)])];
+            let messages = vec![Message::new(MessageRole::User, user_parts)];
 
             match self
                 .agent
@@ -81,6 +86,11 @@ impl StructuredExtractor {
                 Ok(response) => {
                     let decision = response.data;
                     decision.validate()?;
+                    if let Some(text) = coverage_text {
+                        if !text.trim().is_empty() {
+                            ensure_chunk_coverage(&decision, text)?;
+                        }
+                    }
                     return Ok(StructuredExtraction {
                         decision,
                         usage: response.usage,
@@ -109,4 +119,52 @@ pub enum StructuredExtractError {
     Agent(#[from] ai_ox::agent::error::AgentError),
     #[error(transparent)]
     Validation(#[from] StructuredValidationError),
+}
+
+fn ensure_chunk_coverage(
+    decision: &StructuredDecision,
+    source_text: &str,
+) -> Result<(), StructuredExtractError> {
+    let source_tokens = count_tokens(source_text);
+    if source_tokens == 0 {
+        return Ok(());
+    }
+
+    let chunk_tokens: usize = decision
+        .chunks
+        .iter()
+        .map(|chunk| count_tokens(&chunk.body))
+        .sum();
+
+    if chunk_tokens == 0 {
+        return Err(StructuredExtractError::Validation(
+            StructuredValidationError::with_issue(
+                "chunk coverage mismatch: chunks contain no text",
+            ),
+        ));
+    }
+
+    let source_len = source_tokens as f32;
+    let chunk_len = chunk_tokens as f32;
+    if source_len == 0.0 {
+        return Ok(());
+    }
+
+    let diff_ratio = ((source_len - chunk_len).abs()) / source_len;
+    const MAX_ALLOWED_DIFF: f32 = 0.15; // allow up to 15% difference
+
+    if diff_ratio > MAX_ALLOWED_DIFF {
+        return Err(StructuredExtractError::Validation(
+            StructuredValidationError::with_issue(format!(
+                "chunk coverage mismatch: {:.1}% difference between source and chunks",
+                diff_ratio * 100.0
+            )),
+        ));
+    }
+
+    Ok(())
+}
+
+fn count_tokens(text: &str) -> usize {
+    text.split_whitespace().count()
 }

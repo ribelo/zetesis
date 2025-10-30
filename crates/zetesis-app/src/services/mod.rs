@@ -6,13 +6,29 @@
 //! resource accounting stay localized.
 
 pub mod context;
+pub mod embed;
+pub mod indexer;
+pub mod jobs;
+pub mod milli_actor;
 pub mod ocr;
 pub mod orchestrator;
 pub mod structured;
 
 pub use context::{
-    EmbedClient, EmbedService, Governors, PipelineContext, PipelineError, PipelineResult,
+    EmbedBatchTask, EmbedClient, EmbedMode, EmbedRuntimeOptions, EmbedService, EmbeddingJobClient,
+    Governors, JobMetadata, PipelineContext, PipelineError, PipelineResult, ProviderJobState,
+    SubmittedJob,
 };
+pub use embed::GeminiEmbedClient;
+pub use indexer::{
+    decision_content_hash, index_structured_decision, index_structured_with_embeddings,
+    load_structured_decision,
+};
+pub use jobs::{
+    EmbeddingJob, EmbeddingJobStatus, EmbeddingJobStore, EmbeddingJobStoreError,
+    EmbeddingProviderKind,
+};
+pub use milli_actor::MilliActorHandle;
 pub use ocr::{
     DeepInfraOcr, GeminiOcr, OcrConfig, OcrDocumentResult, OcrError, OcrInput, OcrMimeType,
     OcrPageResult, OcrService, OcrSpan,

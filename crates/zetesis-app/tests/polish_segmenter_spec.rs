@@ -14,9 +14,13 @@ fn splits_real_kio_pdf_smoke() -> Result<(), Box<dyn Error>> {
         .map(PathBuf::from)
         .expect("workspace root");
 
-    let data_dir = workspace_root.join("data").join("kio");
+    let data_dir = workspace_root
+        .join("data")
+        .join("kio")
+        .join("raw")
+        .join("kio");
     if !data_dir.exists() {
-        eprintln!("skipping: data/kio directory not found");
+        eprintln!("skipping: data/kio/raw/kio directory not found");
         return Ok(());
     }
 

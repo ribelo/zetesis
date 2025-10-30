@@ -5,3 +5,6 @@ pub const DEFAULT_EMBEDDER_KEY: &str = "gemini-embedding-001";
 
 /// Dimensionality of embeddings produced by the default embedder.
 pub const DEFAULT_EMBEDDING_DIM: usize = 768;
+
+/// Default Gemini model used for structured extraction.
+pub const DEFAULT_EXTRACTOR_MODEL: &str = "gemini-2.5-flash-lite-preview-09-2025";
