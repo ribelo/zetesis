@@ -59,6 +59,12 @@ impl StructuredExtractor {
         let mut last_error: Option<StructuredExtractError> = None;
 
         while attempt < self.max_attempts {
+            if attempt == 0 {
+                let schema = schemars::schema_for!(StructuredDecision);
+                let schema_json =
+                    serde_json::to_value(&schema).expect("structured decision schema serializable");
+                dbg!(schema_json);
+            }
             let user_text = if attempt == 0 {
                 text.to_owned()
             } else {

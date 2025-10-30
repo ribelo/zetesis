@@ -6,14 +6,16 @@
 //! payloads before writing to storage or search indices.
 
 use std::{
+    borrow::Cow,
     fmt::{self, Display},
     sync::OnceLock,
 };
 
 use chrono::NaiveDate;
 use regex::Regex;
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use strum::{AsRefStr, EnumIter};
 use thiserror::Error;
 
@@ -165,6 +167,7 @@ pub struct Procurement {
     /// Subject of the procurement as described in the ruling.
     pub subject: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "schema_nullable_procedure_type")]
     /// Procedure type applied by the contracting authority.
     pub procedure_type: Option<ProcedureType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -249,9 +252,7 @@ pub struct IssueTag {
 }
 
 /// Result of the decision regarding the appeal.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, EnumIter, AsRefStr,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, EnumIter, AsRefStr)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionResult {
     /// Appeal dismissed; zamawiający prevails.
@@ -270,9 +271,7 @@ pub enum DecisionResult {
 }
 
 /// Role of a panel member.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, EnumIter, AsRefStr,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, EnumIter, AsRefStr)]
 #[serde(rename_all = "snake_case")]
 pub enum PanelRole {
     /// Chair of the panel (Przewodniczący).
@@ -286,9 +285,7 @@ pub enum PanelRole {
 }
 
 /// Procurement procedure type.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, EnumIter, AsRefStr,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, EnumIter, AsRefStr)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcedureType {
     /// Open tender (przetarg nieograniczony).
@@ -306,9 +303,7 @@ pub enum ProcedureType {
 }
 
 /// Statute family.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, EnumIter, AsRefStr,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, EnumIter, AsRefStr)]
 #[serde(rename_all = "snake_case")]
 pub enum StatuteCode {
     /// Public Procurement Law (Prawo zamówień publicznych).
@@ -322,9 +317,7 @@ pub enum StatuteCode {
 }
 
 /// High-level issue taxonomy.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, EnumIter, AsRefStr,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, EnumIter, AsRefStr)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueKey {
     /// Allegations concerning abnormally low price.
@@ -341,6 +334,174 @@ pub enum IssueKey {
     Exclusion,
     /// Other issue.
     Other,
+}
+
+fn string_enum_schema(
+    description: &'static str,
+    variants: &[(&'static str, &'static str)],
+) -> Schema {
+    let mut schema = Map::new();
+    schema.insert("type".to_string(), Value::String("string".to_string()));
+    schema.insert(
+        "enum".to_string(),
+        Value::Array(
+            variants
+                .iter()
+                .map(|(value, _)| Value::String((*value).to_string()))
+                .collect(),
+        ),
+    );
+
+    let mut meta_description = description.to_string();
+    let variant_notes: Vec<String> = variants
+        .iter()
+        .filter_map(|(value, note)| {
+            if note.is_empty() {
+                None
+            } else {
+                Some(format!("{value}: {note}"))
+            }
+        })
+        .collect();
+    if !variant_notes.is_empty() {
+        if !meta_description.is_empty() {
+            meta_description.push(' ');
+        }
+        meta_description.push_str("Variants: ");
+        meta_description.push_str(&variant_notes.join(" "));
+    }
+
+    if !meta_description.is_empty() {
+        schema.insert("description".to_string(), Value::String(meta_description));
+    }
+
+    Schema::from(schema)
+}
+
+fn schema_nullable_procedure_type(generator: &mut SchemaGenerator) -> Schema {
+    let base_schema = ProcedureType::json_schema(generator);
+    let base_value: Value = base_schema.into();
+    let mut object = match base_value {
+        Value::Object(map) => map,
+        _ => Map::new(),
+    };
+    object.insert("nullable".to_string(), Value::Bool(true));
+    Schema::from(object)
+}
+
+impl JsonSchema for DecisionResult {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("DecisionResult")
+    }
+
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+        string_enum_schema(
+            "Result of the appeal.",
+            &[
+                ("dismissed", "Appeal dismissed; zamawiający prevails."),
+                ("upheld", "Appeal upheld in full."),
+                ("partially_upheld", "Appeal upheld in part."),
+                (
+                    "discontinued",
+                    "Proceedings discontinued (e.g., withdrawal).",
+                ),
+                ("annulled", "Previous decision annulled."),
+                ("unknown", "Fallback when result is not one of the above."),
+            ],
+        )
+    }
+}
+
+impl JsonSchema for PanelRole {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("PanelRole")
+    }
+
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+        string_enum_schema(
+            "Role of the adjudicating panel member.",
+            &[
+                ("chair", "Chair of the panel (Przewodniczący)."),
+                ("member", "Panel member (Członek)."),
+                ("rapporteur", "Rapporteur preparing the case (Referent)."),
+                ("other", "Other or unspecified role."),
+            ],
+        )
+    }
+}
+
+impl JsonSchema for ProcedureType {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("ProcedureType")
+    }
+
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+        string_enum_schema(
+            "Procurement procedure type.",
+            &[
+                ("open", "Open tender (przetarg nieograniczony)."),
+                ("restricted", "Restricted tender (przetarg ograniczony)."),
+                ("competitive_dialogue", "Competitive dialogue."),
+                ("negotiated", "Negotiated procedure."),
+                ("design_contest", "Design contest."),
+                ("other", "Any other procedure type."),
+            ],
+        )
+    }
+}
+
+impl JsonSchema for StatuteCode {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("StatuteCode")
+    }
+
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+        string_enum_schema(
+            "Code of the statute cited in the reasoning.",
+            &[
+                (
+                    "pzp",
+                    "Public Procurement Law (Prawo zamówień publicznych).",
+                ),
+                ("kc", "Civil Code (Kodeks cywilny)."),
+                (
+                    "kpc",
+                    "Code of Civil Procedure (Kodeks postępowania cywilnego).",
+                ),
+                ("other", "Any other statute."),
+            ],
+        )
+    }
+}
+
+impl JsonSchema for IssueKey {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("IssueKey")
+    }
+
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+        string_enum_schema(
+            "High-level categorisation of the dispute.",
+            &[
+                ("low_price", "Allegations concerning abnormally low price."),
+                (
+                    "participation_requirements",
+                    "Requirements for participation in the procedure.",
+                ),
+                (
+                    "subject_matter",
+                    "Description of the subject of the contract.",
+                ),
+                ("formal_defect", "Formal defects (e.g., missing documents)."),
+                (
+                    "evaluation_criteria",
+                    "Evaluation criteria and their application.",
+                ),
+                ("exclusion", "Exclusion of a contractor."),
+                ("other", "Any other issue."),
+            ],
+        )
+    }
 }
 
 /// Validation failures aggregated into a single error.
