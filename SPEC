@@ -13,12 +13,17 @@
 - [REQ-ZE-TODO-REVIEWS] When TODO items complete a requirement, annotate the requirement with `(Verified via WP-…/T…)` so SPEC remains the single source of truth.
 
 ### Storage & Indexing
-- [REQ-ZE-STORAGE-MILLI] Persist canonical structured documents and derived chunk records directly in Milli. Each record must remain self-contained so Milli alone can satisfy read and reindex flows. (Updated 2025-10-30 — migrated away from LMDB-backed document store)
-- [REQ-ZE-STORAGE-FS] Store original KIO PDFs on the filesystem using content-addressed paths under `$XDG_DATA_HOME/zetesis/blobs/{silo}/{prefix}/{hash}.pdf`; document records reference the blob location.
-- [REQ-ZE-INDEX-PER-SILO] Create one Milli index **per silo** at `$XDG_DATA_HOME/zetesis/milli/{silo}` using Milli’s LMDB-backed environment. Index paths are derived from the silo slug—do not duplicate them elsewhere.
-- [REQ-ZE-INDEX-EMBEDDER] Configure each Milli index with vector backend Hannoy and a user-provided embedder defined in configuration (initially `gemini-embedding-001`, dimension 768). Manual vectors must appear under `_vectors.{embedder_key}`.
-- [REQ-ZE-INDEX-FIELDS] Chunk documents shall expose flat (or shallow) fields compatible with Milli flattening: `silo`, `doc_type`, `doc_id`, `decision.date` (ISO), `decision.result`, `panel.names[]`, `parties.contracting_authority`, `parties.appellant`, `procurement.cpv_codes`, `section`, `ord`, and `content`. (Updated 2025-10-30 — aligned with Milli canonical storage)
-- [REQ-ZE-INDEX-LITERAL] Store per-chunk embeddings only inside Milli; no secondary store may retain vector payloads. (Updated 2025-10-30 — clarified Milli-only vector policy)
+- [REQ-ZE-STORAGE-MILLI] Persist canonical structured documents and derived chunk records directly in Milli. Each record is self-contained so Milli alone can satisfy read and reindex flows. (Updated 2025-11-04 — aligned to current code)
+- [REQ-ZE-STORAGE-FS] Blobs live under `$XDG_DATA_HOME/zetesis/blobs/{silo}/{prefix}/{cid}` where `cid` is lowercase hex BLAKE3 of original bytes. Callers may additionally cache KIO downloads in user-provided folders. (Updated 2025-11-04)
+- [REQ-ZE-INDEX-PER-SILO] Maintain one Milli index per silo at `$XDG_DATA_HOME/zetesis/milli/{silo}`. Paths are derived from a lowercase slug; do not duplicate elsewhere.
+- [REQ-ZE-INDEX-EMBEDDER] Configure indexes with Hannoy vector backend and a user-provided embedder (default from config), dimension `DEFAULT_EMBEDDING_DIM`. Vectors are stored under `_vectors.{embedder_key}` with user-provided embeddings.
+- [REQ-ZE-INDEX-FIELDS] Record shapes:
+  - Document (`doc_type=doc`): `id`=`{silo}-{doc_id}-doc`, `silo`, `doc_type`, `doc_id`, `summary_short`, `panel_names[]`, `panel_roles[]`, `panel{names,roles}`, `parties_*` flats, `procurement_*` flats, `identifiers_*` flats, `decision_date`, `decision_result`, `issues_keys[]`, `structured` (full JSON), `ingest{status,updated_at,embedder_key,chunk_count,error}`, `_vectors.{embedder_key}`=null.
+  - Chunk (`doc_type=chunk`): `id`=`{silo}-{doc_id}-chunk-{ord}`, `silo`, `doc_type`, `doc_id`, `ord`, `section`, `content`, nested `decision{date,result}`, `identifiers{kio_docket,saos_id}`, `parties{...}`, `procurement{...}`, `panel{...}`, `issues[{issue_key,confidence}]`, and flat duplicates: `panel_names`, `panel_roles`, `parties_*`, `procurement_*`, `identifiers_*`, `decision_date`, `decision_result`, `issues_keys[]`.
+- [REQ-ZE-INDEX-SEARCHABLE] Searchable fields include: `content`, `summary_short`, `doc_id`, `decision.{date,result}`, `identifiers.{kio_docket,saos_id}`, `parties.{contracting_authority,appellant,awardee,interested_bidders}`, `panel.{names,roles}`, `procurement.{subject,procedure_type,tender_id,cpv_codes}`, `issues.issue_key`, `section`.
+- [REQ-ZE-INDEX-FILTERABLE] Filterable fields include flat duplicates: `silo`, `doc_type`, `doc_id`, `decision_date`, `decision_result`, `identifiers_*`, `panel_*`, `parties_*`, `procurement_*`, `issues_keys`, `section`.
+- [REQ-ZE-INDEX-SORTABLE] Sortable fields include `decision_date` and `doc_id`.
+- [REQ-ZE-INDEX-IDEMPOTENT] Indexing uses ReplaceDocuments semantics and stable primary key `id` to ensure idempotent writes.
 
 ### KIO Ingestion
 - [REQ-ZE-KIO-INGESTOR] Provide a KIO scraper that enumerates judgments via `POST /Home/GetResults` on https://orzeczenia.uzp.gov.pl/ (Kind=KIO) and walks detail pages for metadata and downloads. The retired FTP flow is not supported. (Updated 2025-10-25 — UZP disabled FTP on 2025-09-30)
@@ -29,3 +34,62 @@
 - [REQ-ZE-KIO-CHUNKS] Split KIO documents using the double-pass chunker into sections (`header`, `sentencja`, `uzasadnienie`, `other`) with stable ordering; offsets remain attached to chunk metadata inside Milli. (Updated 2025-10-30 — LMDB removed)
 - [REQ-ZE-KIO-PIPELINE] The ingest pipeline must: (1) write PDFs to the blob store, (2) persist canonical structured documents in Milli with ingest status `pending`, (3) embed chunks via `ai-ox` Gemini (IO-bounded with governed concurrency), (4) upsert chunk records with `_vectors.{embedder_key}`, and (5) mark the document record `indexed` with counts and timings. (Updated 2025-10-30 — LMDB removed)
 - [REQ-ZE-KIO-DELETE] Hard deletes remove Milli documents (doc + chunks) and filesystem blobs in a single operation.
+
+### SAOS Ingestion
+- [REQ-ZE-SAOS-INGESTOR] Provide a SAOS scraper for pre-2021 KIO judgments via `GET /api/search/judgments` and `GET /api/judgments/{id}` under https://www.saos.org.pl/. Respect `CUT_OFF_DATE` semantics to avoid overlap with UZP.
+- [REQ-ZE-SAOS-PAGING] Use page size 100; advance with `page=0..n` until exhaustion or limit reached; compute totals from response `info.totalResults`.
+- [REQ-ZE-SAOS-RATE] Apply a 4 rps limiter with exponential backoff and jitter across search, detail, and file downloads.
+- [REQ-ZE-SAOS-FILES] Download PDFs from `files/judgments/national_appeal_chamber/<...>` and cache under caller-provided directory or blob storage.
+
+### OCR Service
+- [REQ-ZE-OCR-PROVIDERS] Expose OCR via providers: DeepInfra (default model `allenai/olmOCR-2-7B-1025`) and Gemini (model configurable), selected in CLI. Missing API keys must error fast.
+- [REQ-ZE-OCR-LIMITS] Enforce bounds: max batch inputs 64, max pages per document 1024, explicit non-zero concurrency for documents/pages, and inflight budget consistency checks.
+- [REQ-ZE-OCR-IMAGES] Render PDF pages to PNG via pdfium, then downscale to `image_max_edge` preserving aspect ratio; encode PNG/JPEG as required by provider.
+- [REQ-ZE-OCR-RETRY] Apply provider-specific rate limiting and exponential backoff; log usage tokens when available.
+
+### Text Processing
+- [REQ-ZE-TEXT-CLEANUP] Normalize extracted text (token separation, whitespace, diacritics intact) prior to segmentation.
+- [REQ-ZE-TEXT-SEGMENT] Segment Polish legal text with ICU segmenter plus abbreviation/ordinal stitching and enumeration splitting. Provide deterministic ranges and strings with no empty outputs.
+
+### Embedding & Jobs
+- [REQ-ZE-EMBED-MODELS] Use Gemini embeddings for `RetrievalDocument`/`RetrievalQuery` with configured output dimension. Replace empty texts with all-zero vectors for shape stability.
+- [REQ-ZE-EMBED-MODES] Support `Batched` and `Sequential` modes; batch size bounded by configuration and provider limits.
+- [REQ-ZE-JOBS-STORE] Persist embedding jobs in LMDB under `$XDG_DATA_HOME/zetesis/lmdb/jobs` with status lifecycle: Pending → Embedding → Embedded → Ingesting → Ingested | Failed; job_id equals `doc_id`.
+- [REQ-ZE-JOBS-BATCH] Submit embeddings to Gemini Batch API when `--batch` is set; poll status; ingest results into Milli; mark errors with message in job record and doc.ingest.error.
+
+### CLI Surface
+- [REQ-ZE-CLI-CMDS] Provide subcommands: `serve`, `fetch-kio` (uzp|saos), `ingest`, `audit structured`, `search (keyword|vector)`, `db (list|stats|get|find|backup|purge|recover)`, `jobs (status|embed|ingest)`.
+- [REQ-ZE-CLI-LIMITS] Validate inputs and enforce bounds: positive worker counts, non-empty index names without separators, file size limits for inline attachments (≤ 20 MiB), and supported document types (PDF, common images).
+- [REQ-ZE-CLI-SEARCH] Keyword/vector search accept filters, pagination, field selection, and pretty output; vector search embeds the query with index embedder when not provided.
+
+### Identity & Paths
+- [REQ-ZE-ID-CANONICAL] Canonical `doc_id` is lowercase hex BLAKE3 of exact original content bytes. Never derive from filenames, URLs, or upstream IDs.
+- [REQ-ZE-PATHS] Resolve data paths under `$XDG_DATA_HOME/zetesis`: `milli/{silo}`, `lmdb/{app,jobs}`, `blobs/{silo}/{prefix}/{cid}`, and embedding job staging under `jobs/{payloads,results}/{silo}`. Ensure directories exist before use.
+
+### Observability & Safety
+- [REQ-ZE-ASSERTS] Use assertions to enforce invariants (non-empty ids, bounded sizes, non-zero concurrency) and fail fast on configuration errors.
+- [REQ-ZE-LOGS] Emit structured logs for retries, indexing phases, and ingestion status transitions; prefer human-actionable messages.
+
+### HTTP & UI
+- [REQ-ZE-UI-DIOXUS] Use Dioxus 0.7 Fullstack with SSR as the primary rendering mode. Keep hydration to minimal islands (e.g., search results/typeahead). Do not use a client router. Enforce gzip JS budget ≤ 150 KiB per page.
+- [REQ-ZE-UI-AXUM] Integrate Dioxus SSR into Axum under `/ui/*` routes; keep JSON APIs under `/v1/*`. UI and API share types; avoid leaking service/internal types across layers.
+- [REQ-ZE-UI-SSG] Use Dioxus SSG to pre-render static pages (landing, docs/help) at build time; serve as static assets.
+- [REQ-ZE-UI-TYPEAHEAD] Provide “search as you type” via keyword-only queries: debounce 200 ms, min 2 chars, limit ≤ 10, fields whitelisted, cancellable requests. Fall back to full SSR submit when JS is disabled.
+- [REQ-ZE-UI-REFINE] Trigger vector/hybrid refine only on explicit action (Enter/idle > 600 ms/toggle). Never embed on every keystroke.
+- [REQ-ZE-UI-ASSETS] Serve static assets under `public/` (or embedded) with immutable caching; version via hashed filenames when practical.
+
+### Authn/Authz
+- [REQ-ZE-AUTH-PROXY] Terminate OAuth2/OIDC at a reverse proxy (e.g., oauth2-proxy) and trust identity headers only from a private network. Application remains stateless and holds no user database.
+- [REQ-ZE-AUTH-JWT] Optionally accept OIDC JWTs directly: verify signature via JWKS, enforce audience/issuer, allow small clock skew, cache keys, and reject on failure.
+- [REQ-ZE-AUTH-API-KEY] Support static API keys for programmatic access; scope keys to limited routes; disable by default.
+- [REQ-ZE-AUTH-RBAC] Implement simple roles (`user`, `admin`) via header/claims; admin-only routes include maintenance and backups.
+
+### Backup & Restore
+- [REQ-ZE-BACKUP-RESTIC] Perform encrypted backups with restic to Hetzner S3 (or equivalent). Schedule daily backups with systemd timers and enforce retention (7 daily, 4 weekly, 6 monthly).
+- [REQ-ZE-BACKUP-SCOPE] Backup includes `milli/*`, `lmdb/jobs`, and `blobs/*`. Run integrity checks post-backup: document counts, presence of vectors, and index health.
+- [REQ-ZE-BACKUP-RECOVER] Provide `db recover --dry-run` to validate a restore target; block in-place recoveries unless `--force` is set.
+
+### Job Queue & Reliability
+- [REQ-ZE-JOBS-LOCAL] Use the LMDB-backed `EmbeddingJobStore` as the primary queue; persist status transitions and timestamps; no external broker required.
+- [REQ-ZE-JOBS-REAPER] Add a stale job reaper (age-based) and idempotent retry policy with bounded attempts and exponential backoff.
+- [REQ-ZE-JOBS-LIMITS] Enforce bounded concurrency and back-pressure via rate limiters; expose `jobs status` to report counts and oldest age by state.
