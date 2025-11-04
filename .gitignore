@@ -10,3 +10,4 @@ config/settings.toml
 data/
 
 third_party/
+.cargo/
