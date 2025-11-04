@@ -24,7 +24,7 @@ Legend: [ ] = open · [~] = in progress · [x] = done
 - [ ] T2: Add SPEC verification checklist to CI (clippy fmt test invoke, fail on drift) (P1) (covers REQ-ZE-SPEC-CADENCE)
 
 ## WP-BLOBS — Content-Addressed Storage
-- [ ] T1: Define `BlobStore` trait (`put`/`get`/`head`/`delete`, CID=idempotent, streaming) + property tests (P0) (covers REQ-ZE-STORAGE-FS, REQ-ZE-ID-CANONICAL)
+- [x] T1: Define `BlobStore` trait (`put`/`get`/`head`/`delete`, CID=idempotent, streaming) + property tests (P0) (covers REQ-ZE-STORAGE-FS, REQ-ZE-ID-CANONICAL)
 - [ ] T2: Implement `FsBlobStore` over `AppPaths::blob_path` with checksum-on-write and size verification (P0) (covers REQ-ZE-STORAGE-FS)
 - [ ] T3: Add S3-compatible `S3BlobStore` scaffold (Hetzner) behind feature flag + config stubs (P1) (prep for later provider) (covers REQ-ZE-STORAGE-FS)
 - [ ] T4: Migrate KIO/SAOS download paths to `BlobStore` API; deprecate ad-hoc caches; E2E move test (P1) (covers REQ-ZE-STORAGE-FS)
