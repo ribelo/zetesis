@@ -146,11 +146,17 @@ fn init_tracing(level: LevelFilter) {
 #[derive(Debug, Error)]
 enum AppError {
     #[error(transparent)]
-    Config(#[from] config::AppConfigError),
+    ConfigLoad(#[from] config::AppConfigError),
+    #[error("configuration error: {0}")]
+    Config(String),
+    #[error("storage error: {0}")]
+    Storage(String),
     #[error(transparent)]
     Server(#[from] server::ServerError),
     #[error(transparent)]
     Ingest(#[from] ingestion::IngestorError),
+    #[error(transparent)]
+    Manifest(#[from] ingestion::ManifestError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -247,27 +253,105 @@ async fn run(cli: Cli) -> Result<(), AppError> {
     Ok(())
 }
 
+async fn build_blob_store(
+    storage_cfg: &config::StorageConfig,
+) -> Result<Arc<dyn zetesis_app::services::BlobStore>, AppError> {
+    use zetesis_app::paths::AppPaths;
+    use zetesis_app::services::{BlobStore, DurableWrite, FsBlobStore};
+
+    match storage_cfg.backend.as_str() {
+        "fs" => {
+            let paths = AppPaths::new(&storage_cfg.path)?;
+            let store: Arc<dyn BlobStore> = Arc::new(
+                FsBlobStore::builder()
+                    .paths(paths)
+                    .durability(DurableWrite::None)
+                    .build(),
+            );
+            tracing::debug!(path = ?storage_cfg.path, "initialized FsBlobStore");
+            Ok(store)
+        }
+        "s3" => {
+            #[cfg(not(feature = "s3"))]
+            {
+                Err(AppError::Config(
+                    "S3 backend requested but s3 feature not enabled".to_string(),
+                ))
+            }
+            #[cfg(feature = "s3")]
+            {
+                use zetesis_app::services::S3BlobStore;
+
+                let s3_cfg = storage_cfg.s3.as_ref().ok_or_else(|| {
+                    AppError::Config(
+                        "S3 backend selected but storage.s3 config missing".to_string(),
+                    )
+                })?;
+
+                let store = S3BlobStore::from_config(
+                    s3_cfg.bucket.clone(),
+                    s3_cfg.endpoint_url.clone(),
+                    s3_cfg.region.clone(),
+                    s3_cfg.force_path_style,
+                    s3_cfg.root_prefix.clone(),
+                )
+                .await
+                .map_err(|e| {
+                    AppError::Storage(format!("failed to initialize S3BlobStore: {}", e))
+                })?;
+
+                tracing::info!(
+                    bucket = %s3_cfg.bucket,
+                    endpoint = ?s3_cfg.endpoint_url,
+                    region = ?s3_cfg.region,
+                    "initialized S3BlobStore"
+                );
+
+                Ok(Arc::new(store))
+            }
+        }
+        other => Err(AppError::Config(format!(
+            "unknown storage backend '{}'; expected 'fs' or 's3'",
+            other
+        ))),
+    }
+}
+
 async fn run_fetch_kio(args: FetchKioArgs, verbosity: u8) -> Result<(), AppError> {
+    use std::sync::Arc;
+    use zetesis_app::services::BlobStore;
+
     let worker_count = NonZeroUsize::new(args.workers.max(1)).expect("workers must always be >= 1");
-    let output_dir = resolve_output_dir(&args.output_path)?;
     let base_url = resolve_kio_base_url(&args);
+
+    let cfg = config::load()?;
+    let blob_store: Arc<dyn BlobStore> = build_blob_store(&cfg.storage).await?;
 
     tracing::info!(
         source = ?args.source,
         url = %base_url,
         limit = ?args.limit,
         workers = worker_count.get(),
-        output = %output_dir.display(),
-        "starting KIO portal scrape"
+        backend = %cfg.storage.backend,
+        "starting KIO portal scrape with BlobStore"
     );
 
     let options = KioScrapeOptions::builder()
-        .output_dir(output_dir.clone())
+        .blob_store(blob_store)
         .worker_count(worker_count)
         .maybe_limit(args.limit)
         .build();
+
+    // Open manifest writer for recording {doc_id → cid} mappings
+    let manifest_path = AppPaths::new(&cfg.storage.path)?
+        .data_dir()
+        .join("kio_blob_manifest.ndjson");
+    let manifest = ingestion::ManifestWriter::open(&manifest_path).await?;
+    tracing::debug!(path = %manifest_path.display(), "opened blob manifest");
+
     let progress = (verbosity == 0).then_some(make_progress_bar());
-    let mut tracker = ProgressTracker::new(progress.clone(), args.limit.map(|l| l as u64));
+    let mut tracker = ProgressTracker::new(progress.clone(), args.limit.map(|l| l as u64))
+        .with_manifest(manifest);
     let summary = match args.source {
         KioSource::Uzp => {
             let scraper = KioUzpScraper::new(&base_url)?;
@@ -284,9 +368,9 @@ async fn run_fetch_kio(args: FetchKioArgs, verbosity: u8) -> Result<(), AppError
 
     if !tracker.has_progress_bar() {
         tracing::info!(
-            downloaded = summary.downloaded,
+            stored = summary.stored,
             discovered = summary.discovered,
-            skipped = summary.skipped_existing,
+            skipped = summary.skipped,
             "KIO scrape completed successfully"
         );
     }
@@ -315,7 +399,7 @@ where
     S: Stream<Item = Result<KioEvent, ingestion::IngestorError>> + Unpin,
 {
     while let Some(event) = stream.next().await {
-        let summary = tracker.handle_event(event?)?;
+        let summary = tracker.handle_event(event?).await?;
         if let Some(summary) = summary {
             return Ok(summary);
         }
@@ -332,8 +416,8 @@ fn finish_kio_progress(
     if let Some(pb) = progress {
         tracker.ensure_length(&pb, summary.discovered as u64);
         pb.finish_with_message(format!(
-            "Completed: {}/{} downloaded ({} skipped)",
-            summary.downloaded, summary.discovered, summary.skipped_existing
+            "Completed: {}/{} stored ({} skipped)",
+            summary.stored, summary.discovered, summary.skipped
         ));
     }
 }
@@ -759,6 +843,7 @@ struct ProgressTracker {
     target_limit: Option<u64>,
     pb_len_set: bool,
     completed: u64,
+    manifest: Option<ingestion::ManifestWriter>,
 }
 
 impl ProgressTracker {
@@ -768,14 +853,23 @@ impl ProgressTracker {
             target_limit,
             pb_len_set: false,
             completed: 0,
+            manifest: None,
         }
+    }
+
+    fn with_manifest(mut self, manifest: ingestion::ManifestWriter) -> Self {
+        self.manifest = Some(manifest);
+        self
     }
 
     fn has_progress_bar(&self) -> bool {
         self.progress.is_some()
     }
 
-    fn handle_event(&mut self, event: KioEvent) -> Result<Option<KioScraperSummary>, AppError> {
+    async fn handle_event(
+        &mut self,
+        event: KioEvent,
+    ) -> Result<Option<KioScraperSummary>, AppError> {
         match event {
             KioEvent::DiscoveryStarted { limit } => {
                 self.update_length(limit.map(|v| v as u64));
@@ -813,7 +907,7 @@ impl ProgressTracker {
                     tracing::debug!(worker, doc_id = %doc_id, "worker picked up document");
                 }
             }
-            KioEvent::DownloadSkipped { doc_id } => {
+            KioEvent::BlobSkipped { doc_id } => {
                 self.bump_position();
                 if let Some(pb) = self.progress.as_ref() {
                     pb.set_message(format!("cached {doc_id}"));
@@ -821,12 +915,44 @@ impl ProgressTracker {
                     tracing::info!(doc_id = %doc_id, "document already cached");
                 }
             }
-            KioEvent::DownloadCompleted { doc_id, bytes } => {
+            KioEvent::BlobStored {
+                doc_id,
+                cid,
+                bytes,
+                existed,
+            } => {
                 self.bump_position();
+
+                // Write manifest entry
+                if let Some(manifest) = self.manifest.as_mut() {
+                    let entry = ingestion::ManifestEntry::new(doc_id.clone(), cid.clone(), bytes);
+                    if let Err(e) = manifest.write(&entry).await {
+                        tracing::warn!(
+                            doc_id = %doc_id,
+                            cid = %cid,
+                            error = %e,
+                            "failed to write manifest entry"
+                        );
+                    }
+                }
+
                 if let Some(pb) = self.progress.as_ref() {
-                    pb.set_message(format!("saved {doc_id} ({bytes} bytes)"));
+                    if existed {
+                        pb.set_message(format!("cached {doc_id} (cid: {})", &cid[..8]));
+                    } else {
+                        pb.set_message(format!(
+                            "stored {doc_id} ({bytes} bytes, cid: {})",
+                            &cid[..8]
+                        ));
+                    }
                 } else {
-                    tracing::info!(doc_id = %doc_id, bytes, "downloaded document");
+                    tracing::info!(
+                        doc_id = %doc_id,
+                        cid = %cid,
+                        bytes,
+                        existed,
+                        "stored blob"
+                    );
                 }
             }
             KioEvent::Completed { summary } => return Ok(Some(summary)),

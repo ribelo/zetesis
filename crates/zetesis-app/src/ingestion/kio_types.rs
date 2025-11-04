@@ -1,14 +1,15 @@
-use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
+use std::{num::NonZeroUsize, sync::Arc};
 
 use bon::Builder;
 use thiserror::Error;
 use url::ParseError;
 
+use crate::services::BlobStore;
+
 /// Shared builder options for KIO scrapers.
-#[derive(Debug, Clone, Builder)]
+#[derive(Clone, Builder)]
 pub struct KioScrapeOptions {
-    #[builder(into)]
-    pub output_dir: PathBuf,
+    pub blob_store: Arc<dyn BlobStore>,
     pub limit: Option<usize>,
     #[builder(default = NonZeroUsize::new(4).unwrap())]
     pub worker_count: NonZeroUsize,
@@ -18,24 +19,75 @@ pub struct KioScrapeOptions {
     pub discovery_concurrency: NonZeroUsize,
 }
 
+impl std::fmt::Debug for KioScrapeOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KioScrapeOptions")
+            .field("blob_store", &"<Arc<dyn BlobStore>>")
+            .field("limit", &self.limit)
+            .field("worker_count", &self.worker_count)
+            .field("channel_capacity", &self.channel_capacity)
+            .field("discovery_concurrency", &self.discovery_concurrency)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::KioScrapeOptions;
-    use std::{num::NonZeroUsize, path::PathBuf};
+    use crate::pipeline::processor::Silo;
+    use crate::services::BlobStore;
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+
+    struct TestBlobStore;
+
+    #[async_trait::async_trait]
+    impl BlobStore for TestBlobStore {
+        async fn put(
+            &self,
+            _silo: Silo,
+            _data: crate::services::ByteStream,
+        ) -> Result<crate::services::PutResult, crate::services::BlobError> {
+            unimplemented!()
+        }
+        async fn get(
+            &self,
+            _silo: Silo,
+            _cid: &str,
+        ) -> Result<crate::services::ByteStream, crate::services::BlobError> {
+            unimplemented!()
+        }
+        async fn head(
+            &self,
+            _silo: Silo,
+            _cid: &str,
+        ) -> Result<Option<crate::services::BlobMeta>, crate::services::BlobError> {
+            unimplemented!()
+        }
+        async fn delete(
+            &self,
+            _silo: Silo,
+            _cid: &str,
+        ) -> Result<bool, crate::services::BlobError> {
+            unimplemented!()
+        }
+    }
 
     #[test]
     fn builder_defaults_discovery_concurrency() {
-        let options = KioScrapeOptions::builder()
-            .output_dir(PathBuf::from("/tmp"))
-            .build();
+        let store: Arc<dyn BlobStore> = Arc::new(TestBlobStore);
+        let options = KioScrapeOptions::builder().blob_store(store).build();
 
         assert_eq!(options.discovery_concurrency.get(), 2);
+        assert_eq!(options.worker_count.get(), 4);
+        assert_eq!(options.channel_capacity, 64);
     }
 
     #[test]
     fn builder_overrides_discovery_concurrency() {
+        let store: Arc<dyn BlobStore> = Arc::new(TestBlobStore);
         let options = KioScrapeOptions::builder()
-            .output_dir(PathBuf::from("/tmp"))
+            .blob_store(store)
             .discovery_concurrency(NonZeroUsize::new(3).unwrap())
             .build();
 
@@ -67,12 +119,14 @@ pub enum KioEvent {
         worker: usize,
         doc_id: String,
     },
-    DownloadSkipped {
+    BlobStored {
         doc_id: String,
-    },
-    DownloadCompleted {
-        doc_id: String,
+        cid: String,
         bytes: usize,
+        existed: bool,
+    },
+    BlobSkipped {
+        doc_id: String,
     },
     Completed {
         summary: KioScraperSummary,
@@ -83,8 +137,8 @@ pub enum KioEvent {
 #[derive(Debug, Clone, Copy)]
 pub struct KioScraperSummary {
     pub discovered: usize,
-    pub downloaded: usize,
-    pub skipped_existing: usize,
+    pub stored: usize,
+    pub skipped: usize,
     pub total_available_hint: Option<usize>,
 }
 

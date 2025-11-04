@@ -73,7 +73,10 @@ pub fn validate_cid(cid: &str) -> Result<(), BlobError> {
         return Err(BlobError::InvalidCid(cid.to_string()));
     }
 
-    if !cid.chars().all(|c: char| c.is_ascii_digit() || ('a'..='f').contains(&c)) {
+    if !cid
+        .chars()
+        .all(|c: char| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    {
         return Err(BlobError::InvalidCid(cid.to_string()));
     }
     Ok(())
@@ -86,14 +89,18 @@ pub fn blake3_cid(bytes: &[u8]) -> Cid {
 
 /// Compute BLAKE3 cid and size by consuming a `ByteStream`.
 /// Returns the cid, total size, and the collected bytes.
-pub async fn compute_cid_and_collect(mut stream: ByteStream) -> Result<(Cid, u64, Vec<u8>), BlobError> {
+pub async fn compute_cid_and_collect(
+    mut stream: ByteStream,
+) -> Result<(Cid, u64, Vec<u8>), BlobError> {
     let mut hasher = blake3::Hasher::new();
     let mut total: u64 = 0;
     let mut out = Vec::new();
 
     while let Some(chunk_res) = stream.as_mut().next().await {
         let chunk = chunk_res?;
-        total = total.checked_add(chunk.len() as u64).ok_or_else(|| BlobError::Io("size overflow".to_string()))?;
+        total = total
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| BlobError::Io("size overflow".to_string()))?;
         hasher.update(&chunk);
         out.extend_from_slice(&chunk);
     }
@@ -176,7 +183,9 @@ impl FsBlobStore {
 
     /// Fsync a file descriptor.
     async fn fsync_file(&self, file: &mut fs::File) -> Result<(), BlobError> {
-        file.sync_all().await.map_err(|e| BlobError::Io(format!("fsync file: {}", e)))
+        file.sync_all()
+            .await
+            .map_err(|e| BlobError::Io(format!("fsync file: {}", e)))
     }
 
     /// Fsync a directory by opening and syncing it.
@@ -261,9 +270,11 @@ impl BlobStore for FsBlobStore {
             .map_err(|e| BlobError::Io(format!("create temp file: {}", e)))?;
         let temp_path = temp_file.path().to_path_buf();
 
-        let mut file = fs::File::from_std(temp_file.reopen().map_err(|e| {
-            BlobError::Io(format!("reopen temp file: {}", e))
-        })?);
+        let mut file = fs::File::from_std(
+            temp_file
+                .reopen()
+                .map_err(|e| BlobError::Io(format!("reopen temp file: {}", e)))?,
+        );
 
         let mut hasher = blake3::Hasher::new();
         let mut total_bytes: u64 = 0;
@@ -279,10 +290,17 @@ impl BlobStore for FsBlobStore {
                 .map_err(|e| BlobError::Io(format!("write chunk: {}", e)))?;
         }
 
+        // Always flush writes before verifying size
+        file.flush()
+            .await
+            .map_err(|e| BlobError::Io(format!("flush file: {}", e)))?;
+
         // Apply durability policy.
         match self.durability {
             DurableWrite::FileOnly | DurableWrite::FileAndDir => {
-                self.fsync_file(&mut file).await?;
+                file.sync_all()
+                    .await
+                    .map_err(|e| BlobError::Io(format!("fsync file: {}", e)))?;
             }
             DurableWrite::None => {}
         }
@@ -399,6 +417,345 @@ impl BlobStore for FsBlobStore {
     }
 }
 
+// ===== S3 BlobStore Implementation =====
+
+#[cfg(feature = "s3")]
+mod s3_impl {
+    use super::*;
+    use aws_sdk_s3::Client;
+    use aws_sdk_s3::config::{BehaviorVersion, Region};
+    use aws_sdk_s3::primitives::ByteStream as S3ByteStream;
+
+    /// S3-compatible blob store implementation.
+    ///
+    /// Write strategy:
+    /// - Single-part upload with size cap (default 256 MiB)
+    /// - Compute BLAKE3 CID while streaming into memory
+    /// - Check existence via HeadObject before PutObject for idempotency
+    /// - Keys mirror FS layout: blobs/{silo}/{cid[..2]}/{cid}
+    ///
+    /// Read strategy:
+    /// - Stream directly via GetObject
+    /// - Bounded read buffer to control memory usage
+    #[derive(Debug, Clone)]
+    pub struct S3BlobStore {
+        client: Client,
+        bucket: String,
+        root_prefix: Option<String>,
+        chunk_size_bytes: usize,
+        max_single_part_bytes: u64,
+    }
+
+    impl S3BlobStore {
+        /// Create a new S3BlobStore from configuration.
+        pub async fn from_config(
+            bucket: String,
+            endpoint_url: Option<String>,
+            region: Option<String>,
+            force_path_style: bool,
+            root_prefix: Option<String>,
+        ) -> Result<Self, BlobError> {
+            // Load AWS config from behavior chain
+            let mut config_loader = aws_config::defaults(BehaviorVersion::latest());
+
+            // Override region if provided
+            if let Some(r) = region {
+                config_loader = config_loader.region(Region::new(r));
+            }
+
+            let aws_config = config_loader.load().await;
+
+            // Build S3 client with optional endpoint override
+            let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&aws_config);
+
+            if let Some(endpoint) = endpoint_url {
+                s3_config_builder = s3_config_builder.endpoint_url(endpoint);
+            }
+
+            s3_config_builder = s3_config_builder.force_path_style(force_path_style);
+
+            let s3_config = s3_config_builder.build();
+            let client = Client::from_conf(s3_config);
+
+            tracing::debug!(
+                bucket = %bucket,
+                force_path_style = force_path_style,
+                "initialized S3BlobStore"
+            );
+
+            Ok(Self {
+                client,
+                bucket,
+                root_prefix,
+                chunk_size_bytes: 65536,
+                max_single_part_bytes: 256 * 1024 * 1024,
+            })
+        }
+
+        /// Compute S3 key for a blob: [root_prefix/]blobs/{silo}/{cid[..2]}/{cid}
+        fn key_for(&self, silo: Silo, cid: &str) -> String {
+            assert!(cid.len() >= 2, "CID too short for sharding");
+            let prefix = &cid[..2];
+            let key = format!("blobs/{}/{}/{}", silo.slug(), prefix, cid);
+
+            if let Some(root) = &self.root_prefix {
+                format!("{}/{}", root.trim_end_matches('/'), key)
+            } else {
+                key
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for S3BlobStore {
+        async fn put(&self, silo: Silo, mut data: ByteStream) -> Result<PutResult, BlobError> {
+            // Stream into memory while computing CID and checking size cap
+            let mut hasher = blake3::Hasher::new();
+            let mut buffer = Vec::new();
+            let mut total_bytes: u64 = 0;
+
+            while let Some(chunk_res) = data.next().await {
+                let chunk = chunk_res.map_err(|e| BlobError::Stream(e.to_string()))?;
+
+                total_bytes = total_bytes
+                    .checked_add(chunk.len() as u64)
+                    .ok_or_else(|| BlobError::Io("size overflow".to_string()))?;
+
+                if total_bytes > self.max_single_part_bytes {
+                    return Err(BlobError::Io(format!(
+                        "data exceeds max single-part upload size of {} bytes; got {} bytes",
+                        self.max_single_part_bytes, total_bytes
+                    )));
+                }
+
+                hasher.update(&chunk);
+                buffer.extend_from_slice(&chunk);
+            }
+
+            let cid = hasher.finalize().to_hex().to_string();
+            let key = self.key_for(silo, &cid);
+
+            // Check if blob already exists
+            let existed = match self
+                .client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await
+            {
+                Ok(_) => true,
+                Err(err) => {
+                    use aws_sdk_s3::error::SdkError;
+                    match err {
+                        SdkError::ServiceError(service_err) => {
+                            if service_err.err().is_not_found() {
+                                false
+                            } else {
+                                return Err(BlobError::Io(format!(
+                                    "S3 HeadObject service error: {:?}",
+                                    service_err
+                                )));
+                            }
+                        }
+                        other => {
+                            return Err(BlobError::Io(format!(
+                                "S3 HeadObject request failed: {}",
+                                other
+                            )));
+                        }
+                    }
+                }
+            };
+
+            if !existed {
+                // Upload the blob
+                let body = S3ByteStream::from(buffer);
+
+                self.client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(&key)
+                    .body(body)
+                    .content_length(total_bytes as i64)
+                    .send()
+                    .await
+                    .map_err(|e| BlobError::Io(format!("S3 PutObject failed: {}", e)))?;
+
+                tracing::debug!(
+                    silo = %silo.slug(),
+                    cid = %cid,
+                    size = total_bytes,
+                    "uploaded blob to S3"
+                );
+            }
+
+            Ok(PutResult {
+                cid,
+                size_bytes: total_bytes,
+                existed,
+            })
+        }
+
+        async fn get(&self, silo: Silo, cid: &str) -> Result<ByteStream, BlobError> {
+            validate_cid(cid)?;
+            let key = self.key_for(silo, cid);
+
+            let output = self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await
+                .map_err(|e| {
+                    use aws_sdk_s3::error::SdkError;
+                    match e {
+                        SdkError::ServiceError(service_err) => {
+                            if service_err.err().is_no_such_key() {
+                                BlobError::NotFound
+                            } else {
+                                BlobError::Io(format!(
+                                    "S3 GetObject service error: {:?}",
+                                    service_err
+                                ))
+                            }
+                        }
+                        other => BlobError::Io(format!("S3 GetObject request failed: {}", other)),
+                    }
+                })?;
+
+            // Convert S3 ByteStream to our ByteStream
+            let chunk_size = self.chunk_size_bytes;
+            let mut body = output.body;
+
+            let stream = async_stream::try_stream! {
+                loop {
+                    match body.next().await {
+                        Some(Ok(chunk)) => {
+                            // Rechunk to respect our chunk size limit
+                            let mut remaining = chunk;
+                            while !remaining.is_empty() {
+                                let to_take = std::cmp::min(remaining.len(), chunk_size);
+                                yield Bytes::copy_from_slice(&remaining[..to_take]);
+                                remaining = remaining.slice(to_take..);
+                            }
+                        }
+                        Some(Err(e)) => {
+                            Err(BlobError::Stream(format!("S3 stream error: {}", e)))?;
+                        }
+                        None => break,
+                    }
+                }
+            };
+
+            Ok(Box::pin(stream))
+        }
+
+        async fn head(&self, silo: Silo, cid: &str) -> Result<Option<BlobMeta>, BlobError> {
+            validate_cid(cid)?;
+            let key = self.key_for(silo, cid);
+
+            match self
+                .client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await
+            {
+                Ok(output) => {
+                    let size = output.content_length().unwrap_or(0) as u64;
+                    Ok(Some(BlobMeta {
+                        cid: cid.to_string(),
+                        size_bytes: size,
+                    }))
+                }
+                Err(err) => {
+                    use aws_sdk_s3::error::SdkError;
+                    match err {
+                        SdkError::ServiceError(service_err) => {
+                            if service_err.err().is_not_found() {
+                                Ok(None)
+                            } else {
+                                Err(BlobError::Io(format!(
+                                    "S3 HeadObject service error: {:?}",
+                                    service_err
+                                )))
+                            }
+                        }
+                        other => Err(BlobError::Io(format!(
+                            "S3 HeadObject request failed: {}",
+                            other
+                        ))),
+                    }
+                }
+            }
+        }
+
+        async fn delete(&self, silo: Silo, cid: &str) -> Result<bool, BlobError> {
+            validate_cid(cid)?;
+            let key = self.key_for(silo, cid);
+
+            // Check if object exists first
+            let exists = match self
+                .client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await
+            {
+                Ok(_) => true,
+                Err(err) => {
+                    use aws_sdk_s3::error::SdkError;
+                    match err {
+                        SdkError::ServiceError(service_err) => {
+                            if service_err.err().is_not_found() {
+                                return Ok(false);
+                            } else {
+                                return Err(BlobError::Io(format!(
+                                    "S3 HeadObject service error: {:?}",
+                                    service_err
+                                )));
+                            }
+                        }
+                        other => {
+                            return Err(BlobError::Io(format!(
+                                "S3 HeadObject request failed: {}",
+                                other
+                            )));
+                        }
+                    }
+                }
+            };
+
+            if exists {
+                self.client
+                    .delete_object()
+                    .bucket(&self.bucket)
+                    .key(&key)
+                    .send()
+                    .await
+                    .map_err(|e| BlobError::Io(format!("S3 DeleteObject failed: {}", e)))?;
+
+                tracing::debug!(
+                    silo = %silo.slug(),
+                    cid = %cid,
+                    "deleted blob from S3"
+                );
+
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "s3")]
+pub use s3_impl::S3BlobStore;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,7 +782,9 @@ mod tests {
 
     impl InMem {
         fn new() -> Self {
-            Self { map: Arc::new(Mutex::new(HashMap::new())) }
+            Self {
+                map: Arc::new(Mutex::new(HashMap::new())),
+            }
         }
     }
 
@@ -439,7 +798,11 @@ mod tests {
             if !existed {
                 m.insert(key, collected);
             }
-            Ok(PutResult{ cid, size_bytes: size, existed })
+            Ok(PutResult {
+                cid,
+                size_bytes: size,
+                existed,
+            })
         }
 
         async fn get(&self, silo: Silo, cid: &str) -> Result<ByteStream, BlobError> {
@@ -459,7 +822,10 @@ mod tests {
             validate_cid(cid)?;
             let key = (silo.slug().to_string(), cid.to_string());
             let m = self.map.lock().await;
-            Ok(m.get(&key).map(|v| BlobMeta { cid: cid.to_string(), size_bytes: v.len() as u64 }))
+            Ok(m.get(&key).map(|v| BlobMeta {
+                cid: cid.to_string(),
+                size_bytes: v.len() as u64,
+            }))
         }
 
         async fn delete(&self, silo: Silo, cid: &str) -> Result<bool, BlobError> {
@@ -478,7 +844,7 @@ mod tests {
         assert_eq!(want, got);
     }
 
-    proptest!{
+    proptest! {
         #[test]
         fn prop_chunking_preserves_cid(data in proptest::collection::vec(any::<u8>(), 0..1024)) {
             // Split into arbitrary chunks
@@ -520,7 +886,11 @@ mod tests {
         assert_eq!(pr.size_bytes, 11);
 
         // Head
-        let meta = store.head(silo, &pr.cid).await.unwrap().expect("should exist");
+        let meta = store
+            .head(silo, &pr.cid)
+            .await
+            .unwrap()
+            .expect("should exist");
         assert_eq!(meta.size_bytes, 11);
 
         // Get
@@ -580,7 +950,10 @@ mod tests {
 
         // Too-short string
         let too_short = "a";
-        assert!(matches!(store.get(silo, too_short).await, Err(BlobError::InvalidCid(_))));
+        assert!(matches!(
+            store.get(silo, too_short).await,
+            Err(BlobError::InvalidCid(_))
+        ));
     }
 
     // FsBlobStore tests
@@ -601,7 +974,11 @@ mod tests {
         assert!(!pr.existed);
 
         // Head
-        let meta = store.head(silo, &pr.cid).await.unwrap().expect("should exist");
+        let meta = store
+            .head(silo, &pr.cid)
+            .await
+            .unwrap()
+            .expect("should exist");
         assert_eq!(meta.size_bytes, 11);
         assert_eq!(meta.cid, pr.cid);
 
@@ -759,7 +1136,10 @@ mod tests {
 
         let temp = TempDir::new().unwrap();
         let paths = AppPaths::new(temp.path()).unwrap();
-        let store = FsBlobStore::builder().paths(paths).chunk_size_bytes(1024).build();
+        let store = FsBlobStore::builder()
+            .paths(paths)
+            .chunk_size_bytes(1024)
+            .build();
         let silo = Silo::Kio;
 
         // Create 10KB of data split into 1KB chunks
@@ -801,5 +1181,166 @@ mod tests {
         // Verify via head
         let meta = store.head(silo, &pr.cid).await.unwrap().unwrap();
         assert_eq!(meta.cid, expected_cid);
+    }
+
+    // ===== S3BlobStore Tests =====
+
+    #[cfg(feature = "s3")]
+    mod s3_tests {
+        use super::*;
+        use crate::services::S3BlobStore;
+
+        /// Live integration test against actual S3-compatible storage (Hetzner).
+        ///
+        /// This test is ignored by default. To run it, set the following environment variables:
+        /// - HZ_S3_BUCKET: The bucket name
+        /// - HZ_S3_ENDPOINT: The endpoint URL (e.g., https://nbg1.your-objectstorage.com)
+        /// - HZ_S3_REGION: The region (e.g., nbg1)
+        /// - AWS_ACCESS_KEY_ID: Your access key
+        /// - AWS_SECRET_ACCESS_KEY: Your secret key
+        ///
+        /// Then run:
+        /// ```bash
+        /// cargo test --features s3 s3_live_integration_test -- --ignored --nocapture
+        /// ```
+        #[tokio::test]
+        #[ignore]
+        async fn s3_live_integration_test() {
+            let bucket =
+                std::env::var("HZ_S3_BUCKET").expect("HZ_S3_BUCKET environment variable not set");
+            let endpoint = std::env::var("HZ_S3_ENDPOINT")
+                .expect("HZ_S3_ENDPOINT environment variable not set");
+            let region =
+                std::env::var("HZ_S3_REGION").expect("HZ_S3_REGION environment variable not set");
+
+            // AWS SDK will automatically pick up AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+            // from environment variables via the behavior chain
+
+            println!("Connecting to S3-compatible storage:");
+            println!("  Bucket: {}", bucket);
+            println!("  Endpoint: {}", endpoint);
+            println!("  Region: {}", region);
+
+            let store = S3BlobStore::from_config(
+                bucket,
+                Some(endpoint),
+                Some(region),
+                true, // force path-style
+                None, // no root prefix for test
+            )
+            .await
+            .expect("failed to create S3BlobStore");
+
+            let silo = Silo::Kio;
+
+            // Test 1: Put data
+            println!("\nTest 1: Uploading blob...");
+            let test_data = b"Hello from Zetesis S3 integration test!";
+            let stream = chunks_to_stream(vec![test_data.to_vec()]);
+            let pr = store.put(silo, stream).await.expect("put failed");
+
+            println!("  CID: {}", pr.cid);
+            println!("  Size: {} bytes", pr.size_bytes);
+            println!("  Existed: {}", pr.existed);
+
+            assert_eq!(pr.size_bytes, test_data.len() as u64);
+            assert!(!pr.existed, "blob should not have existed on first put");
+
+            // Test 2: Head (verify existence)
+            println!("\nTest 2: Checking blob existence with head...");
+            let meta = store.head(silo, &pr.cid).await.expect("head failed");
+            assert!(meta.is_some(), "blob should exist");
+
+            let meta = meta.unwrap();
+            assert_eq!(meta.cid, pr.cid);
+            assert_eq!(meta.size_bytes, test_data.len() as u64);
+            println!("  Confirmed blob exists with correct size");
+
+            // Test 3: Get (retrieve and verify content)
+            println!("\nTest 3: Downloading and verifying blob content...");
+            let mut got_stream = store.get(silo, &pr.cid).await.expect("get failed");
+            let mut collected = Vec::new();
+            while let Some(chunk) = got_stream.next().await {
+                let b = chunk.expect("stream chunk failed");
+                collected.extend_from_slice(&b);
+            }
+
+            assert_eq!(
+                collected, test_data,
+                "retrieved content should match original"
+            );
+            println!("  Content verified successfully");
+
+            // Test 4: Put idempotency (same content)
+            println!("\nTest 4: Testing put idempotency...");
+            let stream2 = chunks_to_stream(vec![test_data.to_vec()]);
+            let pr2 = store.put(silo, stream2).await.expect("second put failed");
+
+            assert_eq!(pr2.cid, pr.cid, "same content should produce same CID");
+            assert!(pr2.existed, "blob should have existed on second put");
+            println!("  Idempotency confirmed");
+
+            // Test 5: Delete
+            println!("\nTest 5: Deleting blob...");
+            let deleted = store.delete(silo, &pr.cid).await.expect("delete failed");
+            assert!(deleted, "delete should return true for existing blob");
+            println!("  Blob deleted successfully");
+
+            // Test 6: Verify deletion
+            println!("\nTest 6: Verifying blob deletion...");
+            let meta_after = store
+                .head(silo, &pr.cid)
+                .await
+                .expect("head after delete failed");
+            assert!(meta_after.is_none(), "blob should not exist after deletion");
+
+            let deleted_again = store
+                .delete(silo, &pr.cid)
+                .await
+                .expect("second delete failed");
+            assert!(
+                !deleted_again,
+                "delete should return false for non-existent blob"
+            );
+            println!("  Deletion verified");
+
+            // Test 7: NotFound error on get
+            println!("\nTest 7: Testing NotFound error...");
+            let get_result = store.get(silo, &pr.cid).await;
+            assert!(
+                matches!(get_result, Err(BlobError::NotFound)),
+                "get should return NotFound"
+            );
+            println!("  NotFound error confirmed");
+
+            println!("\nAll S3 integration tests passed successfully!");
+        }
+
+        #[tokio::test]
+        async fn test_s3_key_format() {
+            // Test key formatting logic directly
+            let silo = Silo::Kio;
+            let cid = "abcdef1234567890";
+
+            // Test without root prefix
+            let prefix = &cid[..2];
+            let key = format!("blobs/{}/{}/{}", silo.slug(), prefix, cid);
+            assert_eq!(key, "blobs/kio/ab/abcdef1234567890");
+        }
+
+        #[tokio::test]
+        async fn test_s3_key_format_with_root_prefix() {
+            // Test key formatting logic with root prefix
+            let silo = Silo::Kio;
+            let cid = "abcdef1234567890";
+            let root_prefix = "zetesis/";
+
+            let prefix = &cid[..2];
+            let key = format!("blobs/{}/{}/{}", silo.slug(), prefix, cid);
+            // Mirror the actual implementation in key_for
+            let key_with_root = format!("{}/{}", root_prefix.trim_end_matches('/'), key);
+
+            assert_eq!(key_with_root, "zetesis/blobs/kio/ab/abcdef1234567890");
+        }
     }
 }

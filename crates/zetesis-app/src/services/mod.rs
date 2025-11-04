@@ -19,6 +19,9 @@ pub use blob_store::{
     BlobError, BlobMeta, BlobStore, ByteStream, Cid, DurableWrite, FsBlobStore, PutResult,
     blake3_cid, validate_cid,
 };
+
+#[cfg(feature = "s3")]
+pub use blob_store::S3BlobStore;
 pub use context::{
     EmbedBatchTask, EmbedClient, EmbedMode, EmbedRuntimeOptions, EmbedService, EmbeddingJobClient,
     Governors, JobMetadata, PipelineContext, PipelineError, PipelineResult, ProviderJobState,

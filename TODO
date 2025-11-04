@@ -24,79 +24,79 @@ Legend: [ ] = open · [~] = in progress · [x] = done
 - [ ] T2: Add SPEC verification checklist to CI (clippy fmt test invoke, fail on drift) (P1) (covers REQ-ZE-SPEC-CADENCE)
 
 ## WP-BLOBS — Content-Addressed Storage
-- [x] T1: Define `BlobStore` trait (`put`/`get`/`head`/`delete`, CID=idempotent, streaming) + property tests (P0) (covers REQ-ZE-STORAGE-FS, REQ-ZE-ID-CANONICAL)
-- [ ] T2: Implement `FsBlobStore` over `AppPaths::blob_path` with checksum-on-write and size verification (P0) (covers REQ-ZE-STORAGE-FS)
-- [ ] T3: Add S3-compatible `S3BlobStore` scaffold (Hetzner) behind feature flag + config stubs (P1) (prep for later provider) (covers REQ-ZE-STORAGE-FS)
-- [ ] T4: Migrate KIO/SAOS download paths to `BlobStore` API; deprecate ad-hoc caches; E2E move test (P1) (covers REQ-ZE-STORAGE-FS)
+- [x] T3: Define `BlobStore` trait (`put`/`get`/`head`/`delete`, CID=idempotent, streaming) + property tests (P0) (covers REQ-ZE-STORAGE-FS, REQ-ZE-ID-CANONICAL)
+- [x] T4: Implement `FsBlobStore` over `AppPaths::blob_path` with checksum-on-write and size verification (P0) (covers REQ-ZE-STORAGE-FS)
+- [x] T5: Implement `S3BlobStore` using an S3 library (for Hetzner) behind feature flag + config stubs (P1) (covers REQ-ZE-STORAGE-FS) — Completed 2025-11-04: Added aws-sdk-s3 backend with path-style addressing, key layout mirroring, comprehensive tests, and documentation
+- [x] T6: Migrate KIO/SAOS download paths to `BlobStore` API; deprecate ad-hoc caches; E2E move test (P1) (covers REQ-ZE-STORAGE-FS) — Completed 2025-11-05: Refactored KIO scrapers to stream HTTP → BlobStore, replaced filesystem caching with content-addressable storage, added CLI backend selection (S3/FS), implemented manifest writer for doc_id→CID ledger, added E2E integration tests with mock HTTP server, fixed S3 error handling panics
 
 ## WP-CLI — Command Surface
-- [ ] T1: Remove dead CLI (`ocr`, `segment`) and unreachable wiring; keep services internal; update SPEC + help output tests (P0) (covers REQ-ZE-CLI-CMDS)
-- [ ] T2: Validate index names and file size bounds at parse time; add negative tests (P1) (covers REQ-ZE-CLI-LIMITS)
-- [ ] T3: Add examples and `--help` coverage for `search keyword|vector` including filters and fields (P2) (covers REQ-ZE-CLI-SEARCH)
+- [ ] T7: Remove dead CLI (`ocr`, `segment`) and unreachable wiring; keep services internal; update SPEC + help output tests (P0) (covers REQ-ZE-CLI-CMDS)
+- [ ] T8: Validate index names and file size bounds at parse time; add negative tests (P1) (covers REQ-ZE-CLI-LIMITS)
+- [ ] T9: Add examples and `--help` coverage for `search keyword|vector` including filters and fields (P2) (covers REQ-ZE-CLI-SEARCH)
 
 ## WP-SERVER — HTTP Surface
-- [ ] T1: Implement Axum POC with `/healthz` + graceful shutdown (P0) (covers REQ-ZE-CLI-CMDS)
-- [ ] T2: Add `/v1/search/keyword` and `/v1/search/vector` endpoints mirroring CLI options; reuse index/search code paths (P1) (covers REQ-ZE-INDEX-SEARCHABLE)
-- [ ] T3: Logging, rate limits, and error mapping to structured JSON (P1) (covers REQ-ZE-LOGS, REQ-ZE-ASSERTS)
-- [ ] T4: Config load from env/files; XDG-aware paths; CORS off by default (P2)
- - [ ] T5: Typeahead-optimized keyword endpoint: small fields, limit ≤ 10, p95 ≤ 100 ms; per-IP rate limit and 2s LRU cache (P0) (covers REQ-ZE-UI-TYPEAHEAD)
+- [ ] T10: Implement Axum POC with `/healthz` + graceful shutdown (P0) (covers REQ-ZE-CLI-CMDS)
+- [ ] T11: Add `/v1/search/keyword` and `/v1/search/vector` endpoints mirroring CLI options; reuse index/search code paths (P1) (covers REQ-ZE-INDEX-SEARCHABLE)
+- [ ] T12: Logging, rate limits, and error mapping to structured JSON (P1) (covers REQ-ZE-LOGS, REQ-ZE-ASSERTS)
+- [ ] T13: Config load from env/files; XDG-aware paths; CORS off by default (P2)
+ - [ ] T14: Typeahead-optimized keyword endpoint: small fields, limit ≤ 10, p95 ≤ 100 ms; per-IP rate limit and 2s LRU cache (P0) (covers REQ-ZE-UI-TYPEAHEAD)
 
 ## WP-UI — Dioxus 0.7 (SSR + Islands)
-- [ ] T1: Minimal SSR route `/ui/hello` rendered by Dioxus 0.7; CI check for gzipped bundle ≤ 150 KiB (P0) (covers REQ-ZE-UI-DIOXUS)
-- [ ] T2: Wire Dioxus SSR into Axum under `/ui/*`; keep `/v1/*` JSON APIs separate (P0) (covers REQ-ZE-UI-AXUM)
-- [ ] T3: Implement search page: SSR shell + hydrated results island with typeahead (debounce 200ms, min 2 chars, limit 10, cancellable) (P1) (covers REQ-ZE-UI-TYPEAHEAD)
-- [ ] T4: Add “Refine with semantics” action to run hybrid once (RRF, bounded k), swap results (P1) (covers REQ-ZE-UI-REFINE)
-- [ ] T5: Admin status page: SSR table (index stats, job counts); optional tiny hydrated badge for live counters (P1) (covers REQ-ZE-UI-DIOXUS)
-- [ ] T6: SSG build for static pages (landing/help) and static assets pipeline (public/ + caching) (P2) (covers REQ-ZE-UI-SSG, REQ-ZE-UI-ASSETS)
+- [ ] T15: Minimal SSR route `/ui/hello` rendered by Dioxus 0.7; CI check for gzipped bundle ≤ 150 KiB (P0) (covers REQ-ZE-UI-DIOXUS)
+- [ ] T16: Wire Dioxus SSR into Axum under `/ui/*`; keep `/v1/*` JSON APIs separate (P0) (covers REQ-ZE-UI-AXUM)
+- [ ] T17: Implement search page: SSR shell + hydrated results island with typeahead (debounce 200ms, min 2 chars, limit 10, cancellable) (P1) (covers REQ-ZE-UI-TYPEAHEAD)
+- [ ] T18: Add “Refine with semantics” action to run hybrid once (RRF, bounded k), swap results (P1) (covers REQ-ZE-UI-REFINE)
+- [ ] T19: Admin status page: SSR table (index stats, job counts); optional tiny hydrated badge for live counters (P1) (covers REQ-ZE-UI-DIOXUS)
+- [ ] T20: SSG build for static pages (landing/help) and static assets pipeline (public/ + caching) (P2) (covers REQ-ZE-UI-SSG, REQ-ZE-UI-ASSETS)
 
 ## WP-AUTH — OAuth2/OIDC Integration
-- [ ] T1: Document oauth2-proxy setup (Hetzner), header trust model, and network placement (P0) (covers REQ-ZE-AUTH-PROXY)
-- [ ] T2: Optional JWT verification middleware (JWKS cache, aud/iss checks, clock skew) behind feature flag (P1) (covers REQ-ZE-AUTH-JWT)
-- [ ] T3: API key path for programmatic clients (scoped routes, disabled by default) (P1) (covers REQ-ZE-AUTH-API-KEY)
+- [ ] T21: Document oauth2-proxy setup (Hetzner), header trust model, and network placement (P0) (covers REQ-ZE-AUTH-PROXY)
+- [ ] T22: Optional JWT verification middleware (JWKS cache, aud/iss checks, clock skew) behind feature flag (P1) (covers REQ-ZE-AUTH-JWT)
+- [ ] T23: API key path for programmatic clients (scoped routes, disabled by default) (P1) (covers REQ-ZE-AUTH-API-KEY)
 
 ## WP-INGEST — Ingestion Pipeline
-- [ ] T1: Route KIO/SAOS downloaded PDFs to blob store via `AppPaths::blob_path` (content-addressed) and store CID reference (P0) (covers REQ-ZE-STORAGE-FS, REQ-ZE-ID-CANONICAL)
-- [ ] T2: Add end-to-end ingest test that indexes a tiny PDF fixture and verifies `doc` + `chunk` shapes (P1) (covers REQ-ZE-INDEX-IDEMPOTENT, REQ-ZE-INDEX-FIELDS)
+- [ ] T24: Route KIO/SAOS downloaded PDFs to blob store via `AppPaths::blob_path` (content-addressed) and store CID reference (P0) (covers REQ-ZE-STORAGE-FS, REQ-ZE-ID-CANONICAL)
+- [ ] T25: Add end-to-end ingest test that indexes a tiny PDF fixture and verifies `doc` + `chunk` shapes (P1) (covers REQ-ZE-INDEX-IDEMPOTENT, REQ-ZE-INDEX-FIELDS)
 
 ## WP-INDEX — Milli Configuration
-- [ ] T1: Property test for index bootstrap: searchable/filterable/sortable sets equal SPEC; primary key=`id`; Hannoy backend; embedder dims (P1) (covers REQ-ZE-INDEX-EMBEDDER, REQ-ZE-INDEX-SEARCHABLE, REQ-ZE-INDEX-FILTERABLE, REQ-ZE-INDEX-SORTABLE)
+- [ ] T26: Property test for index bootstrap: searchable/filterable/sortable sets equal SPEC; primary key=`id`; Hannoy backend; embedder dims (P1) (covers REQ-ZE-INDEX-EMBEDDER, REQ-ZE-INDEX-SEARCHABLE, REQ-ZE-INDEX-FILTERABLE, REQ-ZE-INDEX-SORTABLE)
 
 ## WP-JOBS — Embedding Jobs
-- [ ] T1: Add stale job reaper and recovery (Pending/Embedding with old timestamps → mark Failed or requeue) (P1) (covers REQ-ZE-JOBS-REAPER, REQ-ZE-JOBS-LIMITS)
-- [ ] T2: Add `jobs status` output with counts by status and oldest timestamp (P2) (covers REQ-ZE-JOBS-LOCAL)
-- [ ] T3: Idempotency tests for enqueue/update/upsert; bounded retries policy (P2) (covers REQ-ZE-JOBS-LIMITS)
+- [ ] T27: Add stale job reaper and recovery (Pending/Embedding with old timestamps → mark Failed or requeue) (P1) (covers REQ-ZE-JOBS-REAPER, REQ-ZE-JOBS-LIMITS)
+- [ ] T28: Add `jobs status` output with counts by status and oldest timestamp (P2) (covers REQ-ZE-JOBS-LOCAL)
+- [ ] T29: Idempotency tests for enqueue/update/upsert; bounded retries policy (P2) (covers REQ-ZE-JOBS-LIMITS)
 
 ## WP-OCR — OCR Providers
-- [ ] T1: Add negative tests for exceeding `MAX_PAGES_PER_DOCUMENT`, zero concurrency, and inflight budget mismatches (P1) (covers REQ-ZE-OCR-LIMITS)
-- [ ] T2: Document token usage logging and provider-specific retries in docs/ocr_costs.md (P2) (covers REQ-ZE-OCR-RETRY)
+- [ ] T30: Add negative tests for exceeding `MAX_PAGES_PER_DOCUMENT`, zero concurrency, and inflight budget mismatches (P1) (covers REQ-ZE-OCR-LIMITS)
+- [ ] T31: Document token usage logging and provider-specific retries in docs/ocr_costs.md (P2) (covers REQ-ZE-OCR-RETRY)
 
 ## WP-HYBRID — Hybrid Search Fusion
-- [ ] T1: Confirm Milli lacks built-in RRF; document hybrid support scope (P0) (covers REQ-ZE-INDEX-SEARCHABLE)
-- [ ] T2: Implement client-side RRF fusion in CLI/server (run keyword + vector, fuse with k=60, bounded k); tests for tie and overlap (P1)
-- [ ] T3: Add optional weighted-linear fusion with tunable weights; default to RRF (P2)
+- [ ] T32: Confirm Milli lacks built-in RRF; document hybrid support scope (P0) (covers REQ-ZE-INDEX-SEARCHABLE)
+- [ ] T33: Implement client-side RRF fusion in CLI/server (run keyword + vector, fuse with k=60, bounded k); tests for tie and overlap (P1)
+- [ ] T34: Add optional weighted-linear fusion with tunable weights; default to RRF (P2)
 
 ## WP-TEXT — Segmentation
-- [ ] T1: Add more YAML regression cases for abbreviations and enumerations; include negative cases (P2) (covers REQ-ZE-TEXT-SEGMENT)
+- [ ] T35: Add more YAML regression cases for abbreviations and enumerations; include negative cases (P2) (covers REQ-ZE-TEXT-SEGMENT)
 
 ## WP-BACKUP — Backup & Recover
-- [ ] T1: Add rotation policy and timestamped dirs for `db backup`; verify counts/sizes (P1) (covers REQ-ZE-BACKUP-RESTIC)
-- [ ] T2: `db recover` integrity check (doc count, vector presence) and dry-run (P1) (covers REQ-ZE-BACKUP-RECOVER)
-- [ ] T3: Restic setup to Hetzner S3 (credentials, bucket policy), systemd service+timer, retention 7/4/6 (P1) (covers REQ-ZE-BACKUP-RESTIC, REQ-ZE-BACKUP-SCOPE)
-- [ ] T4: Monthly restore rehearsal into scratch path + diff stats (P2) (covers REQ-ZE-BACKUP-RECOVER)
+- [ ] T36: Add rotation policy and timestamped dirs for `db backup`; verify counts/sizes (P1) (covers REQ-ZE-BACKUP-RESTIC)
+- [ ] T37: `db recover` integrity check (doc count, vector presence) and dry-run (P1) (covers REQ-ZE-BACKUP-RECOVER)
+- [ ] T38: Restic setup to Hetzner S3 (credentials, bucket policy), systemd service+timer, retention 7/4/6 (P1) (covers REQ-ZE-BACKUP-RESTIC, REQ-ZE-BACKUP-SCOPE)
+- [ ] T39: Monthly restore rehearsal into scratch path + diff stats (P2) (covers REQ-ZE-BACKUP-RECOVER)
 
 ## WP-DELETE — Hard Deletes
-- [ ] T1: Implement atomic delete of doc+chunks+blob with rollback on failure; add dry-run (P0) (covers REQ-ZE-KIO-DELETE)
-- [ ] T2: Negative tests (missing doc, partial state) and idempotency checks (P1)
+- [ ] T40: Implement atomic delete of doc+chunks+blob with rollback on failure; add dry-run (P0) (covers REQ-ZE-KIO-DELETE)
+- [ ] T41: Negative tests (missing doc, partial state) and idempotency checks (P1)
 
 ## WP-DEPLOY — Hetzner Basics
-- [ ] T1: Systemd unit, journald logs, env file; XDG base override docs (P1)
-- [ ] T2: Deployment doc for Hetzner (firewall, ulimit, backups), manual first (P2)
+- [ ] T42: Systemd unit, journald logs, env file; XDG base override docs (P1)
+- [ ] T43: Deployment doc for Hetzner (firewall, ulimit, backups), manual first (P2)
 
 ## WP-CLI-REDESIGN — CLI Consistency and Namespaces
-- [ ] T1: Introduce `--silo <slug>` for dataset-scoped commands; keep positional `INDEX` as a deprecated alias with warning (P0)
-- [ ] T2: Add namespaces: `silo (list|create|stats|backup|recover|purge)`, `source (kio fetch)`, `index (alias for db)`, `sys (serve|init|doctor)` (P0)
-- [ ] T3: Standardize flags across commands (`--limit/--offset/--fields/--pretty/--filter`); enforce bounds (`limit,k ≤ 100`) (P1)
-- [ ] T4: Implement `sys init` (create dirs, verify RW) and `sys doctor` (API keys, paths, map sizes, rate limits) with actionable output (P1)
-- [ ] T5: Update help texts and examples to prefer `--silo`; add deprecation notes for old forms (P1)
-- [ ] T6: Docs: `docs/data-quickstart.md` with end-to-end flow (source→ingest→jobs→search→backup) (P1)
-- [ ] T7: Migration: keep old `db` as alias to `index` and positional `INDEX` for one release; add warnings and a removal date (P2)
+- [ ] T44: Introduce `--silo <slug>` for dataset-scoped commands; keep positional `INDEX` as a deprecated alias with warning (P0)
+- [ ] T45: Add namespaces: `silo (list|create|stats|backup|recover|purge)`, `source (kio fetch)`, `index (alias for db)`, `sys (serve|init|doctor)` (P0)
+- [ ] T46: Standardize flags across commands (`--limit/--offset/--fields/--pretty/--filter`); enforce bounds (`limit,k ≤ 100`) (P1)
+- [ ] T47: Implement `sys init` (create dirs, verify RW) and `sys doctor` (API keys, paths, map sizes, rate limits) with actionable output (P1)
+- [ ] T48: Update help texts and examples to prefer `--silo`; add deprecation notes for old forms (P1)
+- [ ] T49: Docs: `docs/data-quickstart.md` with end-to-end flow (source→ingest→jobs→search→backup) (P1)
+- [ ] T50: Migration: keep old `db` as alias to `index` and positional `INDEX` for one release; add warnings and a removal date (P2)

@@ -1,7 +1,6 @@
 use std::{
     fmt,
     num::NonZeroU32,
-    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -21,7 +20,6 @@ use governor::{
 use reqwest::{Client, Url, header};
 use scraper::{Html, Selector};
 use tokio::{
-    fs,
     sync::{Mutex, mpsc},
     task::JoinSet,
     time::sleep,
@@ -135,7 +133,6 @@ impl KioUzpScraper {
         opts: KioScrapeOptions,
         event_tx: EventSender,
     ) -> Result<(), KioScrapeError> {
-        ensure_dir(&opts.output_dir).await?;
         send_event(&event_tx, KioEvent::DiscoveryStarted { limit: opts.limit }).await?;
 
         let worker_count = opts.worker_count.get();
@@ -145,14 +142,10 @@ impl KioUzpScraper {
         discovery_concurrency = discovery_concurrency.min(channel_capacity);
         let (sender, receiver) = mpsc::channel(channel_capacity);
 
-        let downloaded = Arc::new(AtomicUsize::new(0));
-        let skipped_existing = Arc::new(AtomicUsize::new(0));
+        let stored = Arc::new(AtomicUsize::new(0));
+        let skipped = Arc::new(AtomicUsize::new(0));
 
-        let worker_stats = WorkerStats::new(
-            downloaded.clone(),
-            skipped_existing.clone(),
-            event_tx.clone(),
-        );
+        let worker_stats = WorkerStats::new(stored.clone(), skipped.clone(), event_tx.clone());
 
         assert!(
             discovery_concurrency > 0,
@@ -162,7 +155,7 @@ impl KioUzpScraper {
         let mut join_set = spawn_workers(
             self.clone(),
             receiver,
-            opts.output_dir.clone(),
+            opts.blob_store.clone(),
             worker_count,
             worker_stats,
         );
@@ -184,8 +177,8 @@ impl KioUzpScraper {
         let summary = KioScraperSummary {
             discovered: discovery.discovered,
             total_available_hint: discovery.total_available,
-            downloaded: downloaded.load(Ordering::Relaxed),
-            skipped_existing: skipped_existing.load(Ordering::Relaxed),
+            stored: stored.load(Ordering::Relaxed),
+            skipped: skipped.load(Ordering::Relaxed),
         };
 
         send_event(&event_tx, KioEvent::Completed { summary }).await?;
@@ -543,98 +536,11 @@ impl KioUzpScraper {
     async fn process_task(
         &self,
         task: &KioDocumentTask,
-        output_dir: &Path,
+        blob_store: &Arc<dyn crate::services::BlobStore>,
     ) -> Result<ProcessOutcome, KioScrapeError> {
-        let output_path = output_dir.join(format!("kio_{}.pdf", task.doc_id));
+        use crate::pipeline::processor::Silo;
+        use futures::stream;
 
-        if let Some(outcome) = self.check_existing_pdf(task, &output_path).await? {
-            return Ok(outcome);
-        }
-
-        self.download_and_store_pdf(task, &output_path).await
-    }
-
-    async fn check_existing_pdf(
-        &self,
-        task: &KioDocumentTask,
-        output_path: &Path,
-    ) -> Result<Option<ProcessOutcome>, KioScrapeError> {
-        if !fs::try_exists(output_path).await? {
-            return Ok(None);
-        }
-
-        match fs::metadata(output_path).await {
-            Ok(meta) => {
-                let local_len = meta.len();
-                match self.fetch_pdf_len(&task.pdf_path).await {
-                    Ok(Some(remote_len)) if remote_len == local_len => {
-                        info!(
-                            silo = SILO_SLUG,
-                            stage = "skip_existing",
-                            doc_id = task.doc_id,
-                            path = %output_path.display(),
-                            local_len,
-                            remote_len,
-                            "skipping existing PDF; size matches upstream"
-                        );
-                        Ok(Some(ProcessOutcome::SkippedExisting))
-                    }
-                    Ok(Some(remote_len)) => {
-                        warn!(
-                            silo = SILO_SLUG,
-                            stage = "size_mismatch",
-                            doc_id = task.doc_id,
-                            path = %output_path.display(),
-                            local_len,
-                            remote_len,
-                            "existing PDF size differs from upstream; re-downloading"
-                        );
-                        Ok(None)
-                    }
-                    Ok(None) => {
-                        warn!(
-                            silo = SILO_SLUG,
-                            stage = "size_unknown",
-                            doc_id = task.doc_id,
-                            path = %output_path.display(),
-                            local_len,
-                            "remote PDF size unavailable; re-downloading"
-                        );
-                        Ok(None)
-                    }
-                    Err(err) => {
-                        warn!(
-                            silo = SILO_SLUG,
-                            stage = "size_check_failed",
-                            doc_id = task.doc_id,
-                            path = %output_path.display(),
-                            local_len,
-                            error = %err,
-                            "failed to inspect remote PDF size; re-downloading"
-                        );
-                        Ok(None)
-                    }
-                }
-            }
-            Err(err) => {
-                warn!(
-                    silo = SILO_SLUG,
-                    stage = "local_metadata_failed",
-                    doc_id = task.doc_id,
-                    path = %output_path.display(),
-                    error = %err,
-                    "failed to read local PDF metadata; re-downloading"
-                );
-                Ok(None)
-            }
-        }
-    }
-
-    async fn download_and_store_pdf(
-        &self,
-        task: &KioDocumentTask,
-        output_path: &Path,
-    ) -> Result<ProcessOutcome, KioScrapeError> {
         info!(
             silo = SILO_SLUG,
             stage = "detail_fetch_start",
@@ -657,18 +563,39 @@ impl KioUzpScraper {
             doc_id = task.doc_id,
             "downloading judgment PDF"
         );
-        let pdf = self.fetch_pdf(&task.pdf_path).await?;
-        fs::write(output_path, &pdf).await?;
+        let pdf_bytes = self.fetch_pdf(&task.pdf_path).await?;
+        let byte_count = pdf_bytes.len();
+
         info!(
             silo = SILO_SLUG,
-            stage = "pdf_stored",
+            stage = "blob_store_start",
             doc_id = task.doc_id,
-            bytes = pdf.len(),
-            path = %output_path.display(),
+            bytes = byte_count,
+            "storing blob"
+        );
+
+        let byte_stream: crate::services::ByteStream =
+            Box::pin(stream::once(async move { Ok(pdf_bytes) }));
+
+        let put_result = blob_store.put(Silo::Kio, byte_stream).await.map_err(|e| {
+            KioScrapeError::parse("blob_put", format!("BlobStore put failed: {}", e))
+        })?;
+
+        info!(
+            silo = SILO_SLUG,
+            stage = "blob_stored",
+            doc_id = task.doc_id,
+            cid = %put_result.cid,
+            bytes = put_result.size_bytes,
+            existed = put_result.existed,
             "stored judgment PDF"
         );
 
-        Ok(ProcessOutcome::Downloaded { bytes: pdf.len() })
+        Ok(ProcessOutcome::Stored {
+            cid: put_result.cid,
+            bytes: byte_count,
+            existed: put_result.existed,
+        })
     }
 }
 
@@ -679,20 +606,16 @@ struct DiscoveryStats {
 }
 
 struct WorkerStats {
-    downloaded: Arc<AtomicUsize>,
-    skipped_existing: Arc<AtomicUsize>,
+    stored: Arc<AtomicUsize>,
+    skipped: Arc<AtomicUsize>,
     event_tx: EventSender,
 }
 
 impl WorkerStats {
-    fn new(
-        downloaded: Arc<AtomicUsize>,
-        skipped_existing: Arc<AtomicUsize>,
-        event_tx: EventSender,
-    ) -> Self {
+    fn new(stored: Arc<AtomicUsize>, skipped: Arc<AtomicUsize>, event_tx: EventSender) -> Self {
         Self {
-            downloaded,
-            skipped_existing,
+            stored,
+            skipped,
             event_tx,
         }
     }
@@ -701,8 +624,8 @@ impl WorkerStats {
 impl Clone for WorkerStats {
     fn clone(&self) -> Self {
         Self {
-            downloaded: Arc::clone(&self.downloaded),
-            skipped_existing: Arc::clone(&self.skipped_existing),
+            stored: Arc::clone(&self.stored),
+            skipped: Arc::clone(&self.skipped),
             event_tx: self.event_tx.clone(),
         }
     }
@@ -710,28 +633,31 @@ impl Clone for WorkerStats {
 
 #[derive(Debug)]
 enum ProcessOutcome {
-    Downloaded { bytes: usize },
-    SkippedExisting,
+    Stored {
+        cid: String,
+        bytes: usize,
+        existed: bool,
+    },
+    Skipped,
 }
 
 fn spawn_workers(
     scraper: KioUzpScraper,
     receiver: mpsc::Receiver<KioDocumentTask>,
-    output_dir: PathBuf,
+    blob_store: Arc<dyn crate::services::BlobStore>,
     worker_count: usize,
     stats: WorkerStats,
 ) -> JoinSet<Result<(), KioScrapeError>> {
     let shared_receiver = Arc::new(Mutex::new(receiver));
-    let output_dir = Arc::new(output_dir);
 
     let mut join_set = JoinSet::new();
     for worker_idx in 0..worker_count {
         let rx = Arc::clone(&shared_receiver);
         let scraper = scraper.clone();
-        let output_dir = Arc::clone(&output_dir);
+        let blob_store = Arc::clone(&blob_store);
         let stats = stats.clone();
 
-        join_set.spawn(async move { run_worker(worker_idx, rx, scraper, output_dir, stats).await });
+        join_set.spawn(async move { run_worker(worker_idx, rx, scraper, blob_store, stats).await });
     }
 
     join_set
@@ -741,7 +667,7 @@ async fn run_worker(
     worker_idx: usize,
     receiver: Arc<Mutex<mpsc::Receiver<KioDocumentTask>>>,
     scraper: KioUzpScraper,
-    output_dir: Arc<PathBuf>,
+    blob_store: Arc<dyn crate::services::BlobStore>,
     stats: WorkerStats,
 ) -> Result<(), KioScrapeError> {
     loop {
@@ -755,7 +681,7 @@ async fn run_worker(
             break;
         };
 
-        process_worker_task(worker_idx, &scraper, &output_dir, &stats, task).await?;
+        process_worker_task(worker_idx, &scraper, &blob_store, &stats, task).await?;
     }
     Ok(())
 }
@@ -770,7 +696,7 @@ async fn receive_task(
 async fn process_worker_task(
     worker_idx: usize,
     scraper: &KioUzpScraper,
-    output_dir: &Path,
+    blob_store: &Arc<dyn crate::services::BlobStore>,
     stats: &WorkerStats,
     task: KioDocumentTask,
 ) -> Result<(), KioScrapeError> {
@@ -791,27 +717,42 @@ async fn process_worker_task(
     )
     .await?;
 
-    match scraper.process_task(&task, output_dir).await {
-        Ok(ProcessOutcome::Downloaded { bytes }) => {
-            stats.downloaded.fetch_add(1, Ordering::Relaxed);
+    match scraper.process_task(&task, blob_store).await {
+        Ok(ProcessOutcome::Stored {
+            cid,
+            bytes,
+            existed,
+        }) => {
+            if !existed {
+                stats.stored.fetch_add(1, Ordering::Relaxed);
+            } else {
+                stats.skipped.fetch_add(1, Ordering::Relaxed);
+            }
             debug!(
                 silo = SILO_SLUG,
                 stage = "worker_done",
                 worker = worker_idx,
                 doc_id = %doc_id,
+                cid = %cid,
                 bytes,
-                "worker finished download"
+                existed,
+                "worker finished blob storage"
             );
             send_event(
                 &stats.event_tx,
-                KioEvent::DownloadCompleted { doc_id, bytes },
+                KioEvent::BlobStored {
+                    doc_id,
+                    cid,
+                    bytes,
+                    existed,
+                },
             )
             .await?;
             Ok(())
         }
-        Ok(ProcessOutcome::SkippedExisting) => {
-            stats.skipped_existing.fetch_add(1, Ordering::Relaxed);
-            send_event(&stats.event_tx, KioEvent::DownloadSkipped { doc_id }).await?;
+        Ok(ProcessOutcome::Skipped) => {
+            stats.skipped.fetch_add(1, Ordering::Relaxed);
+            send_event(&stats.event_tx, KioEvent::BlobSkipped { doc_id }).await?;
             Ok(())
         }
         Err(err) => {
@@ -989,14 +930,6 @@ async fn fetch_discovery_page(
 
 fn parse_err(stage: &'static str, err: impl fmt::Display) -> KioScrapeError {
     KioScrapeError::parse(stage, err.to_string())
-}
-
-async fn ensure_dir(dir: &Path) -> Result<(), KioScrapeError> {
-    if fs::try_exists(dir).await? {
-        return Ok(());
-    }
-    fs::create_dir_all(dir).await?;
-    Ok(())
 }
 
 fn compute_discovery_target(limit: Option<usize>, total_available: Option<usize>) -> usize {

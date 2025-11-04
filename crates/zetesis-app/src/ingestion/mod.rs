@@ -3,6 +3,7 @@
 pub mod kio_saos;
 pub mod kio_types;
 pub mod kio_uzp;
+pub mod manifest;
 
 pub use kio_saos::KioSaosScraper;
 pub use kio_types::{
@@ -10,3 +11,4 @@ pub use kio_types::{
     KioScraperSummary,
 };
 pub use kio_uzp::KioUzpScraper;
+pub use manifest::{ManifestEntry, ManifestError, ManifestWriter};

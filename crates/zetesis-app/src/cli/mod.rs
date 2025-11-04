@@ -73,9 +73,6 @@ pub struct FetchKioArgs {
     /// Limit the number of documents to download (omit to fetch everything).
     #[arg(long)]
     pub limit: Option<usize>,
-    /// Directory where downloaded documents will be cached.
-    #[arg(long, value_name = "DIR")]
-    pub output_path: PathBuf,
     /// Number of concurrent download workers (>= 1).
     #[arg(long, default_value_t = 4)]
     pub workers: usize,
