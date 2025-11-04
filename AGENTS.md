@@ -51,6 +51,7 @@
 - **Default to static dispatch; restrict trait objects on hot paths unless strictly needed and justified.**
 - **Keep macros trivial; don't stack `cfg` attributes/explode test matrix.**
 - **Idiomatic, explicit names with unit suffixes for clarity (e.g., `_ms`).**
+- **Rust 2024 lets `if` guards precede `let` bindings; prefer this guard-first style when it keeps conditions readable.**
 
 ---
 
