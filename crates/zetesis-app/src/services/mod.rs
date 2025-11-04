@@ -5,6 +5,7 @@
 //! `crate::text`, `crate::pdf`, or other dedicated modules so concurrency and
 //! resource accounting stay localized.
 
+pub mod blob_store;
 pub mod context;
 pub mod embed;
 pub mod indexer;
@@ -14,6 +15,9 @@ pub mod ocr;
 pub mod orchestrator;
 pub mod structured;
 
+pub use blob_store::{
+    BlobError, BlobMeta, BlobStore, ByteStream, Cid, PutResult, blake3_cid, validate_cid,
+};
 pub use context::{
     EmbedBatchTask, EmbedClient, EmbedMode, EmbedRuntimeOptions, EmbedService, EmbeddingJobClient,
     Governors, JobMetadata, PipelineContext, PipelineError, PipelineResult, ProviderJobState,
