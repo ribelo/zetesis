@@ -16,7 +16,8 @@ pub mod orchestrator;
 pub mod structured;
 
 pub use blob_store::{
-    BlobError, BlobMeta, BlobStore, ByteStream, Cid, PutResult, blake3_cid, validate_cid,
+    BlobError, BlobMeta, BlobStore, ByteStream, Cid, DurableWrite, FsBlobStore, PutResult,
+    blake3_cid, validate_cid,
 };
 pub use context::{
     EmbedBatchTask, EmbedClient, EmbedMode, EmbedRuntimeOptions, EmbedService, EmbeddingJobClient,
