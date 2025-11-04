@@ -86,10 +86,10 @@ impl StructuredExtractor {
                 Ok(response) => {
                     let decision = response.data;
                     decision.validate()?;
-                    if let Some(text) = coverage_text {
-                        if !text.trim().is_empty() {
-                            ensure_chunk_coverage(&decision, text)?;
-                        }
+                    if let Some(text) = coverage_text
+                        && !text.trim().is_empty()
+                    {
+                        ensure_chunk_coverage(&decision, text)?;
                     }
                     return Ok(StructuredExtraction {
                         decision,
@@ -97,7 +97,7 @@ impl StructuredExtractor {
                     });
                 }
                 Err(err) => {
-                    last_error = Some(StructuredExtractError::Agent(err));
+                    last_error = Some(StructuredExtractError::Agent(Box::new(err)));
                 }
             }
 
@@ -114,11 +114,23 @@ pub enum StructuredExtractError {
     #[error("missing GOOGLE_AI_API_KEY or GEMINI_API_KEY environment variable")]
     MissingApiKey,
     #[error(transparent)]
-    Model(#[from] ai_ox::model::gemini::GeminiError),
+    Model(#[from] Box<ai_ox::model::gemini::GeminiError>),
     #[error(transparent)]
-    Agent(#[from] ai_ox::agent::error::AgentError),
+    Agent(#[from] Box<ai_ox::agent::error::AgentError>),
     #[error(transparent)]
     Validation(#[from] StructuredValidationError),
+}
+
+impl From<ai_ox::model::gemini::GeminiError> for StructuredExtractError {
+    fn from(e: ai_ox::model::gemini::GeminiError) -> Self {
+        StructuredExtractError::Model(Box::new(e))
+    }
+}
+
+impl From<ai_ox::agent::error::AgentError> for StructuredExtractError {
+    fn from(e: ai_ox::agent::error::AgentError) -> Self {
+        StructuredExtractError::Agent(Box::new(e))
+    }
 }
 
 fn ensure_chunk_coverage(

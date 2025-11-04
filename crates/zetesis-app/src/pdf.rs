@@ -137,7 +137,7 @@ fn render_page(
         .map_err(|source| PdfTextError::PageText { page_index, source })?;
 
     let chars = text.chars();
-    if chars.len() == 0 {
+    if chars.is_empty() {
         return Ok(());
     }
 
@@ -319,23 +319,23 @@ fn load_pdfium() -> Result<Pdfium, PdfiumError> {
             "PDFIUM_DYNAMIC_LIB_PATH",
             "PDFIUM_LIBRARY_DIR",
         ] {
-            if let Some(result) = try_bind_from_env(var) {
-                if result.is_ok() {
-                    return result;
-                }
+            if let Some(result) = try_bind_from_env(var)
+                && result.is_ok()
+            {
+                return result;
             }
         }
 
         for candidate in candidate_paths() {
-            if let Some(result) = try_bind_from_path(candidate) {
-                if result.is_ok() {
-                    return result;
-                }
+            if let Some(result) = try_bind_from_path(candidate)
+                && result.is_ok()
+            {
+                return result;
             }
         }
 
         match Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./")) {
-            Ok(bindings) => return Ok(Pdfium::new(bindings)),
+            Ok(bindings) => Ok(Pdfium::new(bindings)),
             Err(primary_err) => match Pdfium::bind_to_system_library() {
                 Ok(bindings) => Ok(Pdfium::new(bindings)),
                 Err(_) => Err(primary_err),

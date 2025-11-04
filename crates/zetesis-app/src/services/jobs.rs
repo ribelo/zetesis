@@ -57,16 +57,11 @@ pub struct EmbeddingJob {
     pub stale: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EmbeddingProviderKind {
+    #[default]
     GeminiBatch,
     Synchronous,
-}
-
-impl Default for EmbeddingProviderKind {
-    fn default() -> Self {
-        EmbeddingProviderKind::GeminiBatch
-    }
 }
 
 impl EmbeddingJob {
@@ -218,9 +213,9 @@ impl EmbeddingJobStore {
     ) -> Result<Vec<EmbeddingJob>, EmbeddingJobStoreError> {
         debug_assert!(limit > 0);
         let rtxn = self.env.read_txn()?;
-        let mut iter = self.jobs.iter(&rtxn)?;
+        let iter = self.jobs.iter(&rtxn)?;
         let mut out = Vec::new();
-        while let Some(entry) = iter.next() {
+        for entry in iter {
             let (_, raw) = entry?;
             let (job, _) = decode_from_slice::<EmbeddingJob, _>(raw, config::standard())?;
             if job.status == status {
@@ -269,9 +264,9 @@ impl EmbeddingJobStore {
         status: EmbeddingJobStatus,
     ) -> Result<usize, EmbeddingJobStoreError> {
         let rtxn = self.env.read_txn()?;
-        let mut iter = self.jobs.iter(&rtxn)?;
+        let iter = self.jobs.iter(&rtxn)?;
         let mut count = 0_usize;
-        while let Some(entry) = iter.next() {
+        for entry in iter {
             let (_, raw) = entry?;
             let (job, _) = decode_from_slice::<EmbeddingJob, _>(raw, config::standard())?;
             if job.status == status {

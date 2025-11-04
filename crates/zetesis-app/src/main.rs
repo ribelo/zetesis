@@ -14,10 +14,8 @@ use std::{
 
 use ai_ox::content::part::Part as AttachmentPart;
 use backon::ExponentialBuilder;
-use blake3;
 use chrono::Utc;
 use futures_util::stream::{Stream, StreamExt};
-use gemini_ox::GeminiRequestError;
 use heed::EnvOpenOptions;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use inquire::{InquireError, Text};
@@ -65,6 +63,65 @@ const LMDB_MAP_SIZE_BYTES: usize = 1 << 30; // match index::milli default
 const DOCUMENT_PROMPT: &str =
     "Przeanalizuj załączony dokument i zwróć odpowiedź w oczekiwanym formacie JSON.";
 const MAX_INLINE_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+/// Default maximum number of files to process in a single ingest when the
+/// environment variable `ZETESIS_MAX_INGEST_FILES` is not set or malformed.
+const DEFAULT_MAX_INGEST_FILES: usize = 10_000;
+
+fn ingest_max_files_from_env() -> usize {
+    // Prefer an explicit env var if set (backwards compatibility), otherwise
+    // consult the app config (which can be populated from env/file through
+    // `config::load`). Fall back to the default if everything else fails.
+    if let Ok(s) = std::env::var("ZETESIS_MAX_INGEST_FILES")
+        && let Ok(v) = s.parse::<usize>()
+        && v > 0
+    {
+        return v;
+    }
+
+    // Try to load from the application config; fall back to default on error.
+    match config::load() {
+        Ok(cfg) => cfg.ingest.max_files,
+        Err(_) => DEFAULT_MAX_INGEST_FILES,
+    }
+}
+
+impl From<milli::Error> for AppError {
+    fn from(e: milli::Error) -> Self {
+        AppError::Milli(Box::new(e))
+    }
+}
+
+impl From<heed::Error> for AppError {
+    fn from(e: heed::Error) -> Self {
+        AppError::Heed(Box::new(e))
+    }
+}
+
+impl From<EmbeddingJobStoreError> for AppError {
+    fn from(e: EmbeddingJobStoreError) -> Self {
+        AppError::Jobs(Box::new(e))
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_ingest_limit(limit: Option<usize>) -> Result<(), AppError> {
+    validate_ingest_limit_with_max(limit, ingest_max_files_from_env())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_ingest_limit_with_max(limit: Option<usize>, max: usize) -> Result<(), AppError> {
+    if let Some(limit) = limit {
+        if limit == 0 {
+            return Err(PipelineError::message("limit must be > 0").into());
+        }
+        if limit > max {
+            return Err(
+                PipelineError::message(format!("limit cannot exceed {} files", max)).into(),
+            );
+        }
+    }
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() {
@@ -109,13 +166,13 @@ enum AppError {
     #[error(transparent)]
     Paths(#[from] PathError),
     #[error(transparent)]
-    Milli(#[from] milli::Error),
+    Milli(#[from] Box<milli::Error>),
     #[error(transparent)]
-    Heed(#[from] heed::Error),
+    Heed(#[from] Box<heed::Error>),
     #[error(transparent)]
     MilliBootstrap(#[from] MilliBootstrapError),
     #[error(transparent)]
-    Jobs(#[from] EmbeddingJobStoreError),
+    Jobs(#[from] Box<EmbeddingJobStoreError>),
     #[error("failed to read input file {path}: {source}")]
     Io {
         path: PathBuf,
@@ -125,6 +182,7 @@ enum AppError {
     #[error("failed to resolve current working directory: {0}")]
     WorkingDir(#[source] std::io::Error),
     #[error("failed to derive document id from {path}")]
+    #[allow(dead_code)]
     InvalidDocId { path: PathBuf },
     #[error("invalid index name `{name}` (empty or contains path separators)")]
     InvalidIndexName { name: String },
@@ -298,6 +356,38 @@ async fn run_ingest(args: IngestArgs) -> Result<(), AppError> {
     let ctx = build_pipeline_context(&args.embed_model)?;
     let extractor = StructuredExtractor::from_env(&args.extractor_model)?;
 
+    // Validate CLI arguments early and fail fast with clear error messages.
+    validate_ingest_limit(args.limit)?;
+
+    // Enforce configured maximum even when the user did not pass `--limit`.
+    let config_max = ingest_max_files_from_env();
+    let effective_limit = args.limit.or(Some(config_max));
+    if args.limit.is_none() {
+        tracing::info!(
+            event = "ingest_limit_enforced",
+            max = config_max,
+            "no --limit provided; enforcing configured max_files"
+        );
+    }
+
+    // Sanity assertions for developer/debug builds; these are side-effect-free.
+    debug_assert!(!args.embed_model.is_empty(), "embed model must be present");
+    debug_assert!(
+        !args.extractor_model.is_empty(),
+        "extractor model must be present"
+    );
+
+    tracing::info!(
+        event = "ingest_start",
+        index = %args.index,
+        path = %args.path.display(),
+        limit = ?args.limit,
+        batch = args.batch,
+        embed_model = %args.embed_model,
+        extractor_model = %args.extractor_model,
+        "starting ingest"
+    );
+
     let silo = Silo::from_str(&args.index).map_err(|_| AppError::InvalidIndexName {
         name: args.index.clone(),
     })?;
@@ -318,8 +408,9 @@ async fn run_ingest(args: IngestArgs) -> Result<(), AppError> {
         ensure_index(&ctx.paths, slug, &ctx.embed.embedder_key, ctx.embed.dim)?;
     }
 
-    let targets = collect_ingest_targets(&args.path, args.limit)?;
+    let targets = collect_ingest_targets(&args.path, effective_limit)?;
     if targets.is_empty() {
+        tracing::info!(event = "ingest_nothing", path = %args.path.display(), "no supported documents found");
         println!("no supported documents found at {}", args.path.display());
         return Ok(());
     }
@@ -327,16 +418,32 @@ async fn run_ingest(args: IngestArgs) -> Result<(), AppError> {
     let mut stats = IngestStats::default();
 
     for path in targets {
+        tracing::info!(event = "ingest_document_start", path = %path.display());
         stats.total = stats.total.saturating_add(1);
         match ingest_document(&ctx, &extractor, silo, &path, &args).await {
             Ok(outcome) => match outcome.status {
                 EmbeddingJobStatus::Ingested => {
                     stats.ingested = stats.ingested.saturating_add(1);
+                    tracing::info!(
+                        event = "ingest_document_complete",
+                        path = %path.display(),
+                        job_id = %outcome.job_id,
+                        status = ?outcome.status,
+                        "document ingested"
+                    );
                     println!("ingested {} (job_id: {})", path.display(), outcome.job_id);
                 }
                 EmbeddingJobStatus::Embedding => {
                     stats.submitted = stats.submitted.saturating_add(1);
                     if let Some(provider_job_id) = outcome.provider_job_id {
+                        tracing::info!(
+                            event = "ingest_document_submitted",
+                            path = %path.display(),
+                            job_id = %outcome.job_id,
+                            provider_job_id = %provider_job_id,
+                            status = ?outcome.status,
+                            "document submitted to provider"
+                        );
                         println!(
                             "submitted {} (job_id: {}, provider_job_id: {})",
                             path.display(),
@@ -344,20 +451,50 @@ async fn run_ingest(args: IngestArgs) -> Result<(), AppError> {
                             provider_job_id
                         );
                     } else {
+                        tracing::info!(
+                            event = "ingest_document_submitted",
+                            path = %path.display(),
+                            job_id = %outcome.job_id,
+                            status = ?outcome.status,
+                            "document submitted (no provider id)"
+                        );
                         println!("submitted {} (job_id: {})", path.display(), outcome.job_id);
                     }
                 }
                 _ => {
+                    tracing::info!(
+                        event = "ingest_document_processed",
+                        path = %path.display(),
+                        job_id = %outcome.job_id,
+                        status = ?outcome.status,
+                        "document processed"
+                    );
                     println!("processed {} (job_id: {})", path.display(), outcome.job_id);
                 }
             },
             Err(err) => {
                 let msg = err.to_string();
                 stats.failed.push((path.clone(), msg.clone()));
-                tracing::warn!(document = %path.display(), error = %msg, "ingest failed");
+                tracing::warn!(event = "ingest_document_failed", document = %path.display(), error = %msg, "ingest failed");
             }
         }
     }
+
+    tracing::info!(
+        event = "ingest_complete",
+        total = stats.total,
+        ingested = stats.ingested,
+        submitted = stats.submitted,
+        failed = stats.failed.len(),
+        "ingest complete"
+    );
+
+    // Debug assertions to help catch logic regressions in development builds.
+    debug_assert!(stats.total >= stats.ingested, "total should be >= ingested");
+    debug_assert!(
+        stats.total >= stats.submitted,
+        "total should be >= submitted"
+    );
 
     println!(
         "processed {} document(s): {} ingested, {} awaiting provider results, {} failed",
@@ -375,6 +512,29 @@ async fn run_ingest(args: IngestArgs) -> Result<(), AppError> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod ingest_tests {
+    use super::*;
+
+    #[test]
+    fn validate_limit_zero_rejected() {
+        let res = validate_ingest_limit_with_max(Some(0), 100);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn validate_limit_exceeds_env_rejected() {
+        let res = validate_ingest_limit_with_max(Some(6), 5);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn validate_limit_within_env_ok() {
+        let res = validate_ingest_limit_with_max(Some(3), 5);
+        assert!(res.is_ok());
+    }
 }
 
 async fn ingest_document(
@@ -395,6 +555,10 @@ async fn ingest_document(
     if bytes.is_empty() {
         return Err(PipelineError::message("document is empty").into());
     }
+    debug_assert!(
+        !bytes.is_empty(),
+        "read should produce bytes for non-empty file"
+    );
     if bytes.len() > MAX_INLINE_ATTACHMENT_BYTES {
         let limit_mib = (MAX_INLINE_ATTACHMENT_BYTES / (1024 * 1024)).max(1);
         let message = format!(
@@ -407,6 +571,9 @@ async fn ingest_document(
     }
 
     let doc_id = doc_id_from_bytes(&bytes);
+    // Emit telemetry that ties the parsed document to the generated doc_id and
+    // number of content chunks produced. This helps downstream observability and
+    // deduplication tracing.
     let display_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -449,6 +616,17 @@ async fn ingest_document(
     }
 
     let chunk_count = extraction.decision.chunks.len();
+    debug_assert!(
+        chunk_count > 0,
+        "extraction must produce at least one chunk"
+    );
+    tracing::info!(
+        event = "document_parsed",
+        doc_id = %doc_id,
+        path = %path.display(),
+        chunk_count = chunk_count,
+        "document parsed and structured"
+    );
     if chunk_count == 0 {
         return Err(PipelineError::message("structured decision produced zero chunks").into());
     }
@@ -533,10 +711,10 @@ fn collect_ingest_targets(path: &Path, limit: Option<usize>) -> Result<Vec<PathB
 
         entries.sort_by_key(|(_, modified)| Reverse(*modified));
         let mut files: Vec<PathBuf> = entries.into_iter().map(|(path, _)| path).collect();
-        if let Some(limit) = limit {
-            if limit < files.len() {
-                files.truncate(limit);
-            }
+        if let Some(limit) = limit
+            && limit < files.len()
+        {
+            files.truncate(limit);
         }
         return Ok(files);
     }
@@ -661,11 +839,11 @@ impl ProgressTracker {
         if self.pb_len_set {
             return;
         }
-        if let Some(pb) = self.progress.as_ref() {
-            if let Some(length) = effective_length(self.target_limit, hint) {
-                pb.set_length(length.max(1));
-                self.pb_len_set = true;
-            }
+        if let Some(pb) = self.progress.as_ref()
+            && let Some(length) = effective_length(self.target_limit, hint)
+        {
+            pb.set_length(length.max(1));
+            self.pb_len_set = true;
         }
     }
 
@@ -853,7 +1031,7 @@ fn render_sentences_json(
             payload.insert("end".to_string(), json!(range.end));
         }
 
-        println!("{}", serde_json::Value::Object(payload).to_string());
+        println!("{}", serde_json::Value::Object(payload));
     }
     Ok(())
 }
@@ -1238,42 +1416,46 @@ async fn embed_single_job(
     }
     record.chunk_count = chunk_refs.len() as u32;
 
-    if enable_batch {
-        if let Some(provider) = ctx.embed.provider() {
-            match provider
-                .submit_job(
-                    &record.doc_id,
-                    &chunk_texts,
-                    EmbedBatchTask::Document,
-                    record.mode,
-                )
-                .await
-            {
-                Ok(submission) => {
-                    record.provider_kind = EmbeddingProviderKind::GeminiBatch;
-                    record.provider_job_id = Some(submission.provider_job_id);
-                    record.submitted_batch_count = submission.batch_count;
-                    record.submitted_at_ms = Some(current_timestamp_ms());
-                    ctx.jobs.upsert(&record)?;
-                    return Ok(());
-                }
-                Err(PipelineError::Gemini(
-                    gemini_err @ GeminiRequestError::BatchNotAvailable { .. },
-                )) => {
-                    tracing::warn!(
-                        job_id = record.job_id.as_str(),
-                        error = %gemini_err,
-                        "batch endpoint unavailable; falling back to synchronous embedding"
-                    );
-                }
-                Err(err) => {
+    if enable_batch && let Some(provider) = ctx.embed.provider() {
+        match provider
+            .submit_job(
+                &record.doc_id,
+                &chunk_texts,
+                EmbedBatchTask::Document,
+                record.mode,
+            )
+            .await
+        {
+            Ok(submission) => {
+                record.provider_kind = EmbeddingProviderKind::GeminiBatch;
+                record.provider_job_id = Some(submission.provider_job_id);
+                record.submitted_batch_count = submission.batch_count;
+                record.submitted_at_ms = Some(current_timestamp_ms());
+                ctx.jobs.upsert(&record)?;
+                return Ok(());
+            }
+            Err(err) => {
+                // Special-case Gemini batch endpoint unavailability: fall back to
+                // synchronous embedding instead of failing the job.
+                if let PipelineError::Gemini(e_box) = &err {
+                    if let gemini_ox::GeminiRequestError::BatchNotAvailable { .. } = **e_box {
+                        tracing::warn!(
+                            job_id = record.job_id.as_str(),
+                            error = %e_box,
+                            "batch endpoint unavailable; falling back to synchronous embedding"
+                        );
+                        // continue to synchronous path
+                    } else {
+                        fail_job(ctx, &mut record, err.to_string());
+                        return Err(err);
+                    }
+                } else {
                     fail_job(ctx, &mut record, err.to_string());
                     return Err(err);
                 }
             }
         }
     }
-
     // Fallback: run synchronous embedding and ingest immediately.
     let vectors = ctx
         .embed
@@ -1559,10 +1741,9 @@ async fn search_keyword(args: KeywordSearchArgs) -> Result<(), AppError> {
         .filter
         .as_deref()
         .filter(|value| !value.trim().is_empty())
+        && let Some(filter) = Filter::from_str(expr)?
     {
-        if let Some(filter) = Filter::from_str(expr)? {
-            search.filter(filter);
-        }
+        search.filter(filter);
     }
 
     let mut sort_rules = Vec::new();
@@ -1657,10 +1838,9 @@ async fn search_vector(args: VectorSearchArgs) -> Result<(), AppError> {
         .filter
         .as_deref()
         .filter(|value| !value.trim().is_empty())
+        && let Some(filter) = Filter::from_str(expr)?
     {
-        if let Some(filter) = Filter::from_str(expr)? {
-            search.filter(filter);
-        }
+        search.filter(filter);
     }
     search.semantic(config.name.clone(), embedder, quantized, Some(vector), None);
 
@@ -1816,10 +1996,9 @@ fn db_find(args: DbFindArgs) -> Result<(), AppError> {
         .filter
         .as_deref()
         .filter(|value| !value.trim().is_empty())
+        && let Some(filter) = Filter::from_str(expr)?
     {
-        if let Some(filter) = Filter::from_str(expr)? {
-            search.filter(filter);
-        }
+        search.filter(filter);
     }
 
     let result = search.execute()?;
@@ -2091,7 +2270,7 @@ fn project_value(source: &Value, fields: &[String]) -> Value {
     Value::Object(projected)
 }
 
-fn extract_path<'a>(value: &'a Value, path: &str) -> Option<Value> {
+fn extract_path(value: &Value, path: &str) -> Option<Value> {
     let mut current = value;
     for segment in path.split('.') {
         let key = segment.trim();
@@ -2288,10 +2467,10 @@ fn collect_pdfs(dir: &Path) -> Result<Vec<PathBuf>, AppError> {
             source,
         })?;
         let path = entry.path();
-        if let Some(ext) = path.extension() {
-            if ext == "pdf" {
-                out.push(path);
-            }
+        if let Some(ext) = path.extension()
+            && ext == "pdf"
+        {
+            out.push(path);
         }
     }
     out.sort();

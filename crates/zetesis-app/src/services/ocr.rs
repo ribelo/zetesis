@@ -60,6 +60,12 @@ fn deepinfra_rate_limiter() -> &'static Arc<OcrRateLimiter> {
     })
 }
 
+impl From<GenerateContentError> for OcrError {
+    fn from(e: GenerateContentError) -> Self {
+        OcrError::Gemini(Box::new(e))
+    }
+}
+
 fn gemini_rate_limiter() -> &'static Arc<OcrRateLimiter> {
     static LIMITER: OnceLock<Arc<OcrRateLimiter>> = OnceLock::new();
     LIMITER.get_or_init(|| {
@@ -272,7 +278,7 @@ pub enum OcrError {
     #[error(transparent)]
     DeepInfra(#[from] deepinfra_ox::DeepInfraRequestError),
     #[error(transparent)]
-    Gemini(#[from] GenerateContentError),
+    Gemini(#[from] Box<GenerateContentError>),
     #[error("failed to read input file {path}: {source}")]
     Io {
         path: PathBuf,
@@ -430,7 +436,7 @@ impl DeepInfraProvider {
         model: &str,
     ) -> Result<deepinfra_ox::ChatCompletionResponse, OcrError> {
         let attempt = || async { self.invoke_model(prepared, prompt, max_tokens, model).await };
-        attempt.retry(self.backoff.clone()).await
+        attempt.retry(self.backoff).await
     }
 
     async fn invoke_model(
@@ -536,8 +542,8 @@ impl PageProvider for DeepInfraProvider {
             let truncated = usage
                 .as_ref()
                 .and_then(|u| u.completion_tokens)
-                .map_or(false, |tokens| tokens >= u64::from(max_tokens));
-            let looks_noise = plain_text.as_deref().map_or(false, text_is_numeric_noise);
+                .is_some_and(|tokens| tokens >= u64::from(max_tokens));
+            let looks_noise = plain_text.as_deref().is_some_and(text_is_numeric_noise);
 
             if attempt == 0 && (truncated || looks_noise) {
                 warn!(
@@ -548,7 +554,7 @@ impl PageProvider for DeepInfraProvider {
                     "retrying OCR page with fallback prompt",
                 );
                 prompt = fallback_prompt.clone();
-                max_tokens = max_tokens.min(2048).max(512);
+                max_tokens = max_tokens.clamp(512, 2048);
                 continue;
             }
 
@@ -656,7 +662,7 @@ impl GeminiProvider {
             self.invoke_model(model, encoded_image, mime_type, prompt)
                 .await
         };
-        attempt.retry(self.backoff.clone()).await
+        attempt.retry(self.backoff).await
     }
 
     async fn invoke_model(
@@ -666,9 +672,10 @@ impl GeminiProvider {
         mime_type: &'static str,
         prompt: &str,
     ) -> Result<ModelResponse, OcrError> {
-        let mut parts = Vec::with_capacity(2);
-        parts.push(Part::blob_base64(encoded_image.to_string(), mime_type));
-        parts.push(Part::text(prompt.to_string()));
+        let parts = vec![
+            Part::blob_base64(encoded_image.to_string(), mime_type),
+            Part::text(prompt.to_string()),
+        ];
 
         let user_message = Message::new(MessageRole::User, parts);
         let system_message = Message::new(
@@ -750,10 +757,10 @@ impl PageProvider for GeminiProvider {
                     Some(trimmed.to_string())
                 }
             });
-            let looks_noise = plain_text.as_deref().map_or(false, text_is_numeric_noise);
+            let looks_noise = plain_text.as_deref().is_some_and(text_is_numeric_noise);
             let truncated = usage
                 .completion_tokens
-                .map_or(false, |tokens| tokens >= u64::from(budget));
+                .is_some_and(|tokens| tokens >= u64::from(budget));
             let missing_text = plain_text.is_none();
 
             if idx == 0 && (truncated || looks_noise || missing_text) {
@@ -829,7 +836,7 @@ impl OcrService for GeminiOcr {
 }
 
 fn fallback_token_target(max_tokens: u32) -> u32 {
-    max_tokens.min(2048).max(512)
+    max_tokens.clamp(512, 2048)
 }
 
 fn build_generation_config(max_tokens: u32) -> GenerationConfig {

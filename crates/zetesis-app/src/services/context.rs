@@ -145,18 +145,10 @@ impl Default for EmbedRuntimeOptions {
     }
 }
 
+#[derive(Default)]
 pub struct Governors {
     pub io: Option<Arc<GenericRateLimiter>>,
     pub embed: Option<Arc<GenericRateLimiter>>,
-}
-
-impl Default for Governors {
-    fn default() -> Self {
-        Self {
-            io: None,
-            embed: None,
-        }
-    }
 }
 
 pub struct PipelineContext {
@@ -194,7 +186,7 @@ pub enum PipelineError {
     #[error("missing GOOGLE_AI_API_KEY or GEMINI_API_KEY environment variable")]
     MissingGeminiApiKey,
     #[error(transparent)]
-    Gemini(#[from] GeminiRequestError),
+    Gemini(#[from] Box<GeminiRequestError>),
     #[error(transparent)]
     IndexWrite(#[from] IndexWriteError),
     #[error(transparent)]
@@ -206,6 +198,12 @@ pub enum PipelineError {
 impl PipelineError {
     pub fn message(msg: impl Into<String>) -> Self {
         PipelineError::Message(msg.into())
+    }
+}
+
+impl From<GeminiRequestError> for PipelineError {
+    fn from(e: GeminiRequestError) -> Self {
+        PipelineError::Gemini(Box::new(e))
     }
 }
 

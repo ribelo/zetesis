@@ -34,7 +34,7 @@ impl IndexWriter {
         &self,
         records: &[JsonMap<String, JsonValue>],
     ) -> Result<DocumentAdditionResult, IndexWriteError> {
-        debug_assert!(records.len() <= usize::MAX);
+        // sanity: records is non-empty (checked above) and length is a usize; no-op assert removed
 
         if records.is_empty() {
             let rtxn = self.index.read_txn()?;
@@ -85,7 +85,7 @@ impl IndexWriter {
 #[derive(Debug, Error)]
 pub enum IndexWriteError {
     #[error(transparent)]
-    Milli(#[from] milli::Error),
+    Milli(#[from] Box<milli::Error>),
     #[error(transparent)]
     Heed(#[from] heed::Error),
     #[error(transparent)]
@@ -93,5 +93,17 @@ pub enum IndexWriteError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
-    User(#[from] milli::UserError),
+    User(#[from] Box<milli::UserError>),
+}
+
+impl From<milli::Error> for IndexWriteError {
+    fn from(e: milli::Error) -> Self {
+        IndexWriteError::Milli(Box::new(e))
+    }
+}
+
+impl From<milli::UserError> for IndexWriteError {
+    fn from(e: milli::UserError) -> Self {
+        IndexWriteError::User(Box::new(e))
+    }
 }

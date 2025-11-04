@@ -75,8 +75,11 @@ impl StructuredDecision {
         }
 
         if let Some(procurement) = self.procurement.as_option() {
-            if let Err(errs) = procurement.validate() {
-                issues.extend(errs.into_iter().map(|msg| format!("procurement.{msg}")));
+            match procurement.validate() {
+                Ok(()) => {}
+                Err(errs) => {
+                    issues.extend(errs.into_iter().map(|msg| format!("procurement.{msg}")));
+                }
             }
         }
 
@@ -114,10 +117,10 @@ impl StructuredDecision {
                         "chunks[{idx}].position must equal {expected_position}"
                     ));
                 }
-                if let Some(section) = chunk.section.as_ref() {
-                    if section.trim().is_empty() {
-                        issues.push(format!("chunks[{idx}].section must not be empty"));
-                    }
+                if let Some(section) = chunk.section.as_ref()
+                    && section.trim().is_empty()
+                {
+                    issues.push(format!("chunks[{idx}].section must not be empty"));
                 }
                 if chunk.body.trim().is_empty() {
                     issues.push(format!("chunks[{idx}].body must not be empty"));

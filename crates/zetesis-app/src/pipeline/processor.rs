@@ -121,6 +121,12 @@ impl KioProcessor {
     }
 }
 
+impl Default for KioProcessor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SiloDocumentProcessor for KioProcessor {
     fn name(&self) -> &'static str {
         "kio"
@@ -149,14 +155,16 @@ impl SiloDocumentProcessor for KioProcessor {
 
 impl ToIndexRecord for Chunk {
     fn to_index_record(&self, silo_slug: &str, doc_id: &str, _embedder_key: &str) -> IndexRecord {
-        let mut record = IndexRecord::default();
-        record.silo = silo_slug.to_owned();
-        record.doc_id = doc_id.to_owned();
-        record.section = self.section.clone();
-        record.ord = self.ord;
-        record.content = self.content.clone();
-        record.attributes = self.meta.clone();
-        record
+        IndexRecord {
+            id: String::new(),
+            silo: silo_slug.to_owned(),
+            doc_id: doc_id.to_owned(),
+            section: self.section.clone(),
+            ord: self.ord,
+            content: self.content.clone(),
+            attributes: self.meta.clone(),
+            vector: None,
+        }
     }
 }
 

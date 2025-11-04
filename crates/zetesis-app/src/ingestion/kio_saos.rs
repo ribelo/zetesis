@@ -400,7 +400,7 @@ impl KioSaosScraper {
         };
 
         let response = attempt
-            .retry(self.backoff.clone())
+            .retry(self.backoff)
             .sleep(sleep)
             .notify(|err: &KioScrapeError, delay: Duration| {
                 warn!(
@@ -468,7 +468,7 @@ impl KioSaosScraper {
         };
 
         let response = attempt
-            .retry(self.backoff.clone())
+            .retry(self.backoff)
             .sleep(sleep)
             .notify(|err: &KioScrapeError, delay: Duration| {
                 warn!(
@@ -531,7 +531,7 @@ impl KioSaosScraper {
         };
 
         attempt
-            .retry(self.backoff.clone())
+            .retry(self.backoff)
             .sleep(sleep)
             .notify(|err: &KioScrapeError, delay: Duration| {
                 warn!(
@@ -593,7 +593,7 @@ impl KioSaosScraper {
         };
 
         attempt
-            .retry(self.backoff.clone())
+            .retry(self.backoff)
             .sleep(sleep)
             .notify(|err: &KioScrapeError, delay: Duration| {
                 warn!(

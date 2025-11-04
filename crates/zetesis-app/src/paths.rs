@@ -144,15 +144,13 @@ impl AppPaths {
 }
 
 fn ensure_dir(path: &Path) -> Result<PathBuf, PathError> {
-    if let Err(err) = fs::create_dir_all(path) {
-        if err.kind() != io::ErrorKind::AlreadyExists {
-            return Err(PathError::CreateDir {
-                path: path.to_path_buf(),
-                source: err,
-            });
-        }
+    match fs::create_dir_all(path) {
+        Err(err) if err.kind() != io::ErrorKind::AlreadyExists => Err(PathError::CreateDir {
+            path: path.to_path_buf(),
+            source: err,
+        }),
+        _ => Ok(path.to_path_buf()),
     }
-    Ok(path.to_path_buf())
 }
 
 fn normalize_slug(s: &str) -> String {

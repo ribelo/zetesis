@@ -170,10 +170,7 @@ impl PolishSentenceSegmenter {
             return ranges;
         }
 
-        let extras = options
-            .extra_abbreviations
-            .as_ref()
-            .map(|entries| build_extra_set(entries));
+        let extras = options.extra_abbreviations.as_ref().map(build_extra_set);
 
         let mut merged = Vec::with_capacity(ranges.len());
         let mut iter = ranges.into_iter().peekable();
@@ -245,15 +242,15 @@ fn should_merge(
         return true;
     }
 
-    if options.stitch_abbreviations {
-        if let (Some(last), Some(head)) = (
+    if options.stitch_abbreviations
+        && let (Some(last), Some(head)) = (
             (!last_token.is_empty()).then_some(last_token),
             head_trimmed.filter(|t| !t.is_empty()),
-        ) {
-            let combined = format!("{last} {head}");
-            if phrase_is_abbreviation(&combined, extra) {
-                return true;
-            }
+        )
+    {
+        let combined = format!("{last} {head}");
+        if phrase_is_abbreviation(&combined, extra) {
+            return true;
         }
     }
 
@@ -263,12 +260,8 @@ fn should_merge(
 
     if options.stitch_abbreviations
         && last_token_raw.ends_with(':')
-        && head_token.map_or(false, |token| {
-            token
-                .chars()
-                .next()
-                .map_or(false, |c| c.is_ascii_lowercase())
-        })
+        && head_token
+            .is_some_and(|token| token.chars().next().is_some_and(|c| c.is_ascii_lowercase()))
     {
         // Headings often use "Rozdz. 8." / "Sekcja:" patterns followed by lowercase continuation.
         return true;
@@ -304,10 +297,10 @@ fn token_is_abbreviation(token: &str, extra: Option<&HashSet<String>>) -> bool {
         return true;
     }
 
-    if let Some(stripped) = trimmed.strip_suffix('.') {
-        if lookup_abbreviation(stripped, extra) {
-            return true;
-        }
+    if let Some(stripped) = trimmed.strip_suffix('.')
+        && lookup_abbreviation(stripped, extra)
+    {
+        return true;
     }
 
     false
@@ -317,7 +310,7 @@ fn lookup_abbreviation(candidate: &str, extra: Option<&HashSet<String>>) -> bool
     let lower = candidate.to_lowercase();
     BASE_ABBREVIATIONS_SET.contains(candidate)
         || BASE_ABBREVIATIONS_SET.contains(&lower)
-        || extra.map_or(false, |set| set.contains(candidate) || set.contains(&lower))
+        || extra.is_some_and(|set| set.contains(candidate) || set.contains(&lower))
 }
 
 fn token_is_ordinal(token: &str) -> bool {
@@ -359,7 +352,7 @@ fn trim_range(text: &str, range: Range<usize>) -> Option<Range<usize>> {
 }
 
 fn first_token<'a>(text: &'a str, range: &Range<usize>) -> Option<&'a str> {
-    text[range.clone()].trim_start().split_whitespace().next()
+    text[range.clone()].split_whitespace().next()
 }
 
 fn is_initial(fragment: &str) -> bool {
@@ -368,7 +361,7 @@ fn is_initial(fragment: &str) -> bool {
         && trimmed
             .chars()
             .next()
-            .map_or(false, |c| c.is_ascii_uppercase())
+            .is_some_and(|c| c.is_ascii_uppercase())
         && trimmed.ends_with('.')
 }
 
@@ -382,7 +375,7 @@ fn tail_tokens<'a>(text: &'a str, range: &Range<usize>, limit: usize) -> Vec<&'a
     }
 
     let mut tokens = Vec::new();
-    for token in text[range.clone()].trim_end().split_whitespace().rev() {
+    for token in text[range.clone()].split_whitespace().rev() {
         tokens.push(token);
         if tokens.len() == limit {
             break;
@@ -399,10 +392,10 @@ fn tokens_match_abbreviation(tokens: &[&str], extra: Option<&HashSet<String>>) -
         .filter(|token| !token.is_empty())
         .collect();
 
-    if let Some(last) = trimmed.last() {
-        if token_is_abbreviation(last, extra) {
-            return true;
-        }
+    if let Some(last) = trimmed.last()
+        && token_is_abbreviation(last, extra)
+    {
+        return true;
     }
 
     for start in 0..trimmed.len() {
@@ -426,10 +419,10 @@ fn phrase_is_abbreviation(candidate: &str, extra: Option<&HashSet<String>>) -> b
         return true;
     }
 
-    if let Some(stripped) = trimmed.strip_suffix('.') {
-        if lookup_abbreviation(stripped, extra) {
-            return true;
-        }
+    if let Some(stripped) = trimmed.strip_suffix('.')
+        && lookup_abbreviation(stripped, extra)
+    {
+        return true;
     }
 
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
@@ -475,23 +468,23 @@ fn split_enumerations(text: &str, range: Range<usize>) -> Vec<Range<usize>> {
             continue;
         }
 
-        if allow_follow_on || preceding_allows_marker(slice, offset) {
-            if let Some(marker_len) = enumeration_marker(slice, offset) {
-                let boundary = range.start + offset;
-                if boundary > current_start {
-                    if let Some(trimmed) = trim_range(text, current_start..boundary) {
-                        result.push(trimmed);
-                    }
-                    current_start = boundary;
+        if let Some(marker_len) = enumeration_marker(slice, offset)
+            && (allow_follow_on || preceding_allows_marker(slice, offset))
+        {
+            let boundary = range.start + offset;
+            if boundary > current_start {
+                if let Some(trimmed) = trim_range(text, current_start..boundary) {
+                    result.push(trimmed);
                 }
-
-                allow_follow_on = true;
-                let target = offset + marker_len;
-                while idx < chars.len() && chars[idx].0 < target {
-                    idx += 1;
-                }
-                continue;
+                current_start = boundary;
             }
+
+            allow_follow_on = true;
+            let target = offset + marker_len;
+            while idx < chars.len() && chars[idx].0 < target {
+                idx += 1;
+            }
+            continue;
         }
 
         idx += 1;
@@ -501,10 +494,10 @@ fn split_enumerations(text: &str, range: Range<usize>) -> Vec<Range<usize>> {
         result.push(trimmed);
     }
 
-    if result.is_empty() {
-        if let Some(trimmed) = trim_range(text, range) {
-            result.push(trimmed);
-        }
+    if let Some(trimmed) = trim_range(text, range)
+        && result.is_empty()
+    {
+        result.push(trimmed);
     }
 
     result
@@ -515,16 +508,13 @@ fn preceding_allows_marker(slice: &str, offset: usize) -> bool {
         return false;
     }
 
-    slice[..offset]
-        .chars()
-        .rev()
-        .find(|ch| !ch.is_whitespace())
-        .map_or(true, |ch| {
-            matches!(
-                ch,
-                ':' | ';' | '(' | ')' | '[' | ']' | '-' | '–' | '—' | '\n'
-            )
-        })
+    match slice[..offset].chars().rev().find(|ch| !ch.is_whitespace()) {
+        None => true,
+        Some(ch) => matches!(
+            ch,
+            ':' | ';' | '(' | ')' | '[' | ']' | '-' | '–' | '—' | '\n'
+        ),
+    }
 }
 
 fn enumeration_marker(slice: &str, offset: usize) -> Option<usize> {
@@ -570,10 +560,7 @@ fn enumeration_marker(slice: &str, offset: usize) -> Option<usize> {
 
         Some(marker_end)
     } else if first_char.is_ascii_uppercase() {
-        if chars
-            .get(1)
-            .map_or(false, |(_, ch)| ch.is_ascii_lowercase())
-        {
+        if chars.get(1).is_some_and(|(_, ch)| ch.is_ascii_lowercase()) {
             return None;
         }
 

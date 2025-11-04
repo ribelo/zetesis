@@ -5,7 +5,7 @@ use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use crate::constants::{DEFAULT_EMBEDDER_KEY, DEFAULT_EXTRACTOR_MODEL};
 
 /// Top-level CLI entry point.
-#[derive(Debug, Parser)]
+#[derive(Default, Debug, Parser)]
 #[command(
     name = "zetesis",
     version,
@@ -18,15 +18,6 @@ pub struct Cli {
     /// Increase logging verbosity (-v, -vv, -vvv).
     #[arg(global = true, short = 'v', long = "verbose", action = ArgAction::Count)]
     pub verbose: u8,
-}
-
-impl Default for Cli {
-    fn default() -> Self {
-        Self {
-            command: None,
-            verbose: 0,
-        }
-    }
 }
 
 impl Cli {

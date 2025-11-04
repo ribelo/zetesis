@@ -21,6 +21,7 @@ pub enum AppConfigError {
 pub struct AppConfig {
     pub server: ServerConfig,
     pub storage: StorageConfig,
+    pub ingest: IngestConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -33,6 +34,12 @@ pub struct StorageConfig {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct IngestConfig {
+    /// Maximum files to process in a single ingest run.
+    pub max_files: usize,
+}
+
 pub fn load() -> Result<AppConfig, AppConfigError> {
     let default_storage = default_storage_path()?;
     let builder = Config::builder()
@@ -41,6 +48,7 @@ pub fn load() -> Result<AppConfig, AppConfigError> {
             "storage.path",
             default_storage.to_string_lossy().to_string(),
         )?
+        .set_default("ingest.max_files", 10000)?
         .add_source(File::with_name(CONFIG_FILE).required(false))
         .add_source(Environment::with_prefix("ZETESIS").separator("__"));
 

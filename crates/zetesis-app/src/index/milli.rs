@@ -9,7 +9,7 @@ use milli::progress::{EmbedderStats, Progress};
 use milli::update::{IndexerConfig, Setting as MilliSetting, Settings};
 use milli::vector::VectorStoreBackend;
 use milli::vector::settings::{EmbedderSource, EmbeddingSettings};
-use milli::{FilterableAttributesRule, Index, Result as MilliResult};
+use milli::{FilterableAttributesRule, Index};
 use thiserror::Error;
 
 use crate::paths::{AppPaths, PathError};
@@ -79,9 +79,15 @@ pub enum MilliBootstrapError {
     #[error(transparent)]
     Path(#[from] PathError),
     #[error("milli error: {0}")]
-    Milli(#[from] milli::Error),
+    Milli(#[from] Box<milli::Error>),
     #[error("heed error: {0}")]
     Heed(#[from] heed::Error),
+}
+
+impl From<milli::Error> for MilliBootstrapError {
+    fn from(e: milli::Error) -> Self {
+        MilliBootstrapError::Milli(Box::new(e))
+    }
 }
 
 /// Ensure the Milli index for a given silo exists and is configured with the expected
@@ -186,10 +192,12 @@ fn configure_index(
     }
 
     if !has_expected_embedder {
-        let mut embedder_settings = EmbeddingSettings::default();
-        embedder_settings.source = MilliSetting::Set(EmbedderSource::UserProvided);
-        embedder_settings.dimensions = MilliSetting::Set(embed_dim);
-        embedder_settings.binary_quantized = MilliSetting::Set(false);
+        let embedder_settings = EmbeddingSettings {
+            source: MilliSetting::Set(EmbedderSource::UserProvided),
+            dimensions: MilliSetting::Set(embed_dim),
+            binary_quantized: MilliSetting::Set(false),
+            ..Default::default()
+        };
 
         let mut map = BTreeMap::new();
         map.insert(

@@ -75,7 +75,7 @@ pub async fn index_structured_decision(
     decision: StructuredDecision,
 ) -> PipelineResult<()> {
     debug_assert!(!doc_id.is_empty());
-    debug_assert!(decision.chunks.len() > 0);
+    debug_assert!(!decision.chunks.is_empty());
 
     let pending = build_document_payload(
         &decision,
@@ -122,26 +122,26 @@ pub async fn index_structured_decision(
     };
 
     let chunk_count = chunk_records.len();
-    if chunk_count > 0 {
-        if let Err(err) = actor.upsert(chunk_records).await {
-            let message = format!("chunk upsert failed: {err}");
-            warn!(
-                doc_id,
-                silo = silo.slug(),
-                error = %message,
-                "structured chunk write failed"
-            );
-            mark_ingest_error(
-                actor,
-                &decision,
-                silo,
-                doc_id,
-                &ctx.embed.embedder_key,
-                &message,
-            )
-            .await;
-            return Err(err);
-        }
+    if chunk_count > 0
+        && let Err(err) = actor.upsert(chunk_records).await
+    {
+        let message = format!("chunk upsert failed: {err}");
+        warn!(
+            doc_id,
+            silo = silo.slug(),
+            error = %message,
+            "structured chunk write failed"
+        );
+        mark_ingest_error(
+            actor,
+            &decision,
+            silo,
+            doc_id,
+            &ctx.embed.embedder_key,
+            &message,
+        )
+        .await;
+        return Err(err);
     }
 
     let indexed_doc = build_doc_record(
@@ -190,7 +190,7 @@ pub async fn index_structured_with_embeddings(
     embeddings: Vec<Vec<f32>>,
 ) -> PipelineResult<()> {
     debug_assert!(!doc_id.is_empty());
-    debug_assert!(decision.chunks.len() > 0);
+    debug_assert!(!decision.chunks.is_empty());
 
     let pending = build_document_payload(
         &decision,
@@ -237,26 +237,26 @@ pub async fn index_structured_with_embeddings(
     };
 
     let chunk_count = chunk_records.len();
-    if chunk_count > 0 {
-        if let Err(err) = actor.upsert(chunk_records).await {
-            let message = format!("chunk upsert failed: {err}");
-            warn!(
-                doc_id,
-                silo = silo.slug(),
-                error = %message,
-                "structured chunk write failed"
-            );
-            mark_ingest_error(
-                actor,
-                &decision,
-                silo,
-                doc_id,
-                &ctx.embed.embedder_key,
-                &message,
-            )
-            .await;
-            return Err(err);
-        }
+    if chunk_count > 0
+        && let Err(err) = actor.upsert(chunk_records).await
+    {
+        let message = format!("chunk upsert failed: {err}");
+        warn!(
+            doc_id,
+            silo = silo.slug(),
+            error = %message,
+            "structured chunk write failed"
+        );
+        mark_ingest_error(
+            actor,
+            &decision,
+            silo,
+            doc_id,
+            &ctx.embed.embedder_key,
+            &message,
+        )
+        .await;
+        return Err(err);
     }
 
     let indexed_doc = build_doc_record(
@@ -369,7 +369,7 @@ fn attach_vector(
     vector: &[f32],
 ) -> Result<(), PipelineError> {
     debug_assert!(!embedder_key.is_empty());
-    debug_assert!(vector.len() > 0);
+    debug_assert!(!vector.is_empty());
 
     if vector.iter().any(|value| !value.is_finite()) {
         return Err(PipelineError::message(

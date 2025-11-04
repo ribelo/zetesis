@@ -99,7 +99,7 @@ pub fn build_doc_record(
     embedder_key: &str,
     ingest: IngestMetadata<'_>,
 ) -> Result<JsonMap<String, JsonValue>, serde_json::Error> {
-    debug_assert!(decision.summary_short.len() > 0);
+    debug_assert!(!decision.summary_short.is_empty());
     debug_assert!(decision.panel.len() <= 16);
 
     let panel_names: Vec<String> = decision
@@ -232,7 +232,7 @@ fn make_chunk_records(
     doc_id: &str,
 ) -> Vec<PreparedChunkRecord> {
     debug_assert!(!decision.decision.date.is_empty());
-    debug_assert!(decision.chunks.len() > 0);
+    debug_assert!(!decision.chunks.is_empty());
 
     let base_identifier = json!({
         "kio_docket": &decision.identifiers.kio_docket,

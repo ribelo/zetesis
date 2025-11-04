@@ -343,7 +343,7 @@ impl KioUzpScraper {
         };
 
         attempt
-            .retry(self.backoff.clone())
+            .retry(self.backoff)
             .sleep(sleep)
             .notify(|err: &KioScrapeError, delay: Duration| {
                 warn!(
@@ -404,7 +404,7 @@ impl KioUzpScraper {
         };
 
         attempt
-            .retry(self.backoff.clone())
+            .retry(self.backoff)
             .sleep(sleep)
             .notify(|err: &KioScrapeError, delay: Duration| {
                 warn!(
@@ -464,7 +464,7 @@ impl KioUzpScraper {
         };
 
         attempt
-            .retry(self.backoff.clone())
+            .retry(self.backoff)
             .sleep(sleep)
             .notify(|err: &KioScrapeError, delay: Duration| {
                 warn!(
@@ -526,7 +526,7 @@ impl KioUzpScraper {
         };
 
         attempt
-            .retry(self.backoff.clone())
+            .retry(self.backoff)
             .sleep(sleep)
             .notify(|err: &KioScrapeError, delay: Duration| {
                 warn!(
