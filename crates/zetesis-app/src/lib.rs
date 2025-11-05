@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod config;
 pub mod constants;
+pub mod error;
 pub mod index;
 pub mod ingestion;
 pub mod paths;
