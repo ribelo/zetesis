@@ -3,7 +3,6 @@ use std::{
     collections::BTreeMap,
     env, fs,
     num::NonZeroUsize,
-    ops::Range,
     path::Path,
     path::PathBuf,
     process,
@@ -25,18 +24,19 @@ use milli::vector::VectorStoreBackend;
 use milli::vector::db::IndexEmbeddingConfig;
 use milli::vector::embedder::{Embedder, EmbedderOptions, manual};
 use milli::{AscDesc, Filter, Search as MilliSearch, all_obkv_to_json};
-use serde_json::{Value, json};
+use serde_json::Value;
 use thiserror::Error;
 use tracing_subscriber::{filter::LevelFilter, fmt};
 use uuid::Uuid;
 use zetesis_app::cli::{
     AuditArgs, AuditCommands, Cli, Commands, DEFAULT_KIO_SAOS_URL, DEFAULT_KIO_UZP_URL, DbArgs,
     DbBackupArgs, DbCommands, DbFindArgs, DbGetArgs, DbPurgeArgs, DbRecoverArgs, DbStatsArgs,
-    ExtractStructuredArgs, FetchKioArgs, IndexArgs, IndexCommands, IngestArgs, JobsArgs,
-    JobsCommands, JobsEmbedArgs, JobsIngestArgs, KeywordSearchArgs, KioSource, OcrPdfArgs,
-    OcrProviderKind, SearchArgs, SearchCommands, SegmentOutputFormat, SegmentPdfArgs,
-    StructuredAuditArgs, StructuredIndexArgs, VectorSearchArgs,
+    FetchKioArgs, IngestArgs, JobsArgs, JobsCommands, JobsEmbedArgs, JobsIngestArgs,
+    KeywordSearchArgs, KioSource, SearchArgs, SearchCommands, StructuredAuditArgs,
+    VectorSearchArgs,
 };
+#[cfg(feature = "cli-debug")]
+use zetesis_app::cli::{DebugArgs, DebugCommands};
 use zetesis_app::constants::{DEFAULT_EMBEDDER_KEY, DEFAULT_EMBEDDING_DIM};
 use zetesis_app::index::milli::{MilliBootstrapError, ensure_index, open_existing_index};
 use zetesis_app::ingestion::{
@@ -44,14 +44,13 @@ use zetesis_app::ingestion::{
 };
 use zetesis_app::pdf::{PdfRenderError, PdfTextError, extract_text_from_pdf};
 use zetesis_app::services::{
-    DeepInfraOcr, EmbedBatchTask, EmbedRuntimeOptions, EmbedService, EmbeddingJob,
-    EmbeddingJobStatus, EmbeddingJobStore, EmbeddingJobStoreError, EmbeddingProviderKind,
-    GeminiEmbedClient, GeminiOcr, Governors, MilliActorHandle, OcrConfig, OcrError, OcrInput,
-    OcrMimeType, OcrService, PipelineContext, PipelineError, ProviderJobState,
+    EmbedBatchTask, EmbedRuntimeOptions, EmbedService, EmbeddingJob, EmbeddingJobStatus,
+    EmbeddingJobStore, EmbeddingJobStoreError, EmbeddingProviderKind, GeminiEmbedClient, Governors,
+    MilliActorHandle, OcrError, PipelineContext, PipelineError, ProviderJobState,
     StructuredExtractError, StructuredExtractor, decision_content_hash,
     index_structured_with_embeddings, load_structured_decision,
 };
-use zetesis_app::text::{PolishSentenceSegmenter, cleanup_text};
+use zetesis_app::text::cleanup_text;
 use zetesis_app::{
     config, ingestion,
     paths::{AppPaths, PathError},
@@ -244,6 +243,10 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         }
         Some(Commands::Jobs(args)) => {
             run_jobs(args).await?;
+        }
+        #[cfg(feature = "cli-debug")]
+        Some(Commands::Debug(args)) => {
+            run_debug(args)?;
         }
         None => {
             Cli::print_help();
@@ -995,173 +998,6 @@ impl ProgressTracker {
     }
 }
 
-#[allow(dead_code)]
-fn run_segment_pdf(args: SegmentPdfArgs) -> Result<(), AppError> {
-    for input in &args.inputs {
-        let bytes = fs::read(input).map_err(|source| AppError::Io {
-            path: input.clone(),
-            source,
-        })?;
-
-        let raw_text = extract_text_from_pdf(&bytes)?;
-        let cleaned = cleanup_text(&raw_text);
-        let segments = PolishSentenceSegmenter::ranges(&cleaned)
-            .into_iter()
-            .map(|range| {
-                let content = cleaned[range.clone()].to_string();
-                (range, content)
-            })
-            .filter(|(_, content)| !content.is_empty())
-            .collect::<Vec<_>>();
-
-        match args.format {
-            SegmentOutputFormat::Text => render_sentences_text(input, &segments, args.with_offsets),
-            SegmentOutputFormat::Json => {
-                render_sentences_json(input, &segments, args.with_offsets)?
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[allow(dead_code)]
-async fn run_ocr_pdf(args: OcrPdfArgs) -> Result<(), AppError> {
-    let selected_model = if matches!(args.provider, OcrProviderKind::Gemini)
-        && args.model == "allenai/olmOCR-2-7B-1025"
-    {
-        "gemini-2.5-flash-lite-preview-09-2025".to_string()
-    } else {
-        args.model.clone()
-    };
-
-    let config = OcrConfig {
-        model: selected_model.clone(),
-        render_width: args.render_width,
-        image_max_edge: args.image_max_edge,
-        detail: args.detail.clone(),
-        max_tokens: args.max_tokens,
-        docs_concurrency: NonZeroUsize::new(2).expect("non-zero docs concurrency"),
-        pages_concurrency: NonZeroUsize::new(8).expect("non-zero pages concurrency"),
-        max_inflight_requests: NonZeroUsize::new(16).expect("non-zero inflight budget"),
-    };
-
-    let bytes = fs::read(&args.input).map_err(|source| AppError::Io {
-        path: args.input.clone(),
-        source,
-    })?;
-    let bytes: Arc<[u8]> = Arc::from(bytes);
-
-    let mime_type = args
-        .input
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .and_then(|ext| OcrMimeType::from_extension(&ext.to_ascii_lowercase()))
-        .ok_or_else(|| {
-            AppError::Ocr(OcrError::UnsupportedInput {
-                id: args.input.display().to_string(),
-                mime_type: "unknown".to_string(),
-            })
-        })?;
-
-    let input = OcrInput {
-        id: args.input.display().to_string(),
-        bytes,
-        mime_type,
-    };
-    let inputs = vec![input];
-    let mut documents = match args.provider {
-        OcrProviderKind::Deepinfra => {
-            let service = DeepInfraOcr::from_env()?;
-            service.run_batch(inputs, &config).await?
-        }
-        OcrProviderKind::Gemini => {
-            let service = GeminiOcr::from_env(selected_model.clone(), config.max_tokens)?;
-            service.run_batch(inputs, &config).await?
-        }
-    };
-    let document = documents.pop().ok_or_else(|| {
-        AppError::Ocr(OcrError::UnsupportedInput {
-            id: args.input.display().to_string(),
-            mime_type: mime_type.to_string(),
-        })
-    })?;
-    let results = document.pages;
-
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    serde_json::to_writer_pretty(&mut handle, &results)?;
-    println!();
-
-    Ok(())
-}
-
-#[allow(dead_code)]
-async fn run_extract_structured(args: ExtractStructuredArgs) -> Result<(), AppError> {
-    let bytes = fs::read(&args.input).map_err(|source| AppError::Io {
-        path: args.input.clone(),
-        source,
-    })?;
-    let text = extract_text_from_pdf(&bytes)?;
-
-    let extractor = StructuredExtractor::from_env(&args.model)?;
-    let result = extractor.extract(&text).await?;
-
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    serde_json::to_writer_pretty(&mut handle, &result.decision)?;
-    println!();
-
-    eprintln!(
-        "prompt_tokens={} completion_tokens={} total_tokens={} chunks={}",
-        result.usage.input_tokens(),
-        result.usage.output_tokens(),
-        result.usage.total_tokens(),
-        result.decision.chunks.len()
-    );
-
-    Ok(())
-}
-
-fn render_sentences_text(path: &Path, segments: &[(Range<usize>, String)], with_offsets: bool) {
-    println!("== {} ==", path.display());
-    let mut first = true;
-    for (range, sentence) in segments {
-        if !first {
-            println!();
-        }
-        if with_offsets {
-            println!("{:>8}..{:>8} {}", range.start, range.end, sentence);
-        } else {
-            println!("{}", sentence);
-        }
-        first = false;
-    }
-    println!();
-}
-
-fn render_sentences_json(
-    path: &Path,
-    segments: &[(Range<usize>, String)],
-    with_offsets: bool,
-) -> Result<(), AppError> {
-    let input = path.display().to_string();
-    for (idx, (range, sentence)) in segments.iter().enumerate() {
-        let mut payload = serde_json::Map::new();
-        payload.insert("input".to_string(), json!(&input));
-        payload.insert("ord".to_string(), json!(idx));
-        payload.insert("content".to_string(), json!(sentence));
-
-        if with_offsets {
-            payload.insert("start".to_string(), json!(range.start));
-            payload.insert("end".to_string(), json!(range.end));
-        }
-
-        println!("{}", serde_json::Value::Object(payload));
-    }
-    Ok(())
-}
-
 fn determine_log_level(cli: &Cli) -> LevelFilter {
     match cli.command.as_ref() {
         Some(Commands::FetchKio(_)) => match cli.verbose {
@@ -1199,6 +1035,13 @@ fn determine_log_level(cli: &Cli) -> LevelFilter {
             _ => LevelFilter::TRACE,
         },
         Some(Commands::Jobs(_)) => match cli.verbose {
+            0 => LevelFilter::OFF,
+            1 => LevelFilter::INFO,
+            2 => LevelFilter::DEBUG,
+            _ => LevelFilter::TRACE,
+        },
+        #[cfg(feature = "cli-debug")]
+        Some(Commands::Debug(_)) => match cli.verbose {
             0 => LevelFilter::OFF,
             1 => LevelFilter::INFO,
             2 => LevelFilter::DEBUG,
@@ -1250,6 +1093,26 @@ async fn run_audit(args: AuditArgs) -> Result<(), AppError> {
     }
 }
 
+#[cfg(feature = "cli-debug")]
+fn run_debug(args: DebugArgs) -> Result<(), AppError> {
+    match args.command {
+        DebugCommands::Text(sub) => run_debug_text(sub),
+    }
+}
+
+#[cfg(feature = "cli-debug")]
+fn run_debug_text(args: zetesis_app::cli::DebugTextArgs) -> Result<(), AppError> {
+    let bytes = fs::read(&args.input).map_err(|source| AppError::Io {
+        path: args.input.clone(),
+        source,
+    })?;
+
+    let text = extract_text_from_pdf(&bytes)?;
+    println!("{}", text);
+
+    Ok(())
+}
+
 async fn run_audit_structured(args: StructuredAuditArgs) -> Result<(), AppError> {
     use std::io::Write;
     let paths = collect_pdfs(&args.dir)?;
@@ -1282,13 +1145,6 @@ async fn run_audit_structured(args: StructuredAuditArgs) -> Result<(), AppError>
     }
 
     Ok(())
-}
-
-#[allow(dead_code)]
-async fn run_index(args: IndexArgs) -> Result<(), AppError> {
-    match args.command {
-        IndexCommands::Structured(sub) => run_index_structured(sub).await,
-    }
 }
 
 async fn run_search(args: SearchArgs) -> Result<(), AppError> {
@@ -1795,60 +1651,6 @@ async fn run_db(args: DbArgs) -> Result<(), AppError> {
         DbCommands::Purge(sub) => db_purge(sub)?,
         DbCommands::Recover(sub) => db_recover(sub)?,
     }
-    Ok(())
-}
-
-#[allow(dead_code)]
-async fn run_index_structured(args: StructuredIndexArgs) -> Result<(), AppError> {
-    let extractor = StructuredExtractor::from_env(&args.extractor_model)?;
-    let ctx = build_pipeline_context(&args.embed_model)?;
-
-    for input in &args.inputs {
-        let bytes = fs::read(input).map_err(|source| AppError::Io {
-            path: input.clone(),
-            source,
-        })?;
-        let text = extract_text_from_pdf(&bytes)?;
-        let structured = extractor.extract(&text).await?;
-        let doc_id = doc_id_from_bytes(&bytes);
-        ctx.index_for(Silo::Kio)?;
-
-        let decision = structured.decision;
-        let chunk_count = decision.chunks.len();
-        if chunk_count == 0 {
-            return Err(PipelineError::message("structured decision produced zero chunks").into());
-        }
-        if chunk_count > u32::MAX as usize {
-            return Err(PipelineError::message(
-                "structured decision has more chunks than supported",
-            )
-            .into());
-        }
-        let content_hash = decision_content_hash(&decision)
-            .map_err(|err| PipelineError::message(err.to_string()))
-            .map_err(AppError::from)?;
-        let job = EmbeddingJob::new(
-            doc_id.clone(),
-            Silo::Kio.slug(),
-            ctx.embed.embedder_key.clone(),
-            ctx.embed.runtime.documents_mode,
-            chunk_count as u32,
-            Some(content_hash),
-        );
-        let mut job = job;
-        job.pending_decision = Some(decision);
-        ctx.jobs
-            .enqueue(&job)
-            .map_err(PipelineError::from)
-            .map_err(AppError::from)?;
-        tracing::info!(
-            path = %input.display(),
-            doc_id,
-            status = ?EmbeddingJobStatus::Pending,
-            "queued embedding job"
-        );
-    }
-
     Ok(())
 }
 

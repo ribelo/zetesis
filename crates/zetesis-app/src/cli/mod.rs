@@ -49,10 +49,38 @@ pub enum Commands {
     Db(DbArgs),
     /// Manage asynchronous embedding jobs.
     Jobs(JobsArgs),
+    /// Extract plain text from a PDF (debug feature).
+    #[cfg(feature = "cli-debug")]
+    Debug(DebugArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct ServeArgs;
+
+/// Debug command namespace (gated by cli-debug feature).
+#[cfg(feature = "cli-debug")]
+#[derive(Debug, Args)]
+pub struct DebugArgs {
+    #[command(subcommand)]
+    pub command: DebugCommands,
+}
+
+/// Debug subcommands.
+#[cfg(feature = "cli-debug")]
+#[derive(Debug, Subcommand)]
+pub enum DebugCommands {
+    /// Extract plain text from a PDF file.
+    Text(DebugTextArgs),
+}
+
+/// Options for the `debug text` command.
+#[cfg(feature = "cli-debug")]
+#[derive(Debug, Args)]
+pub struct DebugTextArgs {
+    /// PDF file to extract text from.
+    #[arg(value_parser = validate_pdf_file)]
+    pub input: std::path::PathBuf,
+}
 
 /// Identify which source we are scraping for KIO judgments.
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -73,8 +101,8 @@ pub struct FetchKioArgs {
     /// Limit the number of documents to download (omit to fetch everything).
     #[arg(long)]
     pub limit: Option<usize>,
-    /// Number of concurrent download workers (>= 1).
-    #[arg(long, default_value_t = 4)]
+    /// Number of concurrent download workers (1-64).
+    #[arg(long, default_value_t = 4, value_parser = validate_workers)]
     pub workers: usize,
     /// Upstream source to pull from (`uzp` >= 2021, `saos` < 2021).
     #[arg(long, value_enum, default_value_t = KioSource::Uzp)]
@@ -85,6 +113,7 @@ pub struct FetchKioArgs {
 #[derive(Debug, Args)]
 pub struct IngestArgs {
     /// Name of the index to ingest into (e.g. `kio`).
+    #[arg(value_parser = validate_index_slug)]
     pub index: String,
     /// File or directory containing documents to ingest.
     pub path: PathBuf,
@@ -103,76 +132,6 @@ pub struct IngestArgs {
     /// Create the Milli index if it does not already exist.
     #[arg(long, action = ArgAction::SetTrue)]
     pub create_index: bool,
-}
-
-#[allow(dead_code)]
-/// Segment local documents and print the resulting chunks.
-#[derive(Debug, Args)]
-pub struct SegmentPdfArgs {
-    /// One or more PDF files to inspect.
-    #[arg(required = true)]
-    pub inputs: Vec<PathBuf>,
-    /// Output rendering (human-readable text or JSON lines).
-    #[arg(long, value_enum, default_value_t = SegmentOutputFormat::Text)]
-    pub format: SegmentOutputFormat,
-    /// Include byte offsets for each segment.
-    #[arg(long)]
-    pub with_offsets: bool,
-}
-
-/// Available OCR backends exposed through the CLI.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum OcrProviderKind {
-    Deepinfra,
-    Gemini,
-}
-
-/// OCR a PDF via the selected provider and print JSON to stdout.
-#[allow(dead_code)]
-#[derive(Debug, Args)]
-pub struct OcrPdfArgs {
-    /// PDF document to process.
-    #[arg(value_name = "PDF")]
-    pub input: PathBuf,
-    /// OCR provider used to send page renders.
-    #[arg(long = "ocr-provider", value_enum, default_value_t = OcrProviderKind::Deepinfra)]
-    pub provider: OcrProviderKind,
-    /// Override the model identifier for the selected provider.
-    #[arg(long = "ocr-model", default_value = "allenai/olmOCR-2-7B-1025")]
-    pub model: String,
-    /// Target width (pixels) when rasterizing each PDF page.
-    #[arg(long, default_value_t = 2048)]
-    pub render_width: u32,
-    /// Maximum edge length (pixels) when preparing images for OCR.
-    #[arg(long, default_value_t = 1280)]
-    pub image_max_edge: u32,
-    /// Optional image detail hint passed to the model (`low`, `high`, `auto`).
-    #[arg(long)]
-    pub detail: Option<String>,
-    /// Maximum tokens requested from the model.
-    #[arg(long, default_value_t = 4096)]
-    pub max_tokens: u32,
-}
-
-/// Extract structured decision data from a PDF.
-#[allow(dead_code)]
-#[derive(Debug, Args)]
-pub struct ExtractStructuredArgs {
-    /// PDF document to process.
-    #[arg(value_name = "PDF")]
-    pub input: PathBuf,
-    /// Gemini model identifier to use for structured extraction.
-    #[arg(long, default_value = "gemini-2.5-flash-lite-preview-09-2025")]
-    pub model: String,
-}
-
-/// How to render chunk output.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum SegmentOutputFormat {
-    Text,
-    Json,
 }
 
 /// Audit command namespace.
@@ -206,37 +165,6 @@ pub struct StructuredAuditArgs {
     pub out_path: String,
 }
 
-/// Top-level index command namespace.
-#[allow(dead_code)]
-#[derive(Debug, Args)]
-pub struct IndexArgs {
-    #[command(subcommand)]
-    pub command: IndexCommands,
-}
-
-/// Index subcommands.
-#[allow(dead_code)]
-#[derive(Debug, Subcommand)]
-pub enum IndexCommands {
-    /// Index structured decisions into Milli.
-    Structured(StructuredIndexArgs),
-}
-
-/// Options for indexing structured documents.
-#[allow(dead_code)]
-#[derive(Debug, Args)]
-pub struct StructuredIndexArgs {
-    /// One or more PDF documents to ingest.
-    #[arg(required = true, value_name = "PDF")]
-    pub inputs: Vec<PathBuf>,
-    /// Gemini model identifier used for structured extraction.
-    #[arg(long, default_value = "gemini-2.5-flash-lite-preview-09-2025")]
-    pub extractor_model: String,
-    /// Embedding model identifier used for chunk vectors.
-    #[arg(long, default_value_t = DEFAULT_EMBEDDER_KEY.to_string())]
-    pub embed_model: String,
-}
-
 /// Top-level namespace for search commands.
 #[derive(Debug, Args)]
 pub struct SearchArgs {
@@ -255,8 +183,20 @@ pub enum SearchCommands {
 
 /// Arguments for keyword search.
 #[derive(Debug, Args)]
+#[command(after_help = "\
+EXAMPLES:
+  # Basic keyword search
+  zetesis search keyword kio --q \"procurement law\"
+
+  # Search with filter and custom fields
+  zetesis search keyword kio --q \"contract\" --filter 'decision_type = \"WYROK\"' --fields id,sygnatura
+
+  # Search with sorting and pretty output
+  zetesis search keyword kio --q \"tender\" --sort date:desc --limit 10 --pretty
+")]
 pub struct KeywordSearchArgs {
     /// Name of the index to query (e.g. `kio`).
+    #[arg(value_parser = validate_index_slug)]
     pub index: String,
     /// Query string for keyword search.
     #[arg(long = "q", value_name = "QUERY")]
@@ -264,8 +204,8 @@ pub struct KeywordSearchArgs {
     /// Optional Milli filter expression.
     #[arg(long)]
     pub filter: Option<String>,
-    /// Maximum number of results to return.
-    #[arg(long, default_value_t = 20)]
+    /// Maximum number of results to return (1-100).
+    #[arg(long, default_value_t = 20, value_parser = validate_search_limit)]
     pub limit: usize,
     /// Number of results to skip from the start.
     #[arg(long, default_value_t = 0)]
@@ -283,8 +223,20 @@ pub struct KeywordSearchArgs {
 
 /// Arguments for vector search.
 #[derive(Debug, Args)]
+#[command(after_help = "\
+EXAMPLES:
+  # Basic vector search
+  zetesis search vector kio --q \"cases about public procurement violations\"
+
+  # Vector search with custom embedder and fields
+  zetesis search vector kio --q \"contract disputes\" --embedder gemini-embedding-001 --fields id,decision_date
+
+  # Vector search with filter and pretty output
+  zetesis search vector kio --q \"appeal decisions\" --filter 'year >= 2023' --k 20 --pretty
+")]
 pub struct VectorSearchArgs {
     /// Name of the index to query (e.g. `kio`).
+    #[arg(value_parser = validate_index_slug)]
     pub index: String,
     /// Text prompt to embed and search with.
     #[arg(long = "q", value_name = "QUERY")]
@@ -295,8 +247,8 @@ pub struct VectorSearchArgs {
     /// Optional Milli filter expression.
     #[arg(long)]
     pub filter: Option<String>,
-    /// Number of nearest neighbours to return.
-    #[arg(long = "k", default_value_t = 10)]
+    /// Number of nearest neighbours to return (1-100).
+    #[arg(long = "k", default_value_t = 10, value_parser = validate_vector_k)]
     pub top_k: usize,
     /// Comma-separated list of fields to include in the output.
     #[arg(long = "fields", value_delimiter = ',', num_args = 0..)]
@@ -336,6 +288,7 @@ pub enum DbCommands {
 #[derive(Debug, Args)]
 pub struct DbStatsArgs {
     /// Name of the index to inspect (e.g. `kio`).
+    #[arg(value_parser = validate_index_slug)]
     pub index: String,
 }
 
@@ -343,6 +296,7 @@ pub struct DbStatsArgs {
 #[derive(Debug, Args)]
 pub struct DbGetArgs {
     /// Name of the index to inspect.
+    #[arg(value_parser = validate_index_slug)]
     pub index: String,
     /// Primary key of the record to fetch.
     #[arg(long)]
@@ -359,6 +313,7 @@ pub struct DbGetArgs {
 #[derive(Debug, Args)]
 pub struct DbFindArgs {
     /// Name of the index to inspect.
+    #[arg(value_parser = validate_index_slug)]
     pub index: String,
     /// Optional Milli filter expression.
     #[arg(long)]
@@ -381,6 +336,7 @@ pub struct DbFindArgs {
 #[derive(Debug, Args)]
 pub struct DbBackupArgs {
     /// Name of the index to back up.
+    #[arg(value_parser = validate_index_slug)]
     pub index: String,
     /// Destination directory for backups (defaults to ./backups).
     #[arg(long = "out", value_name = "DIR")]
@@ -391,6 +347,7 @@ pub struct DbBackupArgs {
 #[derive(Debug, Args)]
 pub struct DbPurgeArgs {
     /// Name of the index to remove.
+    #[arg(value_parser = validate_index_slug)]
     pub index: String,
 }
 
@@ -398,6 +355,7 @@ pub struct DbPurgeArgs {
 #[derive(Debug, Args)]
 pub struct DbRecoverArgs {
     /// Name of the index to restore (will overwrite existing data when --force set).
+    #[arg(value_parser = validate_index_slug)]
     pub index: String,
     /// Directory containing the backup to restore from.
     #[arg(long = "from", value_name = "DIR")]
@@ -445,4 +403,242 @@ pub struct JobsIngestArgs {
     /// Maximum number of jobs to ingest in this run.
     #[arg(long, default_value_t = 4)]
     pub limit: usize,
+}
+
+// Validator functions for CLI arguments.
+
+/// Maximum attachment size for inline processing (20 MiB).
+const MAX_INLINE_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
+/// Validate PDF file: must exist, have .pdf extension, and be under size limit.
+#[cfg(feature = "cli-debug")]
+fn validate_pdf_file(s: &str) -> Result<std::path::PathBuf, String> {
+    let path = std::path::PathBuf::from(s);
+
+    if !path.exists() {
+        return Err(format!("file does not exist: {}", s));
+    }
+
+    if !path.is_file() {
+        return Err(format!("path is not a file: {}", s));
+    }
+
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("pdf") => {}
+        _ => return Err(format!("file must have .pdf extension: {}", s)),
+    }
+
+    match std::fs::metadata(&path) {
+        Ok(meta) => {
+            let size = meta.len() as usize;
+            if size > MAX_INLINE_ATTACHMENT_BYTES {
+                let limit_mib = (MAX_INLINE_ATTACHMENT_BYTES / (1024 * 1024)).max(1);
+                return Err(format!(
+                    "file size {} bytes exceeds limit of {} MiB",
+                    size, limit_mib
+                ));
+            }
+        }
+        Err(e) => return Err(format!("failed to read file metadata: {}", e)),
+    }
+
+    Ok(path)
+}
+
+/// Validate index name: lowercase ASCII letters, digits, hyphens only, length 1..=32.
+fn validate_index_slug(s: &str) -> Result<String, String> {
+    if s.is_empty() {
+        return Err("index name cannot be empty".to_string());
+    }
+
+    if s.len() > 32 {
+        return Err(format!("index name too long: {} chars (max 32)", s.len()));
+    }
+
+    if !s
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+    {
+        return Err(
+            "index name must contain only lowercase ASCII letters, digits, and hyphens".to_string(),
+        );
+    }
+
+    Ok(s.to_string())
+}
+
+/// Validate worker count: must be between 1 and 64.
+fn validate_workers(s: &str) -> Result<usize, String> {
+    let value = s
+        .parse::<usize>()
+        .map_err(|_| format!("invalid number: {}", s))?;
+
+    if value == 0 {
+        return Err("workers must be at least 1".to_string());
+    }
+
+    if value > 64 {
+        return Err("workers cannot exceed 64".to_string());
+    }
+
+    Ok(value)
+}
+
+/// Validate search limit: must be between 1 and 100.
+fn validate_search_limit(s: &str) -> Result<usize, String> {
+    let value = s
+        .parse::<usize>()
+        .map_err(|_| format!("invalid number: {}", s))?;
+
+    if value == 0 {
+        return Err("limit must be at least 1".to_string());
+    }
+
+    if value > 100 {
+        return Err("limit cannot exceed 100".to_string());
+    }
+
+    Ok(value)
+}
+
+/// Validate vector search k: must be between 1 and 100.
+fn validate_vector_k(s: &str) -> Result<usize, String> {
+    let value = s
+        .parse::<usize>()
+        .map_err(|_| format!("invalid number: {}", s))?;
+
+    if value == 0 {
+        return Err("k must be at least 1".to_string());
+    }
+
+    if value > 100 {
+        return Err("k cannot exceed 100".to_string());
+    }
+
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn validate_index_slug_empty_rejected() {
+        let res = validate_index_slug("");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn validate_index_slug_uppercase_rejected() {
+        let res = validate_index_slug("KIO");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("lowercase"));
+    }
+
+    #[test]
+    fn validate_index_slug_slash_rejected() {
+        let res = validate_index_slug("foo/bar");
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn validate_index_slug_underscore_rejected() {
+        let res = validate_index_slug("foo_bar");
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn validate_index_slug_too_long_rejected() {
+        let long = "a".repeat(33);
+        let res = validate_index_slug(&long);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("too long"));
+    }
+
+    #[test]
+    fn validate_index_slug_valid_accepted() {
+        assert!(validate_index_slug("kio").is_ok());
+        assert!(validate_index_slug("kio-2023").is_ok());
+        assert!(validate_index_slug("test123").is_ok());
+    }
+
+    #[test]
+    fn fetch_kio_workers_zero_rejected() {
+        let res = Cli::try_parse_from(["zetesis", "fetch-kio", "--workers", "0"]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn fetch_kio_workers_over_limit_rejected() {
+        let res = Cli::try_parse_from(["zetesis", "fetch-kio", "--workers", "65"]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn fetch_kio_workers_within_range_accepted() {
+        let res = Cli::try_parse_from(["zetesis", "fetch-kio", "--workers", "32"]);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn search_keyword_limit_zero_rejected() {
+        let res = Cli::try_parse_from([
+            "zetesis", "search", "keyword", "kio", "--q", "test", "--limit", "0",
+        ]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn search_keyword_limit_over_max_rejected() {
+        let res = Cli::try_parse_from([
+            "zetesis", "search", "keyword", "kio", "--q", "test", "--limit", "101",
+        ]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn search_keyword_limit_within_range_accepted() {
+        let res = Cli::try_parse_from([
+            "zetesis", "search", "keyword", "kio", "--q", "test", "--limit", "50",
+        ]);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn search_vector_k_zero_rejected() {
+        let res = Cli::try_parse_from([
+            "zetesis", "search", "vector", "kio", "--q", "test", "--k", "0",
+        ]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn search_vector_k_over_max_rejected() {
+        let res = Cli::try_parse_from([
+            "zetesis", "search", "vector", "kio", "--q", "test", "--k", "101",
+        ]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn search_vector_k_within_range_accepted() {
+        let res = Cli::try_parse_from([
+            "zetesis", "search", "vector", "kio", "--q", "test", "--k", "20",
+        ]);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn ingest_invalid_index_name_rejected() {
+        let res = Cli::try_parse_from(["zetesis", "ingest", "Invalid_Name", "test.pdf"]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn ingest_valid_index_name_accepted() {
+        let res = Cli::try_parse_from(["zetesis", "ingest", "kio", "test.pdf"]);
+        assert!(res.is_ok());
+    }
 }
