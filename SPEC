@@ -12,6 +12,10 @@
 - [REQ-ZE-TODO-STATUS] Keep TODO status markers (`[ ]`, `[~]`, `[x]`) in sync with progress and avoid removing completed entries; instead mark them `[x]` for traceability.
 - [REQ-ZE-TODO-REVIEWS] When TODO items complete a requirement, annotate the requirement with `(Verified via WP-…/T…)` so SPEC remains the single source of truth.
 
+### Configuration
+- [REQ-ZE-CONFIG-SOURCES] Load settings from TOML files only, honoring precedence `/etc/xdg/zetesis/settings.toml` (override root via `$ZETESIS_ETC_CONFIG_DIR`), `$XDG_CONFIG_HOME/zetesis/settings.toml`, `./config/settings.toml`, then `$ZETESIS_CONFIG_FILE`, before applying `ZETESIS__` environment overrides with double-underscore separators; no implicit `.env` loading. (covers T13)
+- [REQ-ZE-CONFIG-CORS] CORS remains disabled by default; enabling it requires explicit http/https origins, an `OPTIONS`-inclusive method list, header/expose lists bounded to ≤64 entries of ≤128 characters, and `max_age_secs ≤ 86400`, producing headers that mirror the configured allow/expose/credentials choices. (covers T13)
+
 ### Storage & Indexing
 - [REQ-ZE-STORAGE-MILLI] Persist canonical structured documents and derived chunk records directly in Milli. Each record is self-contained so Milli alone can satisfy read and reindex flows. (Updated 2025-11-04 — aligned to current code)
 - [REQ-ZE-STORAGE-FS] Blobs live under `$XDG_DATA_HOME/zetesis/blobs/{silo}/{prefix}/{cid}` where `cid` is lowercase hex BLAKE3 of original bytes. Callers may additionally cache KIO downloads in user-provided folders. (Updated 2025-11-04)

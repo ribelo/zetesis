@@ -9,7 +9,7 @@ Zetesis is a lightweight SaaS for full-text and similarity search over documents
 - **Storage / Search**: A single Milli index (backed by LMDB internally) stores canonical structured documents, chunk records, and user-provided vectors.
 - **Blob Store**: Original PDFs are written to the filesystem using content-addressed paths under the XDG data directory.
 - **AI & Embeddings**: The local `ai-ox` crate supplies LLM utilities and embedding models; treat it as the sole integration point for AI tasks.
-- **Configuration**: Loaded with the `config` crate, resolved through XDG directories via `directories`; defaults live in `config/settings.example.toml`.
+- **Configuration**: Loaded with the `config` crate as TOML only, using XDG precedence (`/etc/xdg` → `$XDG_CONFIG_HOME` → `./config/settings.toml` → `$ZETESIS_CONFIG_FILE`) before applying `ZETESIS__` env overrides; defaults live in `config/settings.example.toml` and CORS stays off unless explicitly configured.
 
 ## 3. Data & Storage Strategy
 - The Milli index is the authoritative store for structured documents and chunk records. All canonical JSON lands here and is queryable directly.
