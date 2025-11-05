@@ -73,6 +73,9 @@ aws-sdk-s3 = { version = "1.69", optional = true }
 serde_yaml = "0.9"
 proptest = "1.9"
 wiremock = "0.6"
+tower = { version = "0.4", features = ["util"] }
+hyper = { version = "1", features = ["http1"] }
+http-body-util = "0.1"
 
 [features]
 default = []
