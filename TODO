@@ -35,8 +35,8 @@ Legend: [ ] = open · [~] = in progress · [x] = done
 - [x] T9: Add examples and `--help` coverage for `search keyword|vector` including filters and fields (P2) (covers REQ-ZE-CLI-SEARCH)
 
 ## WP-SERVER — HTTP Surface
-- [ ] T10: Implement Axum POC with `/healthz` + graceful shutdown (P0) (covers REQ-ZE-CLI-CMDS)
-- [ ] T11: Add `/v1/search/keyword` and `/v1/search/vector` endpoints mirroring CLI options; reuse index/search code paths (P1) (covers REQ-ZE-INDEX-SEARCHABLE)
+- [x] T10: Implement Axum POC with `/healthz` + graceful shutdown (P0) (covers REQ-ZE-CLI-CMDS)
+- [x] T11: Add `/v1/search/keyword` and `/v1/search/vector` endpoints mirroring CLI options; reuse index/search code paths (P1) (covers REQ-ZE-INDEX-SEARCHABLE) — Completed 2025-11-06: shared search service, HTTP validation, regression tests for 400/404 cases
 - [ ] T12: Logging, rate limits, and error mapping to structured JSON (P1) (covers REQ-ZE-LOGS, REQ-ZE-ASSERTS)
 - [ ] T13: Config load from env/files; XDG-aware paths; CORS off by default (P2)
  - [ ] T14: Typeahead-optimized keyword endpoint: small fields, limit ≤ 10, p95 ≤ 100 ms; per-IP rate limit and 2s LRU cache (P0) (covers REQ-ZE-UI-TYPEAHEAD)
