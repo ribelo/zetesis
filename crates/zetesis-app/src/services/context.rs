@@ -1,19 +1,21 @@
-use std::sync::Arc;
+use std::{num::NonZeroU32, sync::Arc};
 
 use ai_ox::embedding::EmbeddingError;
 use async_trait::async_trait;
 use backon::ExponentialBuilder;
-use governor::RateLimiter;
 use governor::clock::DefaultClock;
 use governor::state::InMemoryState;
 use governor::state::direct::NotKeyed;
+use governor::{Quota, RateLimiter};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::constants::DEFAULT_EMBEDDING_DIM;
 use crate::index::milli::{MilliBootstrapError, ensure_index};
 use crate::index::writer::IndexWriteError;
 use crate::paths::{AppPaths, PathError};
 use crate::pipeline::Silo;
+use crate::services::GeminiEmbedClient;
 use crate::services::jobs::{EmbeddingJobStore, EmbeddingJobStoreError};
 use gemini_ox::GeminiRequestError;
 
@@ -199,6 +201,43 @@ impl PipelineError {
     pub fn message(msg: impl Into<String>) -> Self {
         PipelineError::Message(msg.into())
     }
+}
+
+pub fn build_pipeline_context(embed_model: &str) -> Result<PipelineContext, PipelineError> {
+    debug_assert!(!embed_model.is_empty());
+
+    let paths = AppPaths::from_project_dirs()?;
+    let embed_quota = Quota::per_second(NonZeroU32::new(8).expect("quota must be non-zero"));
+    let embed_limiter = Arc::new(RateLimiter::direct(embed_quota));
+    let runtime = EmbedRuntimeOptions::default();
+    let client = Arc::new(GeminiEmbedClient::from_env(
+        embed_model.to_string(),
+        DEFAULT_EMBEDDING_DIM,
+        Some(embed_limiter.clone()),
+        runtime.max_batch,
+    )?);
+    let job_store = EmbeddingJobStore::open(&paths)?;
+    let embed_client: Arc<dyn EmbedClient> = client.clone();
+    let job_provider: Arc<dyn EmbeddingJobClient> = client.clone();
+    let embed = EmbedService {
+        embedder_key: embed_model.to_string(),
+        dim: DEFAULT_EMBEDDING_DIM,
+        client: embed_client,
+        job_client: Some(job_provider),
+        runtime,
+    };
+    let jobs = Arc::new(job_store);
+
+    Ok(PipelineContext {
+        paths,
+        embed,
+        jobs,
+        backoff: ExponentialBuilder::default(),
+        governors: Governors {
+            io: None,
+            embed: Some(embed_limiter),
+        },
+    })
 }
 
 impl From<GeminiRequestError> for PipelineError {

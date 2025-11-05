@@ -13,6 +13,7 @@ pub mod jobs;
 pub mod milli_actor;
 pub mod ocr;
 pub mod orchestrator;
+pub mod search;
 pub mod structured;
 
 pub use blob_store::{
@@ -25,7 +26,7 @@ pub use blob_store::S3BlobStore;
 pub use context::{
     EmbedBatchTask, EmbedClient, EmbedMode, EmbedRuntimeOptions, EmbedService, EmbeddingJobClient,
     Governors, JobMetadata, PipelineContext, PipelineError, PipelineResult, ProviderJobState,
-    SubmittedJob,
+    SubmittedJob, build_pipeline_context,
 };
 pub use embed::GeminiEmbedClient;
 pub use indexer::{
@@ -42,4 +43,10 @@ pub use ocr::{
     OcrPageResult, OcrService, OcrSpan,
 };
 pub use orchestrator::run_for_silo;
+pub use search::{
+    KeywordSearchParams, VectorSearchParams, build_search_row, keyword, normalize_index_name,
+    open_index_read_only, project_value, resolve_index_dir, vector,
+};
+
+pub use search::set_data_dir_override;
 pub use structured::{StructuredExtractError, StructuredExtraction, StructuredExtractor};
