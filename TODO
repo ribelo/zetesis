@@ -30,9 +30,9 @@ Legend: [ ] = open · [~] = in progress · [x] = done
 - [x] T6: Migrate KIO/SAOS download paths to `BlobStore` API; deprecate ad-hoc caches; E2E move test (P1) (covers REQ-ZE-STORAGE-FS) — Completed 2025-11-05: Refactored KIO scrapers to stream HTTP → BlobStore, replaced filesystem caching with content-addressable storage, added CLI backend selection (S3/FS), implemented manifest writer for doc_id→CID ledger, added E2E integration tests with mock HTTP server, fixed S3 error handling panics
 
 ## WP-CLI — Command Surface
-- [ ] T7: Remove dead CLI (`ocr`, `segment`) and unreachable wiring; keep services internal; update SPEC + help output tests (P0) (covers REQ-ZE-CLI-CMDS)
-- [ ] T8: Validate index names and file size bounds at parse time; add negative tests (P1) (covers REQ-ZE-CLI-LIMITS)
-- [ ] T9: Add examples and `--help` coverage for `search keyword|vector` including filters and fields (P2) (covers REQ-ZE-CLI-SEARCH)
+- [x] T7: Remove dead CLI (`ocr`, `segment`) and unreachable wiring; keep services internal; update SPEC + help output tests (P0) (covers REQ-ZE-CLI-CMDS)
+- [x] T8: Validate index names and file size bounds at parse time; add negative tests (P1) (covers REQ-ZE-CLI-LIMITS)
+- [x] T9: Add examples and `--help` coverage for `search keyword|vector` including filters and fields (P2) (covers REQ-ZE-CLI-SEARCH)
 
 ## WP-SERVER — HTTP Surface
 - [ ] T10: Implement Axum POC with `/healthz` + graceful shutdown (P0) (covers REQ-ZE-CLI-CMDS)
