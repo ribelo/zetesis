@@ -11,26 +11,27 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{connect_info::ConnectInfo, MatchedPath, Query, State},
-    http::{header::RETRY_AFTER, HeaderMap, HeaderName, HeaderValue, Request, StatusCode},
+    extract::{MatchedPath, Query, State, connect_info::ConnectInfo},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header::RETRY_AFTER},
     middleware::{self, Next},
     response::IntoResponse,
     routing::get,
 };
+use governor::clock::Clock;
+use governor::{DefaultKeyedRateLimiter, Quota, clock::DefaultClock};
 use serde::{Deserialize, Serialize, de::Deserializer};
 use serde_json::Value;
+use std::num::NonZeroU32;
 use thiserror::Error;
 use tokio::{net::TcpListener, sync::watch};
 use tower_http::{
     classify::ServerErrorsFailureClass,
+    cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer, ExposeHeaders},
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     trace::TraceLayer,
 };
-use governor::{clock::DefaultClock, DefaultKeyedRateLimiter, Quota};
-use std::num::NonZeroU32;
-use governor::clock::Clock;
 
-use crate::config::{AppConfig, RateLimitConfig, RouteLimitConfig, ServerConfig};
+use crate::config::{AppConfig, CorsConfig, RateLimitConfig, RouteLimitConfig, ServerConfig};
 use crate::error::AppError;
 use crate::services::{KeywordSearchParams, VectorSearchParams, keyword, vector};
 
@@ -134,10 +135,9 @@ pub enum ServerError {
         source: std::io::Error,
     },
     #[error("invalid rate limit configuration for {route}: {reason}")]
-    RateLimitConfig {
-        route: &'static str,
-        reason: String,
-    },
+    RateLimitConfig { route: &'static str, reason: String },
+    #[error("invalid CORS configuration: {reason}")]
+    CorsConfig { reason: String },
 }
 
 #[derive(Clone)]
@@ -165,7 +165,10 @@ impl RateLimitState {
     }
 }
 
-fn build_keyed_limiter(route: &RouteLimitConfig, window_ms: u64) -> DefaultKeyedRateLimiter<String> {
+fn build_keyed_limiter(
+    route: &RouteLimitConfig,
+    window_ms: u64,
+) -> DefaultKeyedRateLimiter<String> {
     // Model "max_requests per window_ms" by setting replenish interval to window_ms / max_requests
     // and max burst to route.burst. This allows up to `burst` immediate requests, replenishing
     // `max_requests` cells per `window_ms` on average.
@@ -174,8 +177,8 @@ fn build_keyed_limiter(route: &RouteLimitConfig, window_ms: u64) -> DefaultKeyed
     debug_assert!(n > 0);
     // Use deprecated constructor to set replenish_1_per = per / n precisely.
     #[allow(deprecated)]
-    let mut quota = Quota::new(NonZeroU32::new(n).expect("nonzero"), per)
-        .expect("window_ms must be > 0");
+    let mut quota =
+        Quota::new(NonZeroU32::new(n).expect("nonzero"), per).expect("window_ms must be > 0");
     quota = quota.allow_burst(NonZeroU32::new(route.burst.get()).expect("burst>0"));
     DefaultKeyedRateLimiter::<String>::keyed(quota)
 }
@@ -237,7 +240,9 @@ fn extract_client_ip(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip());
 
-    let Some(peer_ip) = peer else { return None; };
+    let Some(peer_ip) = peer else {
+        return None;
+    };
 
     match mode {
         crate::config::ProxyMode::Off => Some(peer_ip),
@@ -384,8 +389,7 @@ impl ApiError {
 
     fn invalid_param(field: &str, message: impl Into<String>) -> Self {
         debug_assert!(!field.is_empty());
-        ApiError::new(StatusCode::BAD_REQUEST, ERROR_INVALID_PARAMETER, message)
-            .with_field(field)
+        ApiError::new(StatusCode::BAD_REQUEST, ERROR_INVALID_PARAMETER, message).with_field(field)
     }
 
     fn not_found(field: &str, message: impl Into<String>) -> Self {
@@ -565,6 +569,8 @@ fn validate_top_k(k: usize) -> Result<(), ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::header;
+    use tower::ServiceExt;
 
     #[test]
     fn keyword_query_allows_empty_fields() {
@@ -611,6 +617,191 @@ mod tests {
         let error = validate_list("fields", &entries, MAX_FIELD_COUNT)
             .expect_err("too many fields must error");
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    fn server_config_with(cors: CorsConfig) -> ServerConfig {
+        ServerConfig {
+            listen_addr: "127.0.0.1:8080".to_string(),
+            rate_limit: RateLimitConfig::default(),
+            cors,
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_disabled_yields_no_headers() {
+        let config = server_config_with(CorsConfig::default());
+        let router = build_app_router(&config).expect("router builds");
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(HEALTHZ_PATH)
+                    .header(header::ORIGIN, "http://example.com")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none(),
+            "CORS disabled must not emit ACAO"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_enabled_allows_explicit_origin() {
+        let cors = CorsConfig {
+            enabled: true,
+            allow_origins: vec!["http://localhost:5173".to_string()],
+            ..CorsConfig::default()
+        };
+        let config = server_config_with(cors);
+        let router = build_app_router(&config).expect("router builds");
+
+        let origin = "http://localhost:5173";
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(HEALTHZ_PATH)
+                    .header(header::ORIGIN, origin)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let header_value = response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .expect("ACAO header present when enabled");
+        assert_eq!(header_value, origin);
+        assert!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .is_none(),
+            "credentials header remains absent when disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_includes_configured_headers() {
+        let cors = CorsConfig {
+            enabled: true,
+            allow_origins: vec!["http://localhost:5173".to_string()],
+            allow_headers: vec!["authorization".to_string(), "content-type".to_string()],
+            expose_headers: vec!["x-total-count".to_string()],
+            allow_credentials: true,
+            max_age_secs: 720,
+            ..CorsConfig::default()
+        };
+        let config = server_config_with(cors);
+        let router = build_app_router(&config).expect("router builds");
+
+        let origin = "http://localhost:5173";
+        let get_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(HEALTHZ_PATH)
+                    .header(header::ORIGIN, origin)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("simple request succeeds");
+
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let get_headers = get_response.headers();
+        assert_eq!(
+            get_headers
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .expect("origin header present"),
+            origin
+        );
+        assert_eq!(
+            get_headers
+                .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .expect("credentials header present"),
+            "true"
+        );
+        let expose_headers = get_headers
+            .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+            .expect("expose headers present")
+            .to_str()
+            .expect("expose headers ascii");
+        assert!(
+            expose_headers.contains("x-total-count"),
+            "expose headers must echo configured entries: {expose_headers}"
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri(KEYWORD_PATH)
+                    .header(header::ORIGIN, origin)
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("preflight succeeds");
+
+        assert!(
+            response.status() == StatusCode::NO_CONTENT || response.status() == StatusCode::OK,
+            "preflight returns success status"
+        );
+        let headers = response.headers();
+        assert_eq!(
+            headers
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .expect("origin header present"),
+            origin
+        );
+
+        let methods = headers
+            .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+            .expect("allow-methods present")
+            .to_str()
+            .expect("allow-methods ascii");
+        assert!(
+            methods.contains("GET"),
+            "methods list should include configured GET: {methods}"
+        );
+
+        let allow_headers = headers
+            .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .expect("allow-headers present")
+            .to_str()
+            .expect("allow-headers ascii");
+        assert!(
+            allow_headers.contains("authorization") && allow_headers.contains("content-type"),
+            "allow headers must echo configured entries: {allow_headers}"
+        );
+
+        let credentials = headers
+            .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+            .expect("credentials header present");
+        assert_eq!(credentials, "true");
+
+        let max_age = headers
+            .get(header::ACCESS_CONTROL_MAX_AGE)
+            .expect("max-age header present")
+            .to_str()
+            .expect("max-age ascii");
+        assert_eq!(max_age, "720");
     }
 }
 
@@ -695,7 +886,8 @@ fn build_app_router(config: &ServerConfig) -> Result<Router, ServerError> {
     let trace_layer = TraceLayer::new_for_http()
         .make_span_with(|request: &Request<_>| {
             let path = matched_path_or_uri(request);
-            let request_id = header_request_id(request.headers()).unwrap_or_else(|| "-".to_string());
+            let request_id =
+                header_request_id(request.headers()).unwrap_or_else(|| "-".to_string());
             tracing::info_span!(
                 "http.request",
                 method = %request.method(),
@@ -703,23 +895,32 @@ fn build_app_router(config: &ServerConfig) -> Result<Router, ServerError> {
                 request_id = %request_id
             )
         })
-        .on_response(|response: &axum::response::Response, latency: Duration, span: &tracing::Span| {
-            let status = response.status().as_u16();
-            let latency_ms = latency.as_millis().min(u128::from(u64::MAX)) as u64;
-            tracing::info!(parent: span, status, latency_ms, "request completed");
-        })
-        .on_failure(|error: ServerErrorsFailureClass, latency: Duration, span: &tracing::Span| {
-            let latency_ms = latency.as_millis().min(u128::from(u64::MAX)) as u64;
-            tracing::error!(parent: span, latency_ms, error = %error, "request failed");
-        });
-
-    router = router.layer(trace_layer);
+        .on_response(
+            |response: &axum::response::Response, latency: Duration, span: &tracing::Span| {
+                let status = response.status().as_u16();
+                let latency_ms = latency.as_millis().min(u128::from(u64::MAX)) as u64;
+                tracing::info!(parent: span, status, latency_ms, "request completed");
+            },
+        )
+        .on_failure(
+            |error: ServerErrorsFailureClass, latency: Duration, span: &tracing::Span| {
+                let latency_ms = latency.as_millis().min(u128::from(u64::MAX)) as u64;
+                tracing::error!(parent: span, latency_ms, error = %error, "request failed");
+            },
+        );
 
     if config.rate_limit.enabled {
         let limiter_state = RateLimitState::try_new(&config.rate_limit)?;
         let rate_layer = middleware::from_fn_with_state(limiter_state, rate_limit_middleware);
         router = router.layer(rate_layer);
     }
+
+    if config.cors.enabled {
+        let cors_layer = build_cors_layer(&config.cors)?;
+        router = router.layer(cors_layer);
+    }
+
+    router = router.layer(trace_layer);
 
     let request_id_header = HeaderName::from_static(REQUEST_ID_HEADER);
     let make_request_id = MakeRequestUuid::default();
@@ -728,6 +929,65 @@ fn build_app_router(config: &ServerConfig) -> Result<Router, ServerError> {
         .layer(SetRequestIdLayer::new(request_id_header, make_request_id));
 
     Ok(router)
+}
+
+fn build_cors_layer(config: &CorsConfig) -> Result<CorsLayer, ServerError> {
+    debug_assert!(!config.allow_origins.is_empty());
+    let origins: Vec<HeaderValue> = config
+        .allow_origins
+        .iter()
+        .map(|origin| {
+            HeaderValue::from_str(origin).map_err(|err| ServerError::CorsConfig {
+                reason: format!("origin `{origin}` is not a valid header value: {err}"),
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    let methods: Vec<Method> = config
+        .allow_methods
+        .iter()
+        .map(|method| {
+            Method::from_bytes(method.as_bytes()).map_err(|_| ServerError::CorsConfig {
+                reason: format!("method `{method}` failed to parse post-validation"),
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    let allow_headers: Vec<HeaderName> = config
+        .allow_headers
+        .iter()
+        .map(|name| {
+            HeaderName::from_bytes(name.as_bytes()).map_err(|err| ServerError::CorsConfig {
+                reason: format!("header `{name}` is invalid: {err}"),
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    let expose_headers: Vec<HeaderName> = config
+        .expose_headers
+        .iter()
+        .map(|name| {
+            HeaderName::from_bytes(name.as_bytes()).map_err(|err| ServerError::CorsConfig {
+                reason: format!("expose-header `{name}` is invalid: {err}"),
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    let mut cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods(AllowMethods::list(methods))
+        .allow_credentials(config.allow_credentials)
+        .max_age(Duration::from_secs(config.max_age_secs));
+
+    if !allow_headers.is_empty() {
+        cors = cors.allow_headers(AllowHeaders::list(allow_headers));
+    }
+
+    if !expose_headers.is_empty() {
+        cors = cors.expose_headers(ExposeHeaders::list(expose_headers));
+    }
+
+    Ok(cors)
 }
 
 async fn keyword_search(Query(query): Query<KeywordQuery>) -> Result<Json<Vec<Value>>, ApiError> {

@@ -1,17 +1,26 @@
 //! Configuration loading and XDG path helpers.
 
 use std::{
+    env,
     net::IpAddr,
     num::{NonZeroU32, NonZeroU64},
     path::PathBuf,
 };
 
-use config::{Config, Environment, File};
+use axum::http::{Method, header::HeaderName};
+use config::{Config, Environment, File, FileFormat};
 use directories::ProjectDirs;
 use serde::Deserialize;
 use thiserror::Error;
+use url::Url;
 
-const CONFIG_FILE: &str = "config/settings";
+const LOCAL_CONFIG_PATH: &str = "config/settings.toml";
+const ETC_CONFIG_ENV: &str = "ZETESIS_ETC_CONFIG_DIR";
+const CONFIG_OVERRIDE_ENV: &str = "ZETESIS_CONFIG_FILE";
+const ETC_CONFIG_DEFAULT: &str = "/etc/xdg";
+const CORS_MAX_LIST_SIZE: usize = 64;
+const CORS_MAX_ENTRY_LEN: usize = 128;
+const CORS_MAX_AGE_LIMIT: u64 = 86_400;
 
 #[derive(Debug, Error)]
 pub enum AppConfigError {
@@ -33,6 +42,8 @@ pub struct ServerConfig {
     pub listen_addr: String,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    #[serde(default)]
+    pub cors: CorsConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -66,6 +77,52 @@ impl RateLimitConfig {
 
     fn default_vector_limit() -> RouteLimitConfig {
         RouteLimitConfig::vector_defaults()
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CorsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allow_origins: Vec<String>,
+    #[serde(default = "CorsConfig::default_allow_methods")]
+    pub allow_methods: Vec<String>,
+    #[serde(default = "CorsConfig::default_allow_headers")]
+    pub allow_headers: Vec<String>,
+    #[serde(default)]
+    pub expose_headers: Vec<String>,
+    #[serde(default)]
+    pub allow_credentials: bool,
+    #[serde(default = "CorsConfig::default_max_age_secs")]
+    pub max_age_secs: u64,
+}
+
+impl CorsConfig {
+    fn default_allow_methods() -> Vec<String> {
+        vec!["GET".to_string(), "OPTIONS".to_string()]
+    }
+
+    fn default_allow_headers() -> Vec<String> {
+        vec!["authorization".to_string(), "content-type".to_string()]
+    }
+
+    fn default_max_age_secs() -> u64 {
+        600
+    }
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_origins: Vec::new(),
+            allow_methods: Self::default_allow_methods(),
+            allow_headers: Self::default_allow_headers(),
+            expose_headers: Vec::new(),
+            allow_credentials: false,
+            max_age_secs: Self::default_max_age_secs(),
+        }
     }
 }
 
@@ -170,8 +227,9 @@ pub struct IngestConfig {
 }
 
 pub fn load() -> Result<AppConfig, AppConfigError> {
-    let default_storage = default_storage_path()?;
-    let builder = Config::builder()
+    let dirs = project_dirs()?;
+    let default_storage = dirs.data_dir().to_path_buf();
+    let mut builder = Config::builder()
         .set_default("server.listen_addr", "127.0.0.1:8080")?
         .set_default("server.rate_limit.enabled", true)?
         .set_default("server.rate_limit.window_ms", 1_000)?
@@ -186,11 +244,26 @@ pub fn load() -> Result<AppConfig, AppConfigError> {
             "storage.path",
             default_storage.to_string_lossy().to_string(),
         )?
-        .set_default("ingest.max_files", 10000)?
-        .add_source(File::with_name(CONFIG_FILE).required(false))
-        .add_source(Environment::with_prefix("ZETESIS").separator("__"));
+        .set_default("ingest.max_files", 10000)?;
 
-    let cfg = builder.build()?.try_deserialize()?;
+    for path in base_config_paths(&dirs) {
+        debug_assert!(!path.as_os_str().is_empty());
+        builder = builder.add_source(File::from(path).format(FileFormat::Toml).required(false));
+    }
+
+    if let Some(override_path) = config_override_path()? {
+        debug_assert!(!override_path.as_os_str().is_empty());
+        builder = builder.add_source(
+            File::from(override_path)
+                .format(FileFormat::Toml)
+                .required(true),
+        );
+    }
+
+    builder = builder.add_source(Environment::with_prefix("ZETESIS").separator("__"));
+
+    let cfg: AppConfig = builder.build()?.try_deserialize()?;
+    validate_config(&cfg)?;
     Ok(cfg)
 }
 
@@ -198,6 +271,181 @@ pub fn project_dirs() -> Result<ProjectDirs, AppConfigError> {
     ProjectDirs::from("dev", "ribelo", "zetesis").ok_or(AppConfigError::MissingProjectDirs)
 }
 
-fn default_storage_path() -> Result<PathBuf, AppConfigError> {
-    Ok(project_dirs()?.data_dir().to_path_buf())
+fn base_config_paths(dirs: &ProjectDirs) -> [PathBuf; 3] {
+    let etc_root = etc_config_dir();
+    debug_assert!(
+        dirs.config_dir()
+            .join("settings.toml")
+            .starts_with(dirs.config_dir())
+    );
+    [
+        etc_root.join("zetesis").join("settings.toml"),
+        dirs.config_dir().join("settings.toml"),
+        PathBuf::from(LOCAL_CONFIG_PATH),
+    ]
+}
+
+fn config_override_path() -> Result<Option<PathBuf>, AppConfigError> {
+    match env::var_os(CONFIG_OVERRIDE_ENV) {
+        None => Ok(None),
+        Some(raw) => {
+            let path = PathBuf::from(raw);
+            if path.as_os_str().is_empty() {
+                return Err(invalid_config("ZETESIS_CONFIG_FILE must not be empty"));
+            }
+            Ok(Some(path))
+        }
+    }
+}
+
+fn etc_config_dir() -> PathBuf {
+    match env::var_os(ETC_CONFIG_ENV) {
+        Some(raw) => {
+            let path = PathBuf::from(&raw);
+            if path.as_os_str().is_empty() {
+                PathBuf::from(ETC_CONFIG_DEFAULT)
+            } else {
+                path
+            }
+        }
+        None => PathBuf::from(ETC_CONFIG_DEFAULT),
+    }
+}
+
+fn validate_config(config: &AppConfig) -> Result<(), AppConfigError> {
+    validate_cors(&config.server.cors)?;
+    Ok(())
+}
+
+fn validate_cors(cors: &CorsConfig) -> Result<(), AppConfigError> {
+    debug_assert!(CORS_MAX_LIST_SIZE >= 1);
+
+    ensure_list_bounds("allow_origins", &cors.allow_origins)?;
+    ensure_list_bounds("allow_methods", &cors.allow_methods)?;
+    ensure_list_bounds("allow_headers", &cors.allow_headers)?;
+    ensure_list_bounds("expose_headers", &cors.expose_headers)?;
+
+    if cors.max_age_secs > CORS_MAX_AGE_LIMIT {
+        return Err(invalid_config(
+            "CORS max_age_secs exceeds 86400 second ceiling",
+        ));
+    }
+
+    if cors.enabled && cors.allow_origins.is_empty() {
+        return Err(invalid_config("CORS enabled but allow_origins is empty"));
+    }
+
+    if cors.enabled && cors.allow_methods.is_empty() {
+        return Err(invalid_config("CORS enabled but allow_methods is empty"));
+    }
+
+    for origin in &cors.allow_origins {
+        validate_origin(origin)?;
+    }
+
+    let mut has_options = false;
+    for method in &cors.allow_methods {
+        let parsed = parse_method(method)?;
+        if parsed == Method::OPTIONS {
+            has_options = true;
+        }
+    }
+
+    if cors.enabled && !has_options {
+        return Err(invalid_config(
+            "CORS allow_methods must include OPTIONS when enabled",
+        ));
+    }
+
+    for header in &cors.allow_headers {
+        parse_header(header)?;
+    }
+
+    for header in &cors.expose_headers {
+        parse_header(header)?;
+    }
+
+    Ok(())
+}
+
+fn ensure_list_bounds(name: &str, values: &[String]) -> Result<(), AppConfigError> {
+    debug_assert!(!name.is_empty());
+    if values.len() > CORS_MAX_LIST_SIZE {
+        return Err(invalid_config(format!(
+            "CORS {name} supports at most {CORS_MAX_LIST_SIZE} entries"
+        )));
+    }
+
+    for value in values {
+        debug_assert!(value.len() <= usize::MAX);
+        if value.is_empty() {
+            return Err(invalid_config(format!(
+                "CORS {name} entries must not be empty"
+            )));
+        }
+        if value.len() > CORS_MAX_ENTRY_LEN {
+            return Err(invalid_config(format!(
+                "CORS {name} entry `{value}` exceeds {CORS_MAX_ENTRY_LEN} characters"
+            )));
+        }
+        if value.contains('\n') {
+            return Err(invalid_config(format!(
+                "CORS {name} entry `{value}` must not contain newlines"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_origin(raw: &str) -> Result<(), AppConfigError> {
+    debug_assert!(!raw.contains('\r'));
+    let url =
+        Url::parse(raw).map_err(|_| invalid_config(format!("invalid CORS origin `{raw}`")))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(invalid_config(format!(
+                "CORS origin `{raw}` must use http or https (found {other})"
+            )));
+        }
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid_config(format!(
+            "CORS origin `{raw}` must not include userinfo"
+        )));
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        return Err(invalid_config(format!(
+            "CORS origin `{raw}` must not include path, query, or fragment"
+        )));
+    }
+    if url.host_str().is_none() {
+        return Err(invalid_config(format!(
+            "CORS origin `{raw}` must include a host"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_method(method: &str) -> Result<Method, AppConfigError> {
+    debug_assert!(method.len() <= CORS_MAX_ENTRY_LEN);
+    Method::from_bytes(method.as_bytes()).map_err(|_| {
+        invalid_config(format!(
+            "invalid HTTP method `{method}` in CORS allow_methods"
+        ))
+    })
+}
+
+fn parse_header(name: &str) -> Result<HeaderName, AppConfigError> {
+    debug_assert!(name.len() <= CORS_MAX_ENTRY_LEN);
+    HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+        invalid_config(format!(
+            "invalid HTTP header `{name}` in CORS configuration"
+        ))
+    })
+}
+
+fn invalid_config<S: Into<String>>(message: S) -> AppConfigError {
+    AppConfigError::Build(config::ConfigError::Message(message.into()))
 }

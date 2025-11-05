@@ -1,8 +1,24 @@
 # Zetesis configuration scaffold.
+# Configuration precedence (lowest to highest):
+#   1. /etc/xdg/zetesis/settings.toml (override via $ZETESIS_ETC_CONFIG_DIR for tests)
+#   2. $XDG_CONFIG_HOME/zetesis/settings.toml
+#   3. ./config/settings.toml (this file)
+#   4. File pointed to by $ZETESIS_CONFIG_FILE
+#   5. Environment variables prefixed with ZETESIS__ (use double underscore as separator)
 
 [server]
 # Address the HTTP server will bind to once implemented.
 listen_addr = "127.0.0.1:8080"
+
+[server.cors]
+# Cross-origin requests are disabled by default. Uncomment to allow trusted origins.
+# enabled = true
+# allow_origins = ["http://localhost:5173"]
+# allow_methods = ["GET", "OPTIONS"]
+# allow_headers = ["authorization", "content-type"]
+# expose_headers = []
+# allow_credentials = false
+# max_age_secs = 600
 
 [storage]
 # LMDB environment root; omit or comment to use the XDG default (`$XDG_DATA_HOME/zetesis/lmdb`).
