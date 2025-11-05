@@ -12,20 +12,16 @@ use std::{
 };
 
 use ai_ox::content::part::Part as AttachmentPart;
-use backon::ExponentialBuilder;
 use chrono::Utc;
 use futures_util::stream::{Stream, StreamExt};
-use heed::EnvOpenOptions;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use inquire::{InquireError, Text};
 use milli::Index as MilliIndex;
-use milli::score_details::ScoreDetails;
 use milli::vector::VectorStoreBackend;
 use milli::vector::db::IndexEmbeddingConfig;
-use milli::vector::embedder::{Embedder, EmbedderOptions, manual};
-use milli::{AscDesc, Filter, Search as MilliSearch, all_obkv_to_json};
+use milli::vector::embedder::EmbedderOptions;
+use milli::{Filter, Search as MilliSearch, all_obkv_to_json};
 use serde_json::Value;
-use thiserror::Error;
 use tracing_subscriber::{filter::LevelFilter, fmt};
 use uuid::Uuid;
 use zetesis_app::cli::{
@@ -37,28 +33,22 @@ use zetesis_app::cli::{
 };
 #[cfg(feature = "cli-debug")]
 use zetesis_app::cli::{DebugArgs, DebugCommands};
-use zetesis_app::constants::{DEFAULT_EMBEDDER_KEY, DEFAULT_EMBEDDING_DIM};
-use zetesis_app::index::milli::{MilliBootstrapError, ensure_index, open_existing_index};
+use zetesis_app::error::AppError;
+use zetesis_app::index::milli::{ensure_index, open_existing_index};
 use zetesis_app::ingestion::{
     KioEvent, KioSaosScraper, KioScrapeOptions, KioScraperSummary, KioUzpScraper,
 };
-use zetesis_app::pdf::{PdfRenderError, PdfTextError, extract_text_from_pdf};
+use zetesis_app::pdf::extract_text_from_pdf;
 use zetesis_app::services::{
-    EmbedBatchTask, EmbedRuntimeOptions, EmbedService, EmbeddingJob, EmbeddingJobStatus,
-    EmbeddingJobStore, EmbeddingJobStoreError, EmbeddingProviderKind, GeminiEmbedClient, Governors,
-    MilliActorHandle, OcrError, PipelineContext, PipelineError, ProviderJobState,
-    StructuredExtractError, StructuredExtractor, decision_content_hash,
-    index_structured_with_embeddings, load_structured_decision,
+    EmbedBatchTask, EmbeddingJob, EmbeddingJobStatus, EmbeddingJobStore, EmbeddingProviderKind,
+    KeywordSearchParams, MilliActorHandle, PipelineContext, PipelineError, ProviderJobState,
+    StructuredExtractor, VectorSearchParams, build_pipeline_context, decision_content_hash,
+    index_structured_with_embeddings, keyword, load_structured_decision, normalize_index_name,
+    open_index_read_only, project_value, resolve_index_dir, vector,
 };
 use zetesis_app::text::cleanup_text;
-use zetesis_app::{
-    config, ingestion,
-    paths::{AppPaths, PathError},
-    pipeline::Silo,
-    server,
-};
+use zetesis_app::{config, ingestion, paths::AppPaths, pipeline::Silo, server};
 
-const LMDB_MAP_SIZE_BYTES: usize = 1 << 30; // match index::milli default
 const DOCUMENT_PROMPT: &str =
     "Przeanalizuj załączony dokument i zwróć odpowiedź w oczekiwanym formacie JSON.";
 const MAX_INLINE_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
@@ -81,24 +71,6 @@ fn ingest_max_files_from_env() -> usize {
     match config::load() {
         Ok(cfg) => cfg.ingest.max_files,
         Err(_) => DEFAULT_MAX_INGEST_FILES,
-    }
-}
-
-impl From<milli::Error> for AppError {
-    fn from(e: milli::Error) -> Self {
-        AppError::Milli(Box::new(e))
-    }
-}
-
-impl From<heed::Error> for AppError {
-    fn from(e: heed::Error) -> Self {
-        AppError::Heed(Box::new(e))
-    }
-}
-
-impl From<EmbeddingJobStoreError> for AppError {
-    fn from(e: EmbeddingJobStoreError) -> Self {
-        AppError::Jobs(Box::new(e))
     }
 }
 
@@ -140,82 +112,6 @@ fn init_tracing(level: LevelFilter) {
     if tracing::subscriber::set_global_default(subscriber).is_err() {
         tracing::warn!("Tracing subscriber already set; skipping re-initialization.");
     }
-}
-
-#[derive(Debug, Error)]
-enum AppError {
-    #[error(transparent)]
-    ConfigLoad(#[from] config::AppConfigError),
-    #[error("configuration error: {0}")]
-    Config(String),
-    #[error("storage error: {0}")]
-    Storage(String),
-    #[error(transparent)]
-    Server(#[from] server::ServerError),
-    #[error(transparent)]
-    Ingest(#[from] ingestion::IngestorError),
-    #[error(transparent)]
-    Manifest(#[from] ingestion::ManifestError),
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
-    #[error(transparent)]
-    Pdf(#[from] PdfTextError),
-    #[error(transparent)]
-    PdfRender(#[from] PdfRenderError),
-    #[error(transparent)]
-    Ocr(#[from] OcrError),
-    #[error(transparent)]
-    Structured(#[from] StructuredExtractError),
-    #[error(transparent)]
-    Pipeline(#[from] PipelineError),
-    #[error(transparent)]
-    Paths(#[from] PathError),
-    #[error(transparent)]
-    Milli(#[from] Box<milli::Error>),
-    #[error(transparent)]
-    Heed(#[from] Box<heed::Error>),
-    #[error(transparent)]
-    MilliBootstrap(#[from] MilliBootstrapError),
-    #[error(transparent)]
-    Jobs(#[from] Box<EmbeddingJobStoreError>),
-    #[error("failed to read input file {path}: {source}")]
-    Io {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to resolve current working directory: {0}")]
-    WorkingDir(#[source] std::io::Error),
-    #[error("failed to derive document id from {path}")]
-    #[allow(dead_code)]
-    InvalidDocId { path: PathBuf },
-    #[error("invalid index name `{name}` (empty or contains path separators)")]
-    InvalidIndexName { name: String },
-    #[error("index `{index}` not found at {path}")]
-    MissingIndex { index: String, path: PathBuf },
-    #[error("backup destination already exists: {path}")]
-    BackupDestinationExists { path: PathBuf },
-    #[error("backup source `{path}` does not exist or is not a directory")]
-    BackupSourceMissing { path: PathBuf },
-    #[error("purge cancelled for index `{index}`")]
-    PurgeConfirmationCancelled { index: String },
-    #[error("confirmation token mismatch for index `{index}`")]
-    PurgeConfirmationRejected { index: String },
-    #[error("failed to read purge confirmation input: {source}")]
-    PurgePromptFailed {
-        #[source]
-        source: InquireError,
-    },
-    #[error("refusing to recover into existing index `{index}` without --force")]
-    RecoverRequiresForce { index: String },
-    #[error("document `{id}` not found in index `{index}`")]
-    DocumentNotFound { index: String, id: String },
-    #[error("embedder `{name}` not configured for index `{index}`")]
-    EmbedderNotFound { index: String, name: String },
-    #[error("embedder `{name}` in index `{index}` does not support vector search via CLI")]
-    UnsupportedEmbedder { index: String, name: String },
-    #[error("invalid sort specification `{spec}`: {reason}")]
-    InvalidSort { spec: String, reason: String },
 }
 
 async fn run(cli: Cli) -> Result<(), AppError> {
@@ -1655,137 +1551,50 @@ async fn run_db(args: DbArgs) -> Result<(), AppError> {
 }
 
 async fn search_keyword(args: KeywordSearchArgs) -> Result<(), AppError> {
-    let (_index_name, index_path) = resolve_index_dir(&args.index)?;
-    let index = open_index_read_only(&index_path)?;
-    let rtxn = index.read_txn()?;
-    let fields_map = index.fields_ids_map(&rtxn)?;
-
-    let mut search = MilliSearch::new(&rtxn, &index);
-    search.query(args.query);
-    search.offset(args.offset);
-    search.limit(args.limit);
-
-    if let Some(expr) = args
-        .filter
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        && let Some(filter) = Filter::from_str(expr)?
-    {
-        search.filter(filter);
-    }
-
-    let mut sort_rules = Vec::new();
-    for spec in &args.sort {
-        let trimmed = spec.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        match AscDesc::from_str(trimmed) {
-            Ok(rule) => sort_rules.push(rule),
-            Err(err) => {
-                drop(rtxn);
-                return Err(AppError::InvalidSort {
-                    spec: trimmed.to_string(),
-                    reason: err.to_string(),
-                });
-            }
-        }
-    }
-    if !sort_rules.is_empty() {
-        search.sort_criteria(sort_rules);
-    }
-
-    let result = search.execute()?;
-    let mut rows = Vec::with_capacity(result.documents_ids.len());
-    for (idx, docid) in result.documents_ids.iter().enumerate() {
-        let document = index.document(&rtxn, *docid)?;
-        let value = Value::Object(all_obkv_to_json(document, &fields_map)?);
-        let projected = project_value(&value, &args.fields);
-        let score = result
-            .document_scores
-            .get(idx)
-            .map(|details: &Vec<ScoreDetails>| ScoreDetails::global_score(details.iter()));
-        rows.push(build_search_row(&value, projected, score));
-    }
-    drop(rtxn);
-    emit_json_rows(&rows, args.pretty)?;
+    let KeywordSearchArgs {
+        index,
+        query,
+        filter,
+        limit,
+        offset,
+        sort,
+        fields,
+        pretty,
+    } = args;
+    let params = KeywordSearchParams {
+        index,
+        query,
+        filter,
+        sort,
+        fields,
+        limit,
+        offset,
+    };
+    let rows = keyword(&params)?;
+    emit_json_rows(&rows, pretty)?;
     Ok(())
 }
 
 async fn search_vector(args: VectorSearchArgs) -> Result<(), AppError> {
-    let embedder_key = args
-        .embedder
-        .clone()
-        .unwrap_or_else(|| DEFAULT_EMBEDDER_KEY.to_string());
-    let index_label = args.index.clone();
-    let (_index_name, index_path) = resolve_index_dir(&args.index)?;
-    let index = open_index_read_only(&index_path)?;
-    let rtxn = index.read_txn()?;
-    let fields_map = index.fields_ids_map(&rtxn)?;
-
-    let configs = index.embedding_configs().embedding_configs(&rtxn)?;
-    let config = configs
-        .iter()
-        .find(|cfg| cfg.name == embedder_key)
-        .ok_or_else(|| AppError::EmbedderNotFound {
-            index: index_label.clone(),
-            name: embedder_key.clone(),
-        })?;
-
-    let (manual_opts, quantized) = match &config.config.embedder_options {
-        EmbedderOptions::UserProvided(options) => (options.clone(), config.config.quantized()),
-        _ => {
-            drop(rtxn);
-            return Err(AppError::UnsupportedEmbedder {
-                index: index_label,
-                name: embedder_key,
-            });
-        }
+    let VectorSearchArgs {
+        index,
+        query,
+        embedder,
+        filter,
+        top_k,
+        fields,
+        pretty,
+    } = args;
+    let params = VectorSearchParams {
+        index,
+        query,
+        embedder,
+        filter,
+        fields,
+        top_k,
     };
-
-    let ctx = build_pipeline_context(&config.name)?;
-    let query_vectors = ctx.embed.embed_queries(&[args.query.as_str()]).await?;
-    let vector = query_vectors
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| vec![0.0; ctx.embed.dim]);
-    if vector.len() != manual_opts.dimensions {
-        drop(rtxn);
-        return Err(PipelineError::message(format!(
-            "embedding dimension mismatch: expected {}, got {}",
-            manual_opts.dimensions,
-            vector.len()
-        ))
-        .into());
-    }
-
-    let embedder = Arc::new(Embedder::UserProvided(manual::Embedder::new(manual_opts)));
-    let mut search = MilliSearch::new(&rtxn, &index);
-    search.limit(args.top_k);
-    if let Some(expr) = args
-        .filter
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        && let Some(filter) = Filter::from_str(expr)?
-    {
-        search.filter(filter);
-    }
-    search.semantic(config.name.clone(), embedder, quantized, Some(vector), None);
-
-    let result = search.execute()?;
-    let mut rows = Vec::with_capacity(result.documents_ids.len());
-    for (idx, docid) in result.documents_ids.iter().enumerate() {
-        let document = index.document(&rtxn, *docid)?;
-        let value = Value::Object(all_obkv_to_json(document, &fields_map)?);
-        let projected = project_value(&value, &args.fields);
-        let score = result
-            .document_scores
-            .get(idx)
-            .map(|details: &Vec<ScoreDetails>| ScoreDetails::global_score(details.iter()));
-        rows.push(build_search_row(&value, projected, score));
-    }
-    drop(rtxn);
-    emit_json_rows(&rows, args.pretty)?;
+    let rows = vector(&params).await?;
+    emit_json_rows(&rows, pretty)?;
     Ok(())
 }
 
@@ -2084,16 +1893,6 @@ fn db_recover(args: DbRecoverArgs) -> Result<(), AppError> {
     Ok(())
 }
 
-fn normalize_index_name(raw: &str) -> Result<String, AppError> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.contains('/') || trimmed.contains('\\') {
-        return Err(AppError::InvalidIndexName {
-            name: raw.to_string(),
-        });
-    }
-    Ok(trimmed.to_ascii_lowercase())
-}
-
 fn io_error(path: &Path, source: std::io::Error) -> AppError {
     AppError::Io {
         path: path.to_path_buf(),
@@ -2145,20 +1944,6 @@ fn copy_directory(src: &Path, dst: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-fn resolve_index_dir(raw: &str) -> Result<(String, PathBuf), AppError> {
-    let name = normalize_index_name(raw)?;
-    let paths = AppPaths::from_project_dirs()?;
-    let base = paths.milli_base_dir()?;
-    let path = base.join(&name);
-    if !path.is_dir() {
-        return Err(AppError::MissingIndex {
-            index: name.clone(),
-            path,
-        });
-    }
-    Ok((name, path))
-}
-
 fn emit_json_value(value: &Value, pretty: bool) -> Result<(), AppError> {
     if pretty {
         println!("{}", serde_json::to_string_pretty(value)?);
@@ -2180,75 +1965,6 @@ fn emit_json_rows(rows: &[Value], pretty: bool) -> Result<(), AppError> {
     Ok(())
 }
 
-fn project_value(source: &Value, fields: &[String]) -> Value {
-    if fields.is_empty() {
-        return source.clone();
-    }
-
-    let mut projected = serde_json::Map::new();
-    for field in fields {
-        let key = field.trim();
-        if key.is_empty() {
-            continue;
-        }
-        if let Some(value) = extract_path(source, key) {
-            projected.insert(key.to_string(), value);
-        }
-    }
-    Value::Object(projected)
-}
-
-fn extract_path(value: &Value, path: &str) -> Option<Value> {
-    let mut current = value;
-    for segment in path.split('.') {
-        let key = segment.trim();
-        if key.is_empty() {
-            return None;
-        }
-        match current {
-            Value::Object(map) => current = map.get(key)?,
-            Value::Array(items) => {
-                let index = key.parse::<usize>().ok()?;
-                current = items.get(index)?;
-            }
-            _ => return None,
-        }
-    }
-    Some(current.clone())
-}
-
-fn number_value(value: f64) -> Option<Value> {
-    if !value.is_finite() {
-        return None;
-    }
-    serde_json::Number::from_f64(value).map(Value::Number)
-}
-
-fn build_search_row(original: &Value, projected: Value, score: Option<f64>) -> Value {
-    let mut map = match projected {
-        Value::Object(map) => map,
-        other => {
-            let mut base = serde_json::Map::new();
-            base.insert("value".to_string(), other);
-            base
-        }
-    };
-
-    if let Some(source) = original.as_object() {
-        for key in ["id", "doc_type", "doc_id"] {
-            if let Some(value) = source.get(key) {
-                map.entry(key.to_string()).or_insert_with(|| value.clone());
-            }
-        }
-    }
-
-    if let Some(value) = score.and_then(number_value) {
-        map.insert("score".to_string(), value);
-    }
-
-    Value::Object(map)
-}
-
 fn human_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
@@ -2262,12 +1978,6 @@ fn human_size(bytes: u64) -> String {
     } else {
         format!("{value:.2} {}", UNITS[unit])
     }
-}
-
-fn open_index_read_only(path: &Path) -> Result<MilliIndex, AppError> {
-    let mut env_opts = EnvOpenOptions::new().read_txn_without_tls();
-    env_opts.map_size(LMDB_MAP_SIZE_BYTES);
-    MilliIndex::new(env_opts, path, false).map_err(AppError::from)
 }
 
 fn describe_embedder(cfg: &IndexEmbeddingConfig) -> String {
@@ -2339,44 +2049,6 @@ fn summarize_documents(
         summary.record(doc_type);
     }
     Ok(summary)
-}
-
-fn build_pipeline_context(embed_model: &str) -> Result<PipelineContext, PipelineError> {
-    debug_assert!(!embed_model.is_empty());
-
-    let paths = AppPaths::from_project_dirs()?;
-    let embed_quota =
-        governor::Quota::per_second(std::num::NonZeroU32::new(8).expect("quota must be non-zero"));
-    let embed_limiter = Arc::new(governor::RateLimiter::direct(embed_quota));
-    let runtime = EmbedRuntimeOptions::default();
-    let client = Arc::new(GeminiEmbedClient::from_env(
-        embed_model.to_string(),
-        DEFAULT_EMBEDDING_DIM,
-        Some(embed_limiter.clone()),
-        runtime.max_batch,
-    )?);
-    let job_store = EmbeddingJobStore::open(&paths)?;
-    let embed_client: Arc<dyn zetesis_app::services::EmbedClient> = client.clone();
-    let job_provider: Arc<dyn zetesis_app::services::EmbeddingJobClient> = client.clone();
-    let embed = EmbedService {
-        embedder_key: embed_model.to_string(),
-        dim: DEFAULT_EMBEDDING_DIM,
-        client: embed_client,
-        job_client: Some(job_provider),
-        runtime,
-    };
-    let jobs = Arc::new(job_store);
-
-    Ok(PipelineContext {
-        paths,
-        embed,
-        jobs,
-        backoff: ExponentialBuilder::default(),
-        governors: Governors {
-            io: None,
-            embed: Some(embed_limiter),
-        },
-    })
 }
 
 fn doc_id_from_bytes(bytes: &[u8]) -> String {
