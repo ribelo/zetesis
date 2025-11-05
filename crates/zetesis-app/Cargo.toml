@@ -69,6 +69,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 tower-http = { version = "0.5", features = ["trace", "request-id", "cors"] }
 aws-config = { version = "1.5", optional = true }
 aws-sdk-s3 = { version = "1.69", optional = true }
+moka = { version = "0.12", features = ["future"] }
 
 [dev-dependencies]
 serde_yaml = "0.9"

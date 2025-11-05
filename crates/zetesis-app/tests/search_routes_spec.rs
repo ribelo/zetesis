@@ -108,3 +108,86 @@ async fn vector_missing_embedder_defaults() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     set_data_dir_override(None);
 }
+
+#[tokio::test]
+async fn typeahead_short_query_returns_400() {
+    let _lock = test_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    set_data_dir_override(None);
+
+    let app = build_api_router();
+    let request = Request::builder()
+        .method("GET")
+        .uri("/v1/search/typeahead?index=kio&q=a")
+        .body(Body::empty())
+        .expect("request builder must not fail");
+
+    let response = app.oneshot(request).await.expect("handler should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body_bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body must be collected")
+        .to_bytes();
+    let body_text = std::str::from_utf8(body_bytes.as_ref()).unwrap_or("<non-utf8>");
+    let value: Value = serde_json::from_slice(body_bytes.as_ref())
+        .unwrap_or_else(|err| panic!("invalid json: {err}; body={body_text}"));
+    assert_eq!(value["error"], json!("invalid_parameter"));
+    assert_eq!(value["field"], json!("q"));
+    set_data_dir_override(None);
+}
+
+#[tokio::test]
+async fn typeahead_limit_over_10_returns_400() {
+    let _lock = test_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    set_data_dir_override(None);
+
+    let app = build_api_router();
+    let request = Request::builder()
+        .method("GET")
+        .uri("/v1/search/typeahead?index=kio&q=abcd&limit=11")
+        .body(Body::empty())
+        .expect("request builder must not fail");
+
+    let response = app.oneshot(request).await.expect("handler should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body_bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body must be collected")
+        .to_bytes();
+    let body_text = std::str::from_utf8(body_bytes.as_ref()).unwrap_or("<non-utf8>");
+    let value: Value = serde_json::from_slice(body_bytes.as_ref())
+        .unwrap_or_else(|err| panic!("invalid json: {err}; body={body_text}"));
+    assert_eq!(value["error"], json!("invalid_parameter"));
+    assert_eq!(value["field"], json!("limit"));
+    set_data_dir_override(None);
+}
+
+#[tokio::test]
+async fn typeahead_missing_index_returns_404() {
+    let _lock = test_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp_dir = TempDir::new().expect("tempdir must be created");
+    set_data_dir_override(Some(temp_dir.path().to_path_buf()));
+
+    let app = build_api_router();
+    let request = Request::builder()
+        .method("GET")
+        .uri("/v1/search/typeahead?index=kio&q=abcd&limit=3")
+        .body(Body::empty())
+        .expect("request builder must not fail");
+
+    let response = app.oneshot(request).await.expect("handler should respond");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    set_data_dir_override(None);
+}

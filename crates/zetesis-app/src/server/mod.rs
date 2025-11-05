@@ -4,7 +4,7 @@ use std::{
     collections::HashSet,
     future::Future,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -19,6 +19,7 @@ use axum::{
 };
 use governor::clock::Clock;
 use governor::{DefaultKeyedRateLimiter, Quota, clock::DefaultClock};
+use moka::future::Cache;
 use serde::{Deserialize, Serialize, de::Deserializer};
 use serde_json::Value;
 use std::num::NonZeroU32;
@@ -38,17 +39,30 @@ use crate::services::{KeywordSearchParams, VectorSearchParams, keyword, vector};
 const HEALTHZ_PATH: &str = "/v1/healthz";
 const KEYWORD_PATH: &str = "/v1/search/keyword";
 const VECTOR_PATH: &str = "/v1/search/vector";
+const TYPEAHEAD_PATH: &str = "/v1/search/typeahead";
 const HEALTHZ_STATUS: &str = "ok";
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FIELD_COUNT: usize = 64;
 const MAX_SORT_COUNT: usize = 8;
 const MAX_FIELD_LEN: usize = 128;
+const TYPEAHEAD_FIELD_WHITELIST: [&str; 5] =
+    ["id", "doc_id", "decision_date", "summary_short", "section"];
+const TYPEAHEAD_CACHE_CAPACITY: u64 = 10_000;
+const TYPEAHEAD_CACHE_TTL: Duration = Duration::from_secs(2);
+const TYPEAHEAD_LIMIT_DEFAULT: usize = 10;
+const TYPEAHEAD_LIMIT_MAX: usize = 10;
+const TYPEAHEAD_MIN_QUERY_LEN: usize = 2;
 const ERROR_INVALID_PARAMETER: &str = "invalid_parameter";
 const ERROR_NOT_FOUND: &str = "not_found";
 const ERROR_METHOD_NOT_ALLOWED: &str = "method_not_allowed";
 const ERROR_RATE_LIMITED: &str = "rate_limited";
 const ERROR_INTERNAL: &str = "internal_server_error";
 const REQUEST_ID_HEADER: &str = "x-request-id";
+const CACHE_HEADER_NAME: &str = "x-cache";
+const CACHE_HIT_VALUE: &str = "hit";
+const CACHE_MISS_VALUE: &str = "miss";
+
+static TYPEAHEAD_FIELDS_VEC: OnceLock<Vec<String>> = OnceLock::new();
 
 #[derive(Debug, Serialize, Copy, Clone, PartialEq, Eq)]
 struct HealthzResponse {
@@ -88,6 +102,44 @@ struct VectorQuery {
     top_k: usize,
     #[serde(default, deserialize_with = "deserialize_string_list")]
     fields: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TypeaheadQuery {
+    index: String,
+    #[serde(rename = "q")]
+    query: String,
+    filter: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct TypeaheadParams {
+    index: String,
+    query: String,
+    normalized_query: String,
+    filter: Option<String>,
+    limit: usize,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct TypeaheadCacheKey {
+    index: String,
+    query: String,
+    filter: Option<String>,
+    limit: usize,
+}
+
+#[derive(Clone)]
+struct TypeaheadState {
+    cache: Cache<TypeaheadCacheKey, Arc<Vec<Value>>>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TypeaheadCacheStatus {
+    Hit,
+    Miss,
 }
 
 #[derive(Debug, Serialize)]
@@ -144,6 +196,7 @@ pub enum ServerError {
 struct RateLimitState {
     keyword: Arc<DefaultKeyedRateLimiter<String>>,
     vector: Arc<DefaultKeyedRateLimiter<String>>,
+    typeahead: Arc<DefaultKeyedRateLimiter<String>>,
     window_ms: u64,
     proxy_mode: crate::config::ProxyMode,
     trusted: Arc<HashSet<IpAddr>>,
@@ -152,12 +205,15 @@ struct RateLimitState {
 impl RateLimitState {
     fn try_new(cfg: &RateLimitConfig) -> Result<Arc<Self>, ServerError> {
         debug_assert!(cfg.window_ms.get() > 0);
+        debug_assert!(cfg.keyword.max_requests.get() > 0);
         let window_ms = cfg.window_ms.get();
         let kw = build_keyed_limiter(&cfg.keyword, window_ms);
         let vec = build_keyed_limiter(&cfg.vector, window_ms);
+        let ta = build_keyed_limiter(&cfg.typeahead, window_ms);
         Ok(Arc::new(Self {
             keyword: Arc::new(kw),
             vector: Arc::new(vec),
+            typeahead: Arc::new(ta),
             window_ms,
             proxy_mode: cfg.proxy_mode,
             trusted: Arc::new(cfg.trusted_proxies.iter().copied().collect()),
@@ -195,21 +251,17 @@ async fn rate_limit_middleware(
 
     let ip = extract_client_ip(&req, state.proxy_mode, state.trusted.as_ref())
         .unwrap_or_else(|| IpAddr::from([0, 0, 0, 0]));
-    let bucket = if path == KEYWORD_PATH {
-        "keyword"
+    let (bucket, limiter) = if path == KEYWORD_PATH {
+        ("keyword", &state.keyword)
     } else if path == VECTOR_PATH {
-        "vector"
+        ("vector", &state.vector)
+    } else if path == TYPEAHEAD_PATH {
+        ("typeahead", &state.typeahead)
     } else {
         // For any unknown route, apply no limiter here; fallback will render 404.
         return next.run(req).await;
     };
     let key = format!("{bucket}:{ip}");
-
-    let limiter = if bucket == "keyword" {
-        &state.keyword
-    } else {
-        &state.vector
-    };
 
     match limiter.check_key(&key) {
         Ok(()) => next.run(req).await,
@@ -353,6 +405,113 @@ impl VectorQuery {
     }
 }
 
+impl TypeaheadQuery {
+    fn into_params(self) -> Result<TypeaheadParams, ApiError> {
+        debug_assert!(TYPEAHEAD_MIN_QUERY_LEN >= 1);
+        debug_assert!(TYPEAHEAD_LIMIT_DEFAULT <= TYPEAHEAD_LIMIT_MAX);
+        let TypeaheadQuery {
+            index,
+            query,
+            filter,
+            limit,
+        } = self;
+        let index = trim_non_empty("index", index)?;
+        let query = trim_non_empty("q", query)?;
+        ensure_min_length("q", &query, TYPEAHEAD_MIN_QUERY_LEN)?;
+        let filter = sanitize_optional(filter);
+        let limit = limit.unwrap_or(TYPEAHEAD_LIMIT_DEFAULT);
+        ensure_range("limit", limit, 1, TYPEAHEAD_LIMIT_MAX)?;
+        let normalized_query = normalize_typeahead_query(&query);
+        Ok(TypeaheadParams {
+            index,
+            query,
+            normalized_query,
+            filter,
+            limit,
+        })
+    }
+}
+
+impl TypeaheadParams {
+    fn cache_key(&self) -> TypeaheadCacheKey {
+        debug_assert!(!self.index.is_empty());
+        debug_assert!(self.limit <= TYPEAHEAD_LIMIT_MAX);
+        TypeaheadCacheKey::new(
+            &self.index,
+            &self.normalized_query,
+            self.filter.as_deref(),
+            self.limit,
+        )
+    }
+
+    fn to_keyword_params(&self) -> KeywordSearchParams {
+        debug_assert!(self.limit <= TYPEAHEAD_LIMIT_MAX);
+        debug_assert!(self.normalized_query.len() >= TYPEAHEAD_MIN_QUERY_LEN);
+        KeywordSearchParams {
+            index: self.index.clone(),
+            query: self.query.clone(),
+            filter: self.filter.clone(),
+            sort: Vec::new(),
+            fields: typeahead_fields().clone(),
+            limit: self.limit,
+            offset: 0,
+        }
+    }
+}
+
+impl TypeaheadCacheKey {
+    fn new(index: &str, normalized_query: &str, filter: Option<&str>, limit: usize) -> Self {
+        debug_assert!(!index.trim().is_empty());
+        debug_assert!(!normalized_query.is_empty());
+        debug_assert!(limit > 0);
+        Self {
+            index: index.to_string(),
+            query: normalized_query.to_string(),
+            filter: filter.map(|value| value.to_string()),
+            limit,
+        }
+    }
+}
+
+impl TypeaheadState {
+    fn new() -> Self {
+        debug_assert!(TYPEAHEAD_CACHE_CAPACITY > 0);
+        debug_assert!(TYPEAHEAD_CACHE_TTL >= Duration::from_secs(1));
+        let cache = Cache::builder()
+            .max_capacity(TYPEAHEAD_CACHE_CAPACITY)
+            .time_to_live(TYPEAHEAD_CACHE_TTL)
+            .build();
+        Self { cache }
+    }
+
+    async fn lookup(
+        &self,
+        key: TypeaheadCacheKey,
+        params: &TypeaheadParams,
+    ) -> Result<(Arc<Vec<Value>>, TypeaheadCacheStatus), ApiError> {
+        debug_assert!(params.limit <= TYPEAHEAD_LIMIT_MAX);
+        debug_assert!(params.normalized_query.len() >= TYPEAHEAD_MIN_QUERY_LEN);
+
+        if let Some(rows) = self.cache.get(&key).await {
+            return Ok((rows, TypeaheadCacheStatus::Hit));
+        }
+
+        let keyword_params = params.to_keyword_params();
+        let loader = async move {
+            let rows = keyword(&keyword_params).map_err(ApiError::from)?;
+            Ok::<Arc<Vec<Value>>, ApiError>(Arc::new(rows))
+        };
+
+        match self.cache.try_get_with(key, loader).await {
+            Ok(rows) => Ok((rows, TypeaheadCacheStatus::Miss)),
+            Err(error) => {
+                let owned = Arc::try_unwrap(error).unwrap_or_else(|_| ApiError::internal());
+                Err(owned)
+            }
+        }
+    }
+}
+
 impl ApiError {
     fn new(status: StatusCode, error: &'static str, message: impl Into<String>) -> Self {
         ApiError {
@@ -491,6 +650,58 @@ fn sanitize_optional(value: Option<String>) -> Option<String> {
             Some(trimmed.to_string())
         }
     })
+}
+
+fn typeahead_fields() -> &'static Vec<String> {
+    TYPEAHEAD_FIELDS_VEC.get_or_init(|| {
+        TYPEAHEAD_FIELD_WHITELIST
+            .iter()
+            .map(|value| value.to_string())
+            .collect()
+    })
+}
+
+fn ensure_min_length(field: &str, value: &str, min: usize) -> Result<(), ApiError> {
+    debug_assert!(!field.is_empty());
+    debug_assert!(min >= 1);
+    if value.chars().count() < min {
+        return Err(ApiError::invalid_param(
+            field,
+            format!("must include at least {min} characters"),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_typeahead_query(value: &str) -> String {
+    debug_assert!(!value.trim().is_empty());
+    debug_assert!(TYPEAHEAD_MIN_QUERY_LEN >= 1);
+    let mut normalized = String::with_capacity(value.len());
+    let mut pending_space = false;
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && !normalized.is_empty() {
+            normalized.push(' ');
+            pending_space = false;
+        }
+        normalized.extend(ch.to_lowercase());
+    }
+    if normalized.ends_with(' ') {
+        normalized.pop();
+    }
+    normalized
+}
+
+fn take_arc_vec(rows: Arc<Vec<Value>>) -> Vec<Value> {
+    debug_assert!(rows.len() <= TYPEAHEAD_LIMIT_MAX);
+    debug_assert!(TYPEAHEAD_LIMIT_MAX <= 64);
+    match Arc::try_unwrap(rows) {
+        Ok(vec) => vec,
+        Err(shared) => shared.as_ref().clone(),
+    }
 }
 
 fn deserialize_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -808,6 +1019,9 @@ mod tests {
 pub fn build_api_router() -> Router {
     debug_assert!(HEALTHZ_PATH.starts_with("/v1/"));
     debug_assert!(HEALTHZ_PATH.ends_with("healthz"));
+    debug_assert!(TYPEAHEAD_LIMIT_DEFAULT <= TYPEAHEAD_LIMIT_MAX);
+
+    let typeahead_state = Arc::new(TypeaheadState::new());
 
     Router::new()
         .route(
@@ -821,6 +1035,12 @@ pub fn build_api_router() -> Router {
         .route(
             VECTOR_PATH,
             get(vector_search).fallback(method_not_allowed_handler),
+        )
+        .route(
+            TYPEAHEAD_PATH,
+            get(typeahead_search)
+                .with_state(typeahead_state)
+                .fallback(method_not_allowed_handler),
         )
 }
 
@@ -988,6 +1208,27 @@ fn build_cors_layer(config: &CorsConfig) -> Result<CorsLayer, ServerError> {
     }
 
     Ok(cors)
+}
+
+async fn typeahead_search(
+    State(state): State<Arc<TypeaheadState>>,
+    Query(query): Query<TypeaheadQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    debug_assert!(!TYPEAHEAD_PATH.is_empty());
+    debug_assert!(TYPEAHEAD_LIMIT_MAX >= TYPEAHEAD_MIN_QUERY_LEN);
+    let params = query.into_params()?;
+    let key = params.cache_key();
+    let (rows, status) = state.lookup(key, &params).await?;
+    let payload = take_arc_vec(rows);
+    let mut response = Json(payload).into_response();
+    let headers = response.headers_mut();
+    let name = HeaderName::from_static(CACHE_HEADER_NAME);
+    let value = match status {
+        TypeaheadCacheStatus::Hit => HeaderValue::from_static(CACHE_HIT_VALUE),
+        TypeaheadCacheStatus::Miss => HeaderValue::from_static(CACHE_MISS_VALUE),
+    };
+    headers.insert(name, value);
+    Ok(response)
 }
 
 async fn keyword_search(Query(query): Query<KeywordQuery>) -> Result<Json<Vec<Value>>, ApiError> {

@@ -56,6 +56,8 @@ pub struct RateLimitConfig {
     pub keyword: RouteLimitConfig,
     #[serde(default = "RateLimitConfig::default_vector_limit")]
     pub vector: RouteLimitConfig,
+    #[serde(default = "RateLimitConfig::default_typeahead_limit")]
+    pub typeahead: RouteLimitConfig,
     #[serde(default)]
     pub proxy_mode: ProxyMode,
     #[serde(default)]
@@ -77,6 +79,10 @@ impl RateLimitConfig {
 
     fn default_vector_limit() -> RouteLimitConfig {
         RouteLimitConfig::vector_defaults()
+    }
+
+    fn default_typeahead_limit() -> RouteLimitConfig {
+        RouteLimitConfig::typeahead_defaults()
     }
 }
 
@@ -133,6 +139,7 @@ impl Default for RateLimitConfig {
             window_ms: Self::default_window_ms(),
             keyword: Self::default_keyword_limit(),
             vector: Self::default_vector_limit(),
+            typeahead: Self::default_typeahead_limit(),
             proxy_mode: ProxyMode::Off,
             trusted_proxies: Vec::new(),
         }
@@ -167,6 +174,13 @@ impl RouteLimitConfig {
         Self {
             max_requests: NonZeroU32::new(3).expect("vector default must be non-zero"),
             burst: NonZeroU32::new(6).expect("vector burst must be non-zero"),
+        }
+    }
+
+    fn typeahead_defaults() -> Self {
+        Self {
+            max_requests: NonZeroU32::new(20).expect("typeahead default must be non-zero"),
+            burst: NonZeroU32::new(40).expect("typeahead burst must be non-zero"),
         }
     }
 }
