@@ -1,6 +1,10 @@
 //! Configuration loading and XDG path helpers.
 
-use std::path::PathBuf;
+use std::{
+    net::IpAddr,
+    num::{NonZeroU32, NonZeroU64},
+    path::PathBuf,
+};
 
 use config::{Config, Environment, File};
 use directories::ProjectDirs;
@@ -27,6 +31,101 @@ pub struct AppConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
     pub listen_addr: String,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RateLimitConfig {
+    #[serde(default = "RateLimitConfig::default_enabled")]
+    pub enabled: bool,
+    #[serde(default = "RateLimitConfig::default_window_ms")]
+    pub window_ms: NonZeroU64,
+    #[serde(default = "RateLimitConfig::default_keyword_limit")]
+    pub keyword: RouteLimitConfig,
+    #[serde(default = "RateLimitConfig::default_vector_limit")]
+    pub vector: RouteLimitConfig,
+    #[serde(default)]
+    pub proxy_mode: ProxyMode,
+    #[serde(default)]
+    pub trusted_proxies: Vec<IpAddr>,
+}
+
+impl RateLimitConfig {
+    fn default_enabled() -> bool {
+        true
+    }
+
+    fn default_window_ms() -> NonZeroU64 {
+        NonZeroU64::new(1_000).expect("non-zero window defaults to 1000ms")
+    }
+
+    fn default_keyword_limit() -> RouteLimitConfig {
+        RouteLimitConfig::keyword_defaults()
+    }
+
+    fn default_vector_limit() -> RouteLimitConfig {
+        RouteLimitConfig::vector_defaults()
+    }
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: Self::default_enabled(),
+            window_ms: Self::default_window_ms(),
+            keyword: Self::default_keyword_limit(),
+            vector: Self::default_vector_limit(),
+            proxy_mode: ProxyMode::Off,
+            trusted_proxies: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RouteLimitConfig {
+    #[serde(default = "RouteLimitConfig::default_requests")]
+    pub max_requests: NonZeroU32,
+    #[serde(default = "RouteLimitConfig::default_burst")]
+    pub burst: NonZeroU32,
+}
+
+impl RouteLimitConfig {
+    fn default_requests() -> NonZeroU32 {
+        NonZeroU32::new(1).expect("default requests bound must be non-zero")
+    }
+
+    fn default_burst() -> NonZeroU32 {
+        NonZeroU32::new(1).expect("default burst bound must be non-zero")
+    }
+
+    fn keyword_defaults() -> Self {
+        Self {
+            max_requests: NonZeroU32::new(10).expect("keyword default must be non-zero"),
+            burst: NonZeroU32::new(20).expect("keyword burst must be non-zero"),
+        }
+    }
+
+    fn vector_defaults() -> Self {
+        Self {
+            max_requests: NonZeroU32::new(3).expect("vector default must be non-zero"),
+            burst: NonZeroU32::new(6).expect("vector burst must be non-zero"),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyMode {
+    Off,
+    XForwardedFor,
+    Forwarded,
+}
+
+impl Default for ProxyMode {
+    fn default() -> Self {
+        ProxyMode::Off
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -74,6 +173,14 @@ pub fn load() -> Result<AppConfig, AppConfigError> {
     let default_storage = default_storage_path()?;
     let builder = Config::builder()
         .set_default("server.listen_addr", "127.0.0.1:8080")?
+        .set_default("server.rate_limit.enabled", true)?
+        .set_default("server.rate_limit.window_ms", 1_000)?
+        .set_default("server.rate_limit.keyword.max_requests", 10)?
+        .set_default("server.rate_limit.keyword.burst", 20)?
+        .set_default("server.rate_limit.vector.max_requests", 3)?
+        .set_default("server.rate_limit.vector.burst", 6)?
+        .set_default("server.rate_limit.proxy_mode", "off")?
+        .set_default("server.rate_limit.trusted_proxies", Vec::<String>::new())?
         .set_default("storage.backend", "fs")?
         .set_default(
             "storage.path",
