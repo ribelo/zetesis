@@ -135,7 +135,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let manifest_path = temp.path().join("manifest.ndjson");
 
-        let mut writer = ManifestWriter::open(&manifest_path).await.unwrap();
+        let writer = ManifestWriter::open(&manifest_path).await.unwrap();
         assert_eq!(writer.path(), manifest_path);
 
         writer.close().await.unwrap();
