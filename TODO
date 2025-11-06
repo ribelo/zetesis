@@ -39,7 +39,7 @@ Legend: [ ] = open · [~] = in progress · [x] = done
 - [x] T11: Add `/v1/search/keyword` and `/v1/search/vector` endpoints mirroring CLI options; reuse index/search code paths (P1) (covers REQ-ZE-INDEX-SEARCHABLE) — Completed 2025-11-06: shared search service, HTTP validation, regression tests for 400/404 cases
 - [x] T12: Logging, rate limits, and error mapping to structured JSON (P1) (covers REQ-ZE-LOGS, REQ-ZE-ASSERTS)
 - [x] T13: Config load from env/files; XDG-aware paths; CORS off by default (P2) — Completed 2025-11-07: Added TOML-only precedence, env overrides, and configurable CORS defaults
-- [ ] T14: Typeahead-optimized keyword endpoint: small fields, limit ≤ 10, p95 ≤ 100 ms; per-IP rate limit and 2s LRU cache (P0) (covers REQ-ZE-UI-TYPEAHEAD)
+- [x] T14: Typeahead-optimized keyword endpoint: small fields, limit ≤ 10, p95 ≤ 100 ms; per-IP rate limit and 2s LRU cache (P0) (covers REQ-ZE-UI-TYPEAHEAD)
 
 ## WP-UI — Dioxus 0.7 (SSR + Islands)
 - [ ] T15: Minimal SSR route `/ui/hello` rendered by Dioxus 0.7; CI check for gzipped bundle ≤ 150 KiB (P0) (covers REQ-ZE-UI-DIOXUS)
@@ -55,8 +55,8 @@ Legend: [ ] = open · [~] = in progress · [x] = done
 - [ ] T23: API key path for programmatic clients (scoped routes, disabled by default) (P1) (covers REQ-ZE-AUTH-API-KEY)
 
 ## WP-INGEST — Ingestion Pipeline
-- [ ] T24: Route KIO/SAOS downloaded PDFs to blob store via `AppPaths::blob_path` (content-addressed) and store CID reference (P0) (covers REQ-ZE-STORAGE-FS, REQ-ZE-ID-CANONICAL)
-- [ ] T25: Add end-to-end ingest test that indexes a tiny PDF fixture and verifies `doc` + `chunk` shapes (P1) (covers REQ-ZE-INDEX-IDEMPOTENT, REQ-ZE-INDEX-FIELDS)
+- [x] T24: Route KIO/SAOS downloaded PDFs to blob store via `AppPaths::blob_path` (content-addressed) and store CID reference (P0) (covers REQ-ZE-STORAGE-FS, REQ-ZE-ID-CANONICAL) — Completed 2025-11-07: Removed redundant NDJSON manifest; CID is canonical doc_id; both UZP and SAOS flow verified via E2E tests
+- [x] T25: Add end-to-end ingest test that indexes a tiny PDF fixture and verifies `doc` + `chunk` shapes (P1) (covers REQ-ZE-INDEX-IDEMPOTENT, REQ-ZE-INDEX-FIELDS) — Completed 2025-11-07: Added tests/ingest_e2e.rs with StructuredDecision indexing, precomputed embeddings, and idempotency verification
 
 ## WP-INDEX — Milli Configuration
 - [ ] T26: Property test for index bootstrap: searchable/filterable/sortable sets equal SPEC; primary key=`id`; Hannoy backend; embedder dims (P1) (covers REQ-ZE-INDEX-EMBEDDER, REQ-ZE-INDEX-SEARCHABLE, REQ-ZE-INDEX-FILTERABLE, REQ-ZE-INDEX-SORTABLE)
