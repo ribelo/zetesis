@@ -120,13 +120,18 @@ pub enum KioEvent {
         doc_id: String,
     },
     BlobStored {
-        doc_id: String,
+        /// Content-addressed identifier (BLAKE3 hash). This is the canonical doc_id.
         cid: String,
+        /// Upstream KIO identifier for metadata/logging only.
+        upstream_id: String,
         bytes: usize,
         existed: bool,
     },
     BlobSkipped {
-        doc_id: String,
+        /// Content-addressed identifier. For skipped blobs, this is the CID from head check.
+        cid: String,
+        /// Upstream KIO identifier for metadata/logging only.
+        upstream_id: String,
     },
     Completed {
         summary: KioScraperSummary,

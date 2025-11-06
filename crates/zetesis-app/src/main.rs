@@ -241,16 +241,8 @@ async fn run_fetch_kio(args: FetchKioArgs, verbosity: u8) -> Result<(), AppError
         .maybe_limit(args.limit)
         .build();
 
-    // Open manifest writer for recording {doc_id → cid} mappings
-    let manifest_path = AppPaths::new(&cfg.storage.path)?
-        .data_dir()
-        .join("kio_blob_manifest.ndjson");
-    let manifest = ingestion::ManifestWriter::open(&manifest_path).await?;
-    tracing::debug!(path = %manifest_path.display(), "opened blob manifest");
-
     let progress = (verbosity == 0).then_some(make_progress_bar());
-    let mut tracker = ProgressTracker::new(progress.clone(), args.limit.map(|l| l as u64))
-        .with_manifest(manifest);
+    let mut tracker = ProgressTracker::new(progress.clone(), args.limit.map(|l| l as u64));
     let summary = match args.source {
         KioSource::Uzp => {
             let scraper = KioUzpScraper::new(&base_url)?;
@@ -742,7 +734,6 @@ struct ProgressTracker {
     target_limit: Option<u64>,
     pb_len_set: bool,
     completed: u64,
-    manifest: Option<ingestion::ManifestWriter>,
 }
 
 impl ProgressTracker {
@@ -752,13 +743,7 @@ impl ProgressTracker {
             target_limit,
             pb_len_set: false,
             completed: 0,
-            manifest: None,
         }
-    }
-
-    fn with_manifest(mut self, manifest: ingestion::ManifestWriter) -> Self {
-        self.manifest = Some(manifest);
-        self
     }
 
     fn has_progress_bar(&self) -> bool {
@@ -806,48 +791,40 @@ impl ProgressTracker {
                     tracing::debug!(worker, doc_id = %doc_id, "worker picked up document");
                 }
             }
-            KioEvent::BlobSkipped { doc_id } => {
+            KioEvent::BlobSkipped { cid, upstream_id } => {
                 self.bump_position();
                 if let Some(pb) = self.progress.as_ref() {
-                    pb.set_message(format!("cached {doc_id}"));
+                    pb.set_message(format!("cached {} (cid: {})", upstream_id, &cid[..8]));
                 } else {
-                    tracing::info!(doc_id = %doc_id, "document already cached");
+                    tracing::info!(
+                        cid = %cid,
+                        upstream_id = %upstream_id,
+                        "document already cached"
+                    );
                 }
             }
             KioEvent::BlobStored {
-                doc_id,
                 cid,
+                upstream_id,
                 bytes,
                 existed,
             } => {
                 self.bump_position();
 
-                // Write manifest entry
-                if let Some(manifest) = self.manifest.as_mut() {
-                    let entry = ingestion::ManifestEntry::new(doc_id.clone(), cid.clone(), bytes);
-                    if let Err(e) = manifest.write(&entry).await {
-                        tracing::warn!(
-                            doc_id = %doc_id,
-                            cid = %cid,
-                            error = %e,
-                            "failed to write manifest entry"
-                        );
-                    }
-                }
-
                 if let Some(pb) = self.progress.as_ref() {
                     if existed {
-                        pb.set_message(format!("cached {doc_id} (cid: {})", &cid[..8]));
+                        pb.set_message(format!("cached {} (cid: {})", upstream_id, &cid[..8]));
                     } else {
                         pb.set_message(format!(
-                            "stored {doc_id} ({bytes} bytes, cid: {})",
+                            "stored {} ({bytes} bytes, cid: {})",
+                            upstream_id,
                             &cid[..8]
                         ));
                     }
                 } else {
                     tracing::info!(
-                        doc_id = %doc_id,
                         cid = %cid,
+                        upstream_id = %upstream_id,
                         bytes,
                         existed,
                         "stored blob"

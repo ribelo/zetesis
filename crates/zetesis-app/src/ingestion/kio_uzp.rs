@@ -638,7 +638,10 @@ enum ProcessOutcome {
         bytes: usize,
         existed: bool,
     },
-    Skipped,
+    #[allow(dead_code)]
+    Skipped {
+        cid: String,
+    },
 }
 
 fn spawn_workers(
@@ -732,7 +735,7 @@ async fn process_worker_task(
                 silo = SILO_SLUG,
                 stage = "worker_done",
                 worker = worker_idx,
-                doc_id = %doc_id,
+                upstream_id = %doc_id,
                 cid = %cid,
                 bytes,
                 existed,
@@ -741,8 +744,8 @@ async fn process_worker_task(
             send_event(
                 &stats.event_tx,
                 KioEvent::BlobStored {
-                    doc_id,
-                    cid,
+                    cid: cid.clone(),
+                    upstream_id: doc_id.clone(),
                     bytes,
                     existed,
                 },
@@ -750,9 +753,12 @@ async fn process_worker_task(
             .await?;
             Ok(())
         }
-        Ok(ProcessOutcome::Skipped) => {
+        Ok(ProcessOutcome::Skipped { cid }) => {
             stats.skipped.fetch_add(1, Ordering::Relaxed);
-            send_event(&stats.event_tx, KioEvent::BlobSkipped { doc_id }).await?;
+            send_event(&stats.event_tx, KioEvent::BlobSkipped {
+                cid,
+                upstream_id: doc_id,
+            }).await?;
             Ok(())
         }
         Err(err) => {

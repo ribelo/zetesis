@@ -27,8 +27,6 @@ pub enum AppError {
     #[error(transparent)]
     Ingest(#[from] ingestion::IngestorError),
     #[error(transparent)]
-    Manifest(#[from] ingestion::ManifestError),
-    #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Pdf(#[from] PdfTextError),

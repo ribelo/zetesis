@@ -1,23 +1,21 @@
-//! End-to-end integration test for KIO scraping with BlobStore and manifest.
+//! End-to-end integration test for KIO scraping with BlobStore.
 //!
 //! This test verifies the complete flow:
 //! 1. Discovery: scraper parses HTML search results
 //! 2. Download: scraper fetches PDF content via HTTP
 //! 3. Storage: BlobStore receives content and computes CID
-//! 4. Manifest: ledger records doc_id → CID mappings
 //!
 //! Uses wiremock to simulate the KIO UZP HTTP server without external dependencies.
 
 use futures_util::{StreamExt, pin_mut};
 use std::sync::Arc;
 use tempfile::TempDir;
-use tokio::io::AsyncReadExt;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path, query_param},
 };
 
-use zetesis_app::ingestion::{KioEvent, KioScrapeOptions, KioUzpScraper, ManifestWriter};
+use zetesis_app::ingestion::{KioEvent, KioScrapeOptions, KioUzpScraper};
 use zetesis_app::paths::AppPaths;
 use zetesis_app::pipeline::processor::Silo;
 use zetesis_app::services::{BlobStore, DurableWrite, FsBlobStore};
@@ -63,11 +61,10 @@ fn mock_pdf_bytes() -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn test_e2e_kio_scraper_with_blobstore_and_manifest() {
+async fn test_e2e_kio_scraper_with_blobstore() {
     // Setup: mock HTTP server
     let mock_server = MockServer::start().await;
     let doc_id = "123456";
-    let doc_id_str = doc_id.to_string();
 
     // Mock search results endpoint (POST Home/GetResults)
     Mock::given(method("POST"))
@@ -101,13 +98,6 @@ async fn test_e2e_kio_scraper_with_blobstore_and_manifest() {
             .build(),
     );
 
-    // Setup: ManifestWriter
-    let temp_dir = TempDir::new().expect("failed to create temp dir");
-    let manifest_path = temp_dir.path().join("manifest.ndjson");
-    let mut manifest_writer = ManifestWriter::open(&manifest_path)
-        .await
-        .expect("failed to open manifest writer");
-
     // Setup: scraper with mock server URL
     let scraper = KioUzpScraper::new(&mock_server.uri()).expect("failed to create scraper");
 
@@ -129,23 +119,8 @@ async fn test_e2e_kio_scraper_with_blobstore_and_manifest() {
     while let Some(result) = stream.next().await {
         match result {
             Ok(event) => {
-                // Record manifest entry on BlobStored event
-                if let KioEvent::BlobStored {
-                    ref doc_id,
-                    ref cid,
-                    bytes,
-                    existed: _,
-                } = event
-                {
-                    let entry = zetesis_app::ingestion::ManifestEntry::new(
-                        doc_id.clone(),
-                        cid.clone(),
-                        bytes,
-                    );
-                    manifest_writer
-                        .write(&entry)
-                        .await
-                        .expect("failed to write manifest");
+                // Capture CID from BlobStored event
+                if let KioEvent::BlobStored { ref cid, .. } = event {
                     stored_cid = Some(cid.clone());
                 }
                 events.push(event);
@@ -153,12 +128,6 @@ async fn test_e2e_kio_scraper_with_blobstore_and_manifest() {
             Err(err) => panic!("scrape error: {}", err),
         }
     }
-
-    // Close manifest
-    manifest_writer
-        .close()
-        .await
-        .expect("failed to close manifest");
 
     // Verify: events received
     assert!(!events.is_empty(), "expected at least one event");
@@ -187,7 +156,7 @@ async fn test_e2e_kio_scraper_with_blobstore_and_manifest() {
         .any(|e| matches!(e, KioEvent::Completed { .. }));
     assert!(has_completed, "expected Completed event");
 
-    // Verify: BlobStore contains PDF
+    // Verify: BlobStore contains PDF with correct CID
     let cid = stored_cid.expect("expected stored_cid to be set");
     let meta = blob_store
         .head(Silo::Kio, &cid)
@@ -198,41 +167,6 @@ async fn test_e2e_kio_scraper_with_blobstore_and_manifest() {
         "expected blob {} to exist in BlobStore",
         cid
     );
-
-    // Verify: manifest file written
-    assert!(
-        manifest_path.exists(),
-        "expected manifest file to exist at {:?}",
-        manifest_path
-    );
-
-    // Verify: manifest content
-    let mut manifest_file = tokio::fs::File::open(&manifest_path)
-        .await
-        .expect("failed to open manifest file");
-    let mut manifest_content = String::new();
-    manifest_file
-        .read_to_string(&mut manifest_content)
-        .await
-        .expect("failed to read manifest file");
-
-    assert!(
-        !manifest_content.is_empty(),
-        "expected manifest to contain entries"
-    );
-
-    let lines: Vec<&str> = manifest_content.lines().collect();
-    assert_eq!(lines.len(), 1, "expected exactly 1 manifest entry");
-
-    let entry: zetesis_app::ingestion::ManifestEntry =
-        serde_json::from_str(lines[0]).expect("failed to parse manifest entry");
-    assert_eq!(
-        entry.doc_id, doc_id_str,
-        "expected manifest doc_id to match"
-    );
-    assert_eq!(entry.cid, cid, "expected manifest cid to match");
-    assert!(entry.size_bytes > 0, "expected manifest size_bytes > 0");
-    assert!(entry.timestamp > 0, "expected manifest timestamp > 0");
 }
 
 #[tokio::test]
