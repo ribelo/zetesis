@@ -27,8 +27,8 @@ use uuid::Uuid;
 use zetesis_app::cli::{
     AuditArgs, AuditCommands, Cli, Commands, DEFAULT_KIO_SAOS_URL, DEFAULT_KIO_UZP_URL, DbArgs,
     DbBackupArgs, DbCommands, DbFindArgs, DbGetArgs, DbPurgeArgs, DbRecoverArgs, DbStatsArgs,
-    FetchKioArgs, IngestArgs, JobsArgs, JobsCommands, JobsEmbedArgs, JobsIngestArgs,
-    KeywordSearchArgs, KioSource, SearchArgs, SearchCommands, StructuredAuditArgs,
+    FetchKioArgs, IngestArgs, JobsArgs, JobsCommands, JobsEmbedArgs, JobsIngestArgs, JobsReapArgs,
+    JobsStatusArgs, KeywordSearchArgs, KioSource, SearchArgs, SearchCommands, StructuredAuditArgs,
     VectorSearchArgs,
 };
 #[cfg(feature = "cli-debug")]
@@ -1030,61 +1030,117 @@ async fn run_search(args: SearchArgs) -> Result<(), AppError> {
 
 async fn run_jobs(args: JobsArgs) -> Result<(), AppError> {
     match args.command {
-        JobsCommands::Status => jobs_status().await,
+        JobsCommands::Status(sub) => jobs_status(sub).await,
         JobsCommands::Embed(sub) => jobs_embed(sub).await,
         JobsCommands::Ingest(sub) => jobs_ingest(sub).await,
+        JobsCommands::Reap(sub) => jobs_reap(sub).await,
     }
 }
 
-async fn jobs_status() -> Result<(), AppError> {
+async fn jobs_status(args: JobsStatusArgs) -> Result<(), AppError> {
+    use comfy_table::{Table, presets};
+    use zetesis_app::cli::JobsStatusFormat;
+
     let paths = AppPaths::from_project_dirs()?;
     let store = EmbeddingJobStore::open(&paths)
         .map_err(PipelineError::from)
         .map_err(AppError::from)?;
 
-    let pending = store
-        .count_by_status(EmbeddingJobStatus::Pending)
-        .map_err(PipelineError::from)
-        .map_err(AppError::from)?;
-    let embedding = store
-        .count_by_status(EmbeddingJobStatus::Embedding)
-        .map_err(PipelineError::from)
-        .map_err(AppError::from)?;
-    let embedded = store
-        .count_by_status(EmbeddingJobStatus::Embedded)
-        .map_err(PipelineError::from)
-        .map_err(AppError::from)?;
-    let ingesting = store
-        .count_by_status(EmbeddingJobStatus::Ingesting)
-        .map_err(PipelineError::from)
-        .map_err(AppError::from)?;
-    let ingested = store
-        .count_by_status(EmbeddingJobStatus::Ingested)
-        .map_err(PipelineError::from)
-        .map_err(AppError::from)?;
-    let failed = store
-        .count_by_status(EmbeddingJobStatus::Failed)
+    let stats = store
+        .list_all_with_counts()
         .map_err(PipelineError::from)
         .map_err(AppError::from)?;
 
-    println!("embedding_status\tcount");
-    println!("pending\t{pending}");
-    println!("embedding\t{embedding}");
-    println!("embedded\t{embedded}");
-    println!("ingesting\t{ingesting}");
-    println!("ingested\t{ingested}");
-    println!("failed\t{failed}");
+    match args.format {
+        JobsStatusFormat::Json => {
+            let mut output = serde_json::Map::new();
+            for (status, (count, oldest_created, oldest_updated)) in stats {
+                let status_name = match status {
+                    EmbeddingJobStatus::Pending => "pending",
+                    EmbeddingJobStatus::Embedding => "embedding",
+                    EmbeddingJobStatus::Embedded => "embedded",
+                    EmbeddingJobStatus::Ingesting => "ingesting",
+                    EmbeddingJobStatus::Ingested => "ingested",
+                    EmbeddingJobStatus::Failed => "failed",
+                };
+                let mut status_obj = serde_json::Map::new();
+                status_obj.insert("count".to_string(), serde_json::json!(count));
+                if let Some(c) = oldest_created {
+                    status_obj.insert("oldest_created_ms".to_string(), serde_json::json!(c));
+                }
+                if let Some(u) = oldest_updated {
+                    status_obj.insert("oldest_updated_ms".to_string(), serde_json::json!(u));
+                }
+                output.insert(status_name.to_string(), serde_json::Value::Object(status_obj));
+            }
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        JobsStatusFormat::Table => {
+            let mut table = Table::new();
+            table.load_preset(presets::UTF8_FULL);
+            table.set_header(vec!["Status", "Count", "Oldest Created", "Oldest Updated"]);
+
+            for (status, (count, oldest_created, oldest_updated)) in stats {
+                let status_name = match status {
+                    EmbeddingJobStatus::Pending => "pending",
+                    EmbeddingJobStatus::Embedding => "embedding",
+                    EmbeddingJobStatus::Embedded => "embedded",
+                    EmbeddingJobStatus::Ingesting => "ingesting",
+                    EmbeddingJobStatus::Ingested => "ingested",
+                    EmbeddingJobStatus::Failed => "failed",
+                };
+                let created_str = oldest_created
+                    .map(|ms| format_timestamp(ms))
+                    .unwrap_or_else(|| "-".to_string());
+                let updated_str = oldest_updated
+                    .map(|ms| format_timestamp(ms))
+                    .unwrap_or_else(|| "-".to_string());
+                let count_str = count.to_string();
+                table.add_row(vec![
+                    status_name.to_string(),
+                    count_str,
+                    created_str,
+                    updated_str,
+                ]);
+            }
+            println!("{table}");
+        }
+    }
 
     Ok(())
 }
 
+fn format_timestamp(ms: i64) -> String {
+    use chrono::{DateTime, Utc};
+    let seconds = ms / 1000;
+    let nanos = ((ms % 1000) * 1_000_000) as u32;
+    match DateTime::from_timestamp(seconds, nanos) {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        None => format!("{} ms", ms),
+    }
+}
+
 async fn jobs_embed(args: JobsEmbedArgs) -> Result<(), AppError> {
+    use zetesis_app::services::{ReaperAction, ReaperConfig, reap_stale_jobs};
+
     if args.limit == 0 {
         println!("jobs embed: limit must be greater than zero");
         return Ok(());
     }
 
     let ctx = build_pipeline_context(&args.embed_model)?;
+
+    // Run reaper to handle stale jobs before processing
+    let reaper_config = ReaperConfig::default();
+    let reaper_report = reap_stale_jobs(&ctx.jobs, &reaper_config, ReaperAction::Both)?;
+    if !reaper_report.is_empty() {
+        tracing::debug!(
+            requeued = reaper_report.requeued.len(),
+            failed = reaper_report.failed.len(),
+            skipped = reaper_report.skipped,
+            "reaper cleaned up stale jobs"
+        );
+    }
     let mut candidates = ctx
         .jobs
         .list_by_status(EmbeddingJobStatus::Pending, args.limit.saturating_mul(8))
@@ -1127,12 +1183,26 @@ async fn jobs_embed(args: JobsEmbedArgs) -> Result<(), AppError> {
 }
 
 async fn jobs_ingest(args: JobsIngestArgs) -> Result<(), AppError> {
+    use zetesis_app::services::{ReaperAction, ReaperConfig, reap_stale_jobs};
+
     if args.limit == 0 {
         println!("jobs ingest: limit must be greater than zero");
         return Ok(());
     }
 
     let ctx = build_pipeline_context(&args.embed_model)?;
+
+    // Run reaper to handle stale jobs before processing
+    let reaper_config = ReaperConfig::default();
+    let reaper_report = reap_stale_jobs(&ctx.jobs, &reaper_config, ReaperAction::Both)?;
+    if !reaper_report.is_empty() {
+        tracing::debug!(
+            requeued = reaper_report.requeued.len(),
+            failed = reaper_report.failed.len(),
+            skipped = reaper_report.skipped,
+            "reaper cleaned up stale jobs"
+        );
+    }
     let mut candidates = ctx
         .jobs
         .list_by_status(EmbeddingJobStatus::Embedding, args.limit.saturating_mul(8))
@@ -1183,6 +1253,77 @@ async fn jobs_ingest(args: JobsIngestArgs) -> Result<(), AppError> {
             "ingested {processed} job(s); {remaining} job(s) still waiting for provider completion"
         );
     }
+    Ok(())
+}
+
+async fn jobs_reap(args: JobsReapArgs) -> Result<(), AppError> {
+    use zetesis_app::cli::JobsReapAction;
+    use zetesis_app::services::{ReaperAction, ReaperConfig, reap_stale_jobs};
+    use comfy_table::{Table, presets};
+
+    let paths = AppPaths::from_project_dirs()?;
+    let store = EmbeddingJobStore::open(&paths)
+        .map_err(PipelineError::from)
+        .map_err(AppError::from)?;
+
+    let action = match args.action {
+        JobsReapAction::Requeue => ReaperAction::Requeue,
+        JobsReapAction::Fail => ReaperAction::Fail,
+        JobsReapAction::Both => ReaperAction::Both,
+    };
+
+    let config = ReaperConfig::default();
+
+    if args.dry_run {
+        println!("Dry run mode: no jobs will be modified");
+        println!(
+            "Reaper config:\n  Pending max age: {} ms ({} hours)\n  Embedding max age: {} ms ({} hours)",
+            config.pending_max_age_ms,
+            config.pending_max_age_ms / 3_600_000,
+            config.embedding_max_age_ms,
+            config.embedding_max_age_ms / 3_600_000
+        );
+        return Ok(());
+    }
+
+    let report = reap_stale_jobs(&store, &config, action)?;
+
+    if report.is_empty() {
+        println!("No stale jobs found");
+    } else {
+        let mut table = Table::new();
+        table.load_preset(presets::UTF8_FULL);
+        table.set_header(vec!["Action", "Count", "Job IDs"]);
+
+        if !report.requeued.is_empty() {
+            let requeued_count = report.requeued.len().to_string();
+            let requeued_ids = report.requeued.join(", ");
+            table.add_row(vec![
+                "Requeued".to_string(),
+                requeued_count,
+                requeued_ids,
+            ]);
+        }
+        if !report.failed.is_empty() {
+            let failed_count = report.failed.len().to_string();
+            let failed_ids = report.failed.join(", ");
+            table.add_row(vec!["Failed".to_string(), failed_count, failed_ids]);
+        }
+        if report.skipped > 0 {
+            let skipped_count = report.skipped.to_string();
+            table.add_row(vec!["Skipped".to_string(), skipped_count, "-".to_string()]);
+        }
+
+        println!("{table}");
+        println!(
+            "Total: {} jobs processed ({} requeued, {} failed, {} skipped)",
+            report.total(),
+            report.requeued.len(),
+            report.failed.len(),
+            report.skipped
+        );
+    }
+
     Ok(())
 }
 

@@ -376,11 +376,50 @@ pub struct JobsArgs {
 #[derive(Debug, Subcommand)]
 pub enum JobsCommands {
     /// Display counts for pending, running, and completed embedding jobs.
-    Status,
+    Status(JobsStatusArgs),
     /// Embed pending jobs into vectors.
     Embed(JobsEmbedArgs),
     /// Ingest embedded jobs into Milli.
     Ingest(JobsIngestArgs),
+    /// Reap stale jobs and optionally requeue or fail them.
+    Reap(JobsReapArgs),
+}
+
+/// Options for the `jobs status` command.
+#[derive(Debug, Args)]
+pub struct JobsStatusArgs {
+    /// Output format (json or table).
+    #[arg(long, default_value = "table")]
+    pub format: JobsStatusFormat,
+}
+
+/// Format for jobs status output.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum JobsStatusFormat {
+    Json,
+    Table,
+}
+
+/// Action to take when reaping stale jobs.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum JobsReapAction {
+    /// Requeue stale jobs with retry backoff.
+    Requeue,
+    /// Mark stale jobs as failed.
+    Fail,
+    /// Requeue if retries left, fail if exhausted.
+    Both,
+}
+
+/// Options for the `jobs reap` command.
+#[derive(Debug, Args)]
+pub struct JobsReapArgs {
+    /// Action to take on stale jobs (requeue, fail, or both).
+    #[arg(long, default_value = "both")]
+    pub action: JobsReapAction,
+    /// Dry run mode (don't modify jobs).
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub dry_run: bool,
 }
 
 /// Options for the `jobs embed` command.
