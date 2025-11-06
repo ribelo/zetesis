@@ -13,9 +13,14 @@ use serde_json;
 use thiserror::Error;
 
 const JOB_ENV_MAP_SIZE_BYTES: usize = 1 << 28; // 256 MiB
+const DEFAULT_MAX_RETRIES: u32 = 3;
+
+fn default_max_retries() -> u32 {
+    DEFAULT_MAX_RETRIES
+}
 
 /// Lifecycle state of an embedding job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EmbeddingJobStatus {
     Pending,
     Embedding,
@@ -55,6 +60,14 @@ pub struct EmbeddingJob {
     pub updated_at_ms: i64,
     #[serde(default)]
     pub stale: bool,
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_retry_at_ms: Option<i64>,
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +109,10 @@ impl EmbeddingJob {
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             stale: false,
+            retry_count: 0,
+            max_retries: DEFAULT_MAX_RETRIES,
+            last_error: None,
+            next_retry_at_ms: None,
         }
     }
 
@@ -114,7 +131,7 @@ impl EmbeddingJob {
     }
 }
 
-fn current_timestamp_ms() -> i64 {
+pub(crate) fn current_timestamp_ms() -> i64 {
     let since_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -206,12 +223,18 @@ impl EmbeddingJobStore {
         }
     }
 
+    /// List jobs by status, respecting exponential backoff scheduling.
+    ///
+    /// Jobs that have `next_retry_at_ms` set to a future timestamp will be
+    /// skipped, allowing the exponential backoff to take effect and preventing
+    /// immediate re-processing of recently failed jobs.
     pub fn list_by_status(
         &self,
         status: EmbeddingJobStatus,
         limit: usize,
     ) -> Result<Vec<EmbeddingJob>, EmbeddingJobStoreError> {
         debug_assert!(limit > 0);
+        let now_ms = current_timestamp_ms();
         let rtxn = self.env.read_txn()?;
         let iter = self.jobs.iter(&rtxn)?;
         let mut out = Vec::new();
@@ -219,6 +242,12 @@ impl EmbeddingJobStore {
             let (_, raw) = entry?;
             let (job, _) = decode_from_slice::<EmbeddingJob, _>(raw, config::standard())?;
             if job.status == status {
+                // Skip jobs that are scheduled for retry in the future
+                if let Some(retry_at) = job.next_retry_at_ms {
+                    if retry_at > now_ms {
+                        continue;
+                    }
+                }
                 out.push(job);
                 if out.len() >= limit {
                     break;
@@ -275,6 +304,99 @@ impl EmbeddingJobStore {
         }
         Ok(count)
     }
+
+    /// List jobs with given status that have not been updated within the threshold.
+    pub fn list_stale_jobs(
+        &self,
+        status: EmbeddingJobStatus,
+        age_threshold_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<EmbeddingJob>, EmbeddingJobStoreError> {
+        debug_assert!(limit > 0);
+        debug_assert!(age_threshold_ms > 0);
+        let now_ms = current_timestamp_ms();
+        let cutoff_ms = now_ms.saturating_sub(age_threshold_ms);
+
+        let rtxn = self.env.read_txn()?;
+        let iter = self.jobs.iter(&rtxn)?;
+        let mut out = Vec::new();
+        for entry in iter {
+            let (_, raw) = entry?;
+            let (job, _) = decode_from_slice::<EmbeddingJob, _>(raw, config::standard())?;
+            if job.status == status && job.updated_at_ms <= cutoff_ms {
+                // Skip jobs that are scheduled for retry in the future
+                if let Some(retry_at) = job.next_retry_at_ms {
+                    if retry_at > now_ms {
+                        continue;
+                    }
+                }
+                out.push(job);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Get the oldest timestamp (both created_at and updated_at) for a given status.
+    pub fn oldest_by_status(
+        &self,
+        status: EmbeddingJobStatus,
+    ) -> Result<Option<(i64, i64)>, EmbeddingJobStoreError> {
+        let rtxn = self.env.read_txn()?;
+        let iter = self.jobs.iter(&rtxn)?;
+        let mut oldest_created: Option<i64> = None;
+        let mut oldest_updated: Option<i64> = None;
+
+        for entry in iter {
+            let (_, raw) = entry?;
+            let (job, _) = decode_from_slice::<EmbeddingJob, _>(raw, config::standard())?;
+            if job.status == status {
+                oldest_created = Some(match oldest_created {
+                    None => job.created_at_ms,
+                    Some(ts) => ts.min(job.created_at_ms),
+                });
+                oldest_updated = Some(match oldest_updated {
+                    None => job.updated_at_ms,
+                    Some(ts) => ts.min(job.updated_at_ms),
+                });
+            }
+        }
+
+        match (oldest_created, oldest_updated) {
+            (Some(c), Some(u)) => Ok(Some((c, u))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Get counts and oldest timestamps for all statuses efficiently.
+    pub fn list_all_with_counts(
+        &self,
+    ) -> Result<std::collections::HashMap<EmbeddingJobStatus, (usize, Option<i64>, Option<i64>)>, EmbeddingJobStoreError> {
+        use std::collections::HashMap;
+        let rtxn = self.env.read_txn()?;
+        let iter = self.jobs.iter(&rtxn)?;
+        let mut stats: HashMap<EmbeddingJobStatus, (usize, Option<i64>, Option<i64>)> =
+            HashMap::new();
+
+        for entry in iter {
+            let (_, raw) = entry?;
+            let (job, _) = decode_from_slice::<EmbeddingJob, _>(raw, config::standard())?;
+            let stat_entry = stats.entry(job.status).or_insert((0, None, None));
+            stat_entry.0 = stat_entry.0.saturating_add(1);
+            stat_entry.1 = Some(match stat_entry.1 {
+                None => job.created_at_ms,
+                Some(ts) => i64::min(ts, job.created_at_ms),
+            });
+            stat_entry.2 = Some(match stat_entry.2 {
+                None => job.updated_at_ms,
+                Some(ts) => i64::min(ts, job.updated_at_ms),
+            });
+        }
+
+        Ok(stats)
+    }
 }
 
 #[cfg(test)]
@@ -301,5 +423,10 @@ mod tests {
         assert_eq!(job.content_hash.as_deref(), Some("hash"));
         assert!(job.provider_job_id.is_none());
         assert!(job.pending_decision.is_none());
+        assert_eq!(job.retry_count, 0);
+        assert_eq!(job.max_retries, 3);
+        assert!(job.last_error.is_none());
+        assert!(job.next_retry_at_ms.is_none());
     }
+
 }

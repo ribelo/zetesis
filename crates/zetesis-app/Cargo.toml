@@ -36,6 +36,7 @@ mime = { workspace = true }
 nalgebra = { workspace = true }
 owo-colors = { workspace = true }
 pdfium-render = { workspace = true }
+rand = { workspace = true }
 rayon = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }

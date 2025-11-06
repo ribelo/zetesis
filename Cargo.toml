@@ -41,6 +41,7 @@ owo-colors = "4.2.3"
 pdfium-render = "0.8.35"
 pulldown-cmark = "0.12.2"
 rayon = "1.11.0"
+rand = "0.8.5"
 regex = "1.12.2"
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls", "cookies", "http2"] }
 rustc-hash = "2.1.1"

@@ -13,6 +13,7 @@ pub mod jobs;
 pub mod milli_actor;
 pub mod ocr;
 pub mod orchestrator;
+pub mod reaper;
 pub mod search;
 pub mod structured;
 
@@ -36,6 +37,9 @@ pub use indexer::{
 pub use jobs::{
     EmbeddingJob, EmbeddingJobStatus, EmbeddingJobStore, EmbeddingJobStoreError,
     EmbeddingProviderKind,
+};
+pub use reaper::{
+    ReaperAction, ReaperConfig, ReaperError, ReaperReport, calculate_retry_backoff, reap_stale_jobs,
 };
 pub use milli_actor::MilliActorHandle;
 pub use ocr::{
