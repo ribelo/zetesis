@@ -708,9 +708,7 @@ enum ProcessOutcome {
         existed: bool,
     },
     #[allow(dead_code)]
-    Skipped {
-        cid: String,
-    },
+    Skipped { cid: String },
 }
 
 fn spawn_workers(

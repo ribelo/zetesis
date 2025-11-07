@@ -53,8 +53,8 @@ impl AppPaths {
         self.ensure_child(&["lmdb", "app"])
     }
 
-    /// LMDB directory dedicated to embedding job metadata (`.../lmdb/jobs`).
-    pub fn embedding_jobs_lmdb_dir(&self) -> Result<PathBuf, PathError> {
+    /// LMDB directory dedicated to generation job metadata (`.../lmdb/jobs`).
+    pub fn generation_jobs_lmdb_dir(&self) -> Result<PathBuf, PathError> {
         self.ensure_child(&["lmdb", "jobs"])
     }
 
@@ -79,13 +79,16 @@ impl AppPaths {
         self.ensure_dynamic(&segments)
     }
 
-    /// Base directory for embedding job staging (`.../jobs`).
-    pub fn embedding_jobs_base_dir(&self) -> Result<PathBuf, PathError> {
+    /// Base directory for generation job staging (`.../jobs`).
+    pub fn generation_jobs_base_dir(&self) -> Result<PathBuf, PathError> {
         self.ensure_child(&["jobs"])
     }
 
-    /// Directory where raw payloads for embedding jobs are staged (`.../jobs/payloads/{silo}`).
-    pub fn embedding_jobs_payload_dir<S: AsRef<str>>(&self, silo: S) -> Result<PathBuf, PathError> {
+    /// Directory where raw payloads for generation jobs are staged (`.../jobs/payloads/{silo}`).
+    pub fn generation_jobs_payload_dir<S: AsRef<str>>(
+        &self,
+        silo: S,
+    ) -> Result<PathBuf, PathError> {
         let segments = vec![
             "jobs".to_string(),
             "payloads".to_string(),
@@ -94,8 +97,11 @@ impl AppPaths {
         self.ensure_dynamic(&segments)
     }
 
-    /// Directory where embedding results are staged (`.../jobs/results/{silo}`).
-    pub fn embedding_jobs_results_dir<S: AsRef<str>>(&self, silo: S) -> Result<PathBuf, PathError> {
+    /// Directory where generation results are staged (`.../jobs/results/{silo}`).
+    pub fn generation_jobs_results_dir<S: AsRef<str>>(
+        &self,
+        silo: S,
+    ) -> Result<PathBuf, PathError> {
         let segments = vec![
             "jobs".to_string(),
             "results".to_string(),

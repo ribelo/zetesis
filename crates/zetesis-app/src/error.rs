@@ -11,7 +11,9 @@ use crate::ingestion;
 use crate::paths::PathError;
 use crate::pdf::{PdfRenderError, PdfTextError};
 use crate::server;
-use crate::services::{EmbeddingJobStoreError, OcrError, PipelineError, ReaperError, StructuredExtractError};
+use crate::services::{
+    GenerationJobStoreError, OcrError, PipelineError, ReaperError, StructuredExtractError,
+};
 
 #[derive(Debug, Error)]
 #[allow(clippy::large_enum_variant)]
@@ -47,7 +49,7 @@ pub enum AppError {
     #[error(transparent)]
     MilliBootstrap(#[from] MilliBootstrapError),
     #[error(transparent)]
-    Jobs(#[from] Box<EmbeddingJobStoreError>),
+    Jobs(#[from] Box<GenerationJobStoreError>),
     #[error(transparent)]
     Reaper(#[from] ReaperError),
     #[error("failed to read input file {path}: {source}")]
@@ -104,8 +106,8 @@ impl From<heed::Error> for AppError {
     }
 }
 
-impl From<EmbeddingJobStoreError> for AppError {
-    fn from(e: EmbeddingJobStoreError) -> Self {
+impl From<GenerationJobStoreError> for AppError {
+    fn from(e: GenerationJobStoreError) -> Self {
         AppError::Jobs(Box::new(e))
     }
 }

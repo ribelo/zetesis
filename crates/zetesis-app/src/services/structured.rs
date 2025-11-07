@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::pipeline::structured::{StructuredDecision, StructuredValidationError};
 
-const SYSTEM_PROMPT: &str = "Jesteś ekspertem analizującym orzeczenia KIO. Odpowiadasz wyłącznie w formacie JSON zgodnym ze schematem przekazanym przez API. Pole `chunks` musi zawierać wszystkie fragmenty tekstu w kolejności i obejmować pełny tekst dokumentu.";
+pub(crate) const STRUCTURED_SYSTEM_PROMPT: &str = "Jesteś ekspertem analizującym orzeczenia KIO. Odpowiadasz wyłącznie w formacie JSON zgodnym ze schematem przekazanym przez API. Pole `chunks` musi zawierać wszystkie fragmenty tekstu w kolejności i obejmować pełny tekst dokumentu.";
 const RETRY_SUFFIX: &str =
     "\n\nUWAGA: Poprzednia odpowiedź była niepoprawna. Zwróć wyłącznie poprawny JSON.";
 const DEFAULT_MAX_ATTEMPTS: u8 = 2;
@@ -42,7 +42,7 @@ impl StructuredExtractor {
             .build();
 
         let agent = Agent::model(model)
-            .system_instruction(SYSTEM_PROMPT)
+            .system_instruction(STRUCTURED_SYSTEM_PROMPT)
             .build();
 
         Ok(Self {

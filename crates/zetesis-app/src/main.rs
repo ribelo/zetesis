@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, hash_map::Entry},
     env, fs,
     num::NonZeroUsize,
     path::Path,
@@ -21,15 +21,16 @@ use milli::vector::VectorStoreBackend;
 use milli::vector::db::IndexEmbeddingConfig;
 use milli::vector::embedder::EmbedderOptions;
 use milli::{Filter, Search as MilliSearch, all_obkv_to_json};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing_subscriber::{filter::LevelFilter, fmt};
 use uuid::Uuid;
 use zetesis_app::cli::{
     AuditArgs, AuditCommands, Cli, Commands, DEFAULT_KIO_SAOS_URL, DEFAULT_KIO_UZP_URL, DbArgs,
     DbBackupArgs, DbCommands, DbFindArgs, DbGetArgs, DbPurgeArgs, DbRecoverArgs, DbStatsArgs,
-    FetchKioArgs, IngestArgs, JobsArgs, JobsCommands, JobsEmbedArgs, JobsIngestArgs, JobsReapArgs,
-    JobsStatusArgs, KeywordSearchArgs, KioSource, SearchArgs, SearchCommands, StructuredAuditArgs,
-    VectorSearchArgs,
+    FetchKioArgs, GenModeArg, IngestArgs, JobsArgs, JobsCommands, JobsGenArgs, JobsGenCommands,
+    JobsGenFetchArgs, JobsGenSubmitArgs, JobsReapArgs, JobsStatusArgs, KeywordSearchArgs,
+    KioSource, SearchArgs, SearchCommands, StructuredAuditArgs, VectorSearchArgs,
 };
 #[cfg(feature = "cli-debug")]
 use zetesis_app::cli::{DebugArgs, DebugCommands};
@@ -39,12 +40,14 @@ use zetesis_app::ingestion::{
     KioEvent, KioSaosScraper, KioScrapeOptions, KioScraperSummary, KioUzpScraper,
 };
 use zetesis_app::pdf::extract_text_from_pdf;
+use zetesis_app::pipeline::structured::StructuredDecision;
 use zetesis_app::services::{
-    EmbedBatchTask, EmbeddingJob, EmbeddingJobStatus, EmbeddingJobStore, EmbeddingProviderKind,
-    KeywordSearchParams, MilliActorHandle, PipelineContext, PipelineError, ProviderJobState,
-    StructuredExtractor, VectorSearchParams, build_pipeline_context, decision_content_hash,
-    index_structured_with_embeddings, keyword, load_structured_decision, normalize_index_name,
-    open_index_read_only, project_value, resolve_index_dir, vector,
+    EmbedBatchTask, GeminiBatchStructuredClient, GenerationJob, GenerationJobStatus,
+    GenerationJobStore, GenerationMode, GenerationProviderKind, KeywordSearchParams,
+    MilliActorHandle, PipelineContext, PipelineError, ProviderJobState, StructuredBatchInput,
+    StructuredBatchRequest, StructuredExtractor, StructuredJobClient, VectorSearchParams,
+    build_pipeline_context, decision_content_hash, index_structured_with_embeddings, keyword,
+    normalize_index_name, open_index_read_only, project_value, resolve_index_dir, vector,
 };
 use zetesis_app::text::cleanup_text;
 use zetesis_app::{config, ingestion, paths::AppPaths, pipeline::Silo, server};
@@ -316,20 +319,20 @@ fn finish_kio_progress(
 #[derive(Default)]
 struct IngestStats {
     total: usize,
-    ingested: usize,
+    generated: usize,
     submitted: usize,
+    queued: usize,
     failed: Vec<(PathBuf, String)>,
 }
 
 struct IngestOutcome {
     job_id: String,
-    status: EmbeddingJobStatus,
+    status: GenerationJobStatus,
     provider_job_id: Option<String>,
 }
 
 async fn run_ingest(args: IngestArgs) -> Result<(), AppError> {
     let ctx = build_pipeline_context(&args.embed_model)?;
-    let extractor = StructuredExtractor::from_env(&args.extractor_model)?;
 
     // Validate CLI arguments early and fail fast with clear error messages.
     validate_ingest_limit(args.limit)?;
@@ -348,8 +351,8 @@ async fn run_ingest(args: IngestArgs) -> Result<(), AppError> {
     // Sanity assertions for developer/debug builds; these are side-effect-free.
     debug_assert!(!args.embed_model.is_empty(), "embed model must be present");
     debug_assert!(
-        !args.extractor_model.is_empty(),
-        "extractor model must be present"
+        !args.gen_model.is_empty(),
+        "generation model must be present"
     );
 
     tracing::info!(
@@ -357,9 +360,10 @@ async fn run_ingest(args: IngestArgs) -> Result<(), AppError> {
         index = %args.index,
         path = %args.path.display(),
         limit = ?args.limit,
-        batch = args.batch,
+        gen_mode = ?args.gen_mode,
+        deprecated_batch_flag = args.batch,
         embed_model = %args.embed_model,
-        extractor_model = %args.extractor_model,
+        gen_model = %args.gen_model,
         "starting ingest"
     );
 
@@ -367,6 +371,29 @@ async fn run_ingest(args: IngestArgs) -> Result<(), AppError> {
         name: args.index.clone(),
     })?;
     let slug = silo.slug();
+
+    let mut gen_mode_arg = args.gen_mode;
+    if args.batch {
+        tracing::warn!(
+            flag = "--batch",
+            replacement = "--gen-mode batch",
+            "deprecated flag --batch used; mapping to generation batch mode"
+        );
+        println!("warning: --batch is deprecated; use --gen-mode batch");
+        gen_mode_arg = GenModeArg::Batch;
+    }
+    let gen_mode = match gen_mode_arg {
+        GenModeArg::Sync => GenerationMode::Sync,
+        GenModeArg::Batch => GenerationMode::Batch,
+    };
+    let extractor = match gen_mode {
+        GenerationMode::Sync => Some(StructuredExtractor::from_env(args.gen_model.clone())?),
+        GenerationMode::Batch => None,
+    };
+    debug_assert!(
+        matches!(gen_mode, GenerationMode::Sync | GenerationMode::Batch),
+        "unsupported generation mode"
+    );
 
     let index_dir = ctx.paths.data_dir().join("milli").join(slug);
     let data_file = index_dir.join("data.mdb");
@@ -395,10 +422,10 @@ async fn run_ingest(args: IngestArgs) -> Result<(), AppError> {
     for path in targets {
         tracing::info!(event = "ingest_document_start", path = %path.display());
         stats.total = stats.total.saturating_add(1);
-        match ingest_document(&ctx, &extractor, silo, &path, &args).await {
+        match ingest_document(&ctx, extractor.as_ref(), silo, &path, &args, gen_mode).await {
             Ok(outcome) => match outcome.status {
-                EmbeddingJobStatus::Ingested => {
-                    stats.ingested = stats.ingested.saturating_add(1);
+                GenerationJobStatus::Generated => {
+                    stats.generated = stats.generated.saturating_add(1);
                     tracing::info!(
                         event = "ingest_document_complete",
                         path = %path.display(),
@@ -406,9 +433,9 @@ async fn run_ingest(args: IngestArgs) -> Result<(), AppError> {
                         status = ?outcome.status,
                         "document ingested"
                     );
-                    println!("ingested {} (job_id: {})", path.display(), outcome.job_id);
+                    println!("generated {} (job_id: {})", path.display(), outcome.job_id);
                 }
-                EmbeddingJobStatus::Embedding => {
+                GenerationJobStatus::Generating => {
                     stats.submitted = stats.submitted.saturating_add(1);
                     if let Some(provider_job_id) = outcome.provider_job_id {
                         tracing::info!(
@@ -433,8 +460,19 @@ async fn run_ingest(args: IngestArgs) -> Result<(), AppError> {
                             status = ?outcome.status,
                             "document submitted (no provider id)"
                         );
-                        println!("submitted {} (job_id: {})", path.display(), outcome.job_id);
+                        println!("queued {} (job_id: {})", path.display(), outcome.job_id);
                     }
+                }
+                GenerationJobStatus::Pending => {
+                    stats.queued = stats.queued.saturating_add(1);
+                    tracing::info!(
+                        event = "ingest_document_queued",
+                        path = %path.display(),
+                        job_id = %outcome.job_id,
+                        status = ?outcome.status,
+                        "document queued for batch generation"
+                    );
+                    println!("queued {} (job_id: {})", path.display(), outcome.job_id);
                 }
                 _ => {
                     tracing::info!(
@@ -458,24 +496,30 @@ async fn run_ingest(args: IngestArgs) -> Result<(), AppError> {
     tracing::info!(
         event = "ingest_complete",
         total = stats.total,
-        ingested = stats.ingested,
+        generated = stats.generated,
         submitted = stats.submitted,
+        queued = stats.queued,
         failed = stats.failed.len(),
         "ingest complete"
     );
 
     // Debug assertions to help catch logic regressions in development builds.
-    debug_assert!(stats.total >= stats.ingested, "total should be >= ingested");
+    debug_assert!(
+        stats.total >= stats.generated,
+        "total should be >= generated"
+    );
     debug_assert!(
         stats.total >= stats.submitted,
         "total should be >= submitted"
     );
+    debug_assert!(stats.total >= stats.queued, "total should be >= queued");
 
     println!(
-        "processed {} document(s): {} ingested, {} awaiting provider results, {} failed",
+        "processed {} document(s): {} generated, {} in flight, {} queued, {} failed",
         stats.total,
-        stats.ingested,
+        stats.generated,
         stats.submitted,
+        stats.queued,
         stats.failed.len()
     );
 
@@ -514,12 +558,13 @@ mod ingest_tests {
 
 async fn ingest_document(
     ctx: &PipelineContext,
-    extractor: &StructuredExtractor,
+    extractor: Option<&StructuredExtractor>,
     silo: Silo,
     path: &Path,
     args: &IngestArgs,
+    gen_mode: GenerationMode,
 ) -> Result<IngestOutcome, AppError> {
-    let kind = document_kind_for_path(path).ok_or_else(|| {
+    let document_kind = document_kind_for_path(path).ok_or_else(|| {
         PipelineError::message(format!("unsupported document type: {}", path.display()))
     })?;
 
@@ -554,26 +599,6 @@ async fn ingest_document(
         .and_then(|name| name.to_str())
         .unwrap_or("document");
 
-    let extraction = match kind {
-        DocumentKind::Pdf => {
-            let text = extract_text_from_pdf(&bytes)?;
-            let attachments = vec![inline_part_from_bytes(
-                &bytes,
-                "application/pdf",
-                display_name,
-            )];
-            extractor
-                .extract_with_context(&text, &attachments, Some(&text))
-                .await?
-        }
-        DocumentKind::Image(mime) => {
-            let attachments = vec![inline_part_from_bytes(&bytes, mime, display_name)];
-            extractor
-                .extract_with_context(DOCUMENT_PROMPT, &attachments, None)
-                .await?
-        }
-    };
-
     if args.create_index {
         ensure_index(
             &ctx.paths,
@@ -590,57 +615,102 @@ async fn ingest_document(
         )?;
     }
 
-    let chunk_count = extraction.decision.chunks.len();
     debug_assert!(
-        chunk_count > 0,
-        "extraction must produce at least one chunk"
+        extractor.is_some() == matches!(gen_mode, GenerationMode::Sync),
+        "extractor availability must match generation mode"
     );
-    tracing::info!(
-        event = "document_parsed",
-        doc_id = %doc_id,
-        path = %path.display(),
-        chunk_count = chunk_count,
-        "document parsed and structured"
-    );
-    if chunk_count == 0 {
-        return Err(PipelineError::message("structured decision produced zero chunks").into());
+
+    match gen_mode {
+        GenerationMode::Batch => {
+            let payload_kind = GenerationPayloadKind::from(document_kind);
+            store_generation_payload(
+                &ctx.paths,
+                silo.slug(),
+                &doc_id,
+                payload_kind,
+                display_name,
+                &bytes,
+            )?;
+
+            let job = GenerationJob::new(
+                doc_id.clone(),
+                silo.slug(),
+                ctx.embed.embedder_key.clone(),
+                args.gen_model.clone(),
+                gen_mode,
+            );
+            ctx.jobs.enqueue(&job)?;
+            tracing::info!(
+                event = "generation_job_enqueued",
+                doc_id = %doc_id,
+                silo = %silo.slug(),
+                mode = ?gen_mode,
+                "queued generation job for batch processing"
+            );
+
+            Ok(IngestOutcome {
+                job_id: job.job_id.clone(),
+                status: GenerationJobStatus::Pending,
+                provider_job_id: None,
+            })
+        }
+        GenerationMode::Sync => {
+            let Some(extractor) = extractor else {
+                return Err(
+                    PipelineError::message("synchronous generation requires extractor").into(),
+                );
+            };
+            let payload_kind = GenerationPayloadKind::from(document_kind);
+            let job = GenerationJob::new(
+                doc_id.clone(),
+                silo.slug(),
+                ctx.embed.embedder_key.clone(),
+                args.gen_model.clone(),
+                gen_mode,
+            );
+            ctx.jobs.enqueue(&job)?;
+
+            let mut record =
+                ctx.jobs
+                    .update_status(&job.job_id, GenerationJobStatus::Generating, None)?;
+
+            let decision =
+                match run_structured_extraction(extractor, &payload_kind, &bytes, display_name)
+                    .await
+                {
+                    Ok(decision) => {
+                        tracing::info!(
+                            event = "document_parsed",
+                            doc_id = %doc_id,
+                            path = %path.display(),
+                            chunk_count = decision.chunks.len(),
+                            "document parsed and structured"
+                        );
+                        decision
+                    }
+                    Err(err) => {
+                        fail_job(ctx, &mut record, err.to_string());
+                        return Err(err);
+                    }
+                };
+            record.pending_decision = Some(decision.clone());
+            record.provider_kind = GenerationProviderKind::Synchronous;
+            record.provider_job_id = None;
+            record.submitted_batch_count = 0;
+            record.submitted_at_ms = None;
+
+            if let Err(err) = finalize_generation(ctx, &mut record, decision).await {
+                fail_job(ctx, &mut record, err.to_string());
+                return Err(err);
+            }
+
+            Ok(IngestOutcome {
+                job_id: record.job_id.clone(),
+                status: record.status,
+                provider_job_id: record.provider_job_id.clone(),
+            })
+        }
     }
-    if chunk_count > u32::MAX as usize {
-        return Err(
-            PipelineError::message("structured decision has more chunks than supported").into(),
-        );
-    }
-
-    let content_hash = decision_content_hash(&extraction.decision)
-        .map_err(|err| PipelineError::message(err.to_string()))
-        .map_err(AppError::from)?;
-
-    let decision = extraction.decision;
-    let job = EmbeddingJob::new(
-        doc_id.clone(),
-        silo.slug(),
-        ctx.embed.embedder_key.clone(),
-        ctx.embed.runtime.documents_mode,
-        chunk_count as u32,
-        Some(content_hash),
-    );
-    let mut job = job;
-    job.pending_decision = Some(decision);
-    ctx.jobs.enqueue(&job)?;
-
-    embed_single_job(ctx, &job, args.batch).await?;
-
-    let stored_job = ctx
-        .jobs
-        .get(&job.job_id)
-        .map_err(PipelineError::from)?
-        .ok_or_else(|| PipelineError::message("embedding job not found after enqueue"))?;
-
-    Ok(IngestOutcome {
-        job_id: stored_job.job_id.clone(),
-        status: stored_job.status,
-        provider_job_id: stored_job.provider_job_id.clone(),
-    })
 }
 
 fn collect_ingest_targets(path: &Path, limit: Option<usize>) -> Result<Vec<PathBuf>, AppError> {
@@ -697,19 +767,115 @@ fn collect_ingest_targets(path: &Path, limit: Option<usize>) -> Result<Vec<PathB
     Err(PipelineError::message("ingest path must be a file or directory").into())
 }
 
+#[derive(Clone, Debug)]
 enum DocumentKind {
     Pdf,
-    Image(&'static str),
+    Image(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum GenerationPayloadKind {
+    Pdf,
+    Image { mime: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GenerationPayloadMeta {
+    kind: GenerationPayloadKind,
+    display_name: String,
+}
+
+impl From<DocumentKind> for GenerationPayloadKind {
+    fn from(kind: DocumentKind) -> Self {
+        match kind {
+            DocumentKind::Pdf => GenerationPayloadKind::Pdf,
+            DocumentKind::Image(mime) => GenerationPayloadKind::Image { mime },
+        }
+    }
 }
 
 fn document_kind_for_path(path: &Path) -> Option<DocumentKind> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     match ext.as_str() {
         "pdf" => Some(DocumentKind::Pdf),
-        "jpg" | "jpeg" => Some(DocumentKind::Image("image/jpeg")),
-        "png" => Some(DocumentKind::Image("image/png")),
+        "jpg" | "jpeg" => Some(DocumentKind::Image("image/jpeg".to_string())),
+        "png" => Some(DocumentKind::Image("image/png".to_string())),
         _ => None,
     }
+}
+
+fn store_generation_payload(
+    paths: &AppPaths,
+    silo: &str,
+    doc_id: &str,
+    kind: GenerationPayloadKind,
+    display_name: &str,
+    bytes: &[u8],
+) -> Result<(), AppError> {
+    let dir = paths.generation_jobs_payload_dir(silo)?;
+    let data_path = dir.join(format!("{doc_id}.bin"));
+    let meta_path = dir.join(format!("{doc_id}.json"));
+
+    fs::write(&data_path, bytes).map_err(|source| AppError::Io {
+        path: data_path.clone(),
+        source,
+    })?;
+
+    let meta = GenerationPayloadMeta {
+        kind,
+        display_name: display_name.to_string(),
+    };
+    let meta_bytes = serde_json::to_vec(&meta)?;
+    fs::write(&meta_path, meta_bytes).map_err(|source| AppError::Io {
+        path: meta_path.clone(),
+        source,
+    })?;
+    Ok(())
+}
+
+fn load_generation_payload(
+    paths: &AppPaths,
+    silo: &str,
+    doc_id: &str,
+) -> Result<(GenerationPayloadKind, String, Vec<u8>), AppError> {
+    let dir = paths.generation_jobs_payload_dir(silo)?;
+    let data_path = dir.join(format!("{doc_id}.bin"));
+    let meta_path = dir.join(format!("{doc_id}.json"));
+
+    let bytes = fs::read(&data_path).map_err(|source| AppError::Io {
+        path: data_path.clone(),
+        source,
+    })?;
+    let meta_bytes = fs::read(&meta_path).map_err(|source| AppError::Io {
+        path: meta_path.clone(),
+        source,
+    })?;
+    let meta: GenerationPayloadMeta = serde_json::from_slice(&meta_bytes)?;
+    Ok((meta.kind, meta.display_name, bytes))
+}
+
+fn remove_generation_payload(paths: &AppPaths, silo: &str, doc_id: &str) -> Result<(), AppError> {
+    let dir = paths.generation_jobs_payload_dir(silo)?;
+    let data_path = dir.join(format!("{doc_id}.bin"));
+    let meta_path = dir.join(format!("{doc_id}.json"));
+
+    if let Err(source) = fs::remove_file(&data_path) {
+        if source.kind() != std::io::ErrorKind::NotFound {
+            return Err(AppError::Io {
+                path: data_path,
+                source,
+            });
+        }
+    }
+    if let Err(source) = fs::remove_file(&meta_path) {
+        if source.kind() != std::io::ErrorKind::NotFound {
+            return Err(AppError::Io {
+                path: meta_path,
+                source,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn inline_part_from_bytes(bytes: &[u8], mime_type: &str, display_name: &str) -> AttachmentPart {
@@ -727,6 +893,120 @@ fn inline_part_from_bytes(bytes: &[u8], mime_type: &str, display_name: &str) -> 
         description: None,
         ext: BTreeMap::new(),
     }
+}
+
+async fn run_structured_extraction(
+    extractor: &StructuredExtractor,
+    payload_kind: &GenerationPayloadKind,
+    bytes: &[u8],
+    display_name: &str,
+) -> Result<StructuredDecision, AppError> {
+    match payload_kind {
+        GenerationPayloadKind::Pdf => {
+            let text = extract_text_from_pdf(bytes)?;
+            let attachments = vec![inline_part_from_bytes(
+                bytes,
+                "application/pdf",
+                display_name,
+            )];
+            let extraction = extractor
+                .extract_with_context(&text, &attachments, Some(&text))
+                .await?;
+            Ok(extraction.decision)
+        }
+        GenerationPayloadKind::Image { mime } => {
+            let attachments = vec![inline_part_from_bytes(bytes, mime.as_str(), display_name)];
+            let extraction = extractor
+                .extract_with_context(DOCUMENT_PROMPT, &attachments, None)
+                .await?;
+            Ok(extraction.decision)
+        }
+    }
+}
+
+async fn finalize_generation(
+    ctx: &PipelineContext,
+    record: &mut GenerationJob,
+    decision: StructuredDecision,
+) -> Result<(), AppError> {
+    use std::str::FromStr;
+
+    if decision.chunks.is_empty() {
+        return Err(PipelineError::message("structured decision produced zero chunks").into());
+    }
+    if decision.chunks.len() > u32::MAX as usize {
+        return Err(
+            PipelineError::message("structured decision has more chunks than supported").into(),
+        );
+    }
+
+    let chunk_texts: Vec<String> = decision
+        .chunks
+        .iter()
+        .map(|chunk| chunk.body.clone())
+        .collect();
+    if chunk_texts.is_empty() {
+        return Err(PipelineError::message("structured decision contains no chunk text").into());
+    }
+    let chunk_refs: Vec<&str> = chunk_texts.iter().map(|text| text.as_str()).collect();
+
+    let content_hash = decision_content_hash(&decision)?;
+    if let Some(existing) = &record.content_hash {
+        if existing != &content_hash {
+            return Err(
+                PipelineError::message("job content hash mismatch after generation").into(),
+            );
+        }
+    } else {
+        record.content_hash = Some(content_hash);
+    }
+    record.chunk_count = chunk_refs.len() as u32;
+
+    let vectors = ctx
+        .embed
+        .embed_batch(
+            &chunk_refs,
+            EmbedBatchTask::Document,
+            ctx.embed.runtime.documents_mode,
+        )
+        .await?;
+    if vectors.len() != chunk_refs.len() {
+        return Err(PipelineError::message(format!(
+            "embedding count mismatch: expected {}, got {}",
+            chunk_refs.len(),
+            vectors.len()
+        ))
+        .into());
+    }
+    for vector in &vectors {
+        if vector.len() != ctx.embed.dim {
+            return Err(PipelineError::message(format!(
+                "embedding dimension mismatch: expected {}, got {}",
+                ctx.embed.dim,
+                vector.len()
+            ))
+            .into());
+        }
+    }
+
+    let silo = Silo::from_str(&record.silo)
+        .map_err(|_| PipelineError::message(format!("unknown silo `{}`", record.silo)))?;
+
+    let index = ctx.index_for(silo)?;
+    let actor = MilliActorHandle::spawn(index, 64);
+    if let Err(err) =
+        index_structured_with_embeddings(&actor, ctx, silo, &record.doc_id, decision, vectors).await
+    {
+        actor.shutdown().await;
+        return Err(AppError::from(err));
+    }
+    actor.shutdown().await;
+
+    record.pending_decision = None;
+    record.completed_at_ms = Some(current_timestamp_ms());
+    record.set_status(GenerationJobStatus::Generated, None);
+    ctx.jobs.upsert(record)?;
+    Ok(())
 }
 
 struct ProgressTracker {
@@ -1031,8 +1311,7 @@ async fn run_search(args: SearchArgs) -> Result<(), AppError> {
 async fn run_jobs(args: JobsArgs) -> Result<(), AppError> {
     match args.command {
         JobsCommands::Status(sub) => jobs_status(sub).await,
-        JobsCommands::Embed(sub) => jobs_embed(sub).await,
-        JobsCommands::Ingest(sub) => jobs_ingest(sub).await,
+        JobsCommands::Gen(sub) => jobs_gen(sub).await,
         JobsCommands::Reap(sub) => jobs_reap(sub).await,
     }
 }
@@ -1042,7 +1321,7 @@ async fn jobs_status(args: JobsStatusArgs) -> Result<(), AppError> {
     use zetesis_app::cli::JobsStatusFormat;
 
     let paths = AppPaths::from_project_dirs()?;
-    let store = EmbeddingJobStore::open(&paths)
+    let store = GenerationJobStore::open(&paths)
         .map_err(PipelineError::from)
         .map_err(AppError::from)?;
 
@@ -1056,12 +1335,10 @@ async fn jobs_status(args: JobsStatusArgs) -> Result<(), AppError> {
             let mut output = serde_json::Map::new();
             for (status, (count, oldest_created, oldest_updated)) in stats {
                 let status_name = match status {
-                    EmbeddingJobStatus::Pending => "pending",
-                    EmbeddingJobStatus::Embedding => "embedding",
-                    EmbeddingJobStatus::Embedded => "embedded",
-                    EmbeddingJobStatus::Ingesting => "ingesting",
-                    EmbeddingJobStatus::Ingested => "ingested",
-                    EmbeddingJobStatus::Failed => "failed",
+                    GenerationJobStatus::Pending => "pending",
+                    GenerationJobStatus::Generating => "generating",
+                    GenerationJobStatus::Generated => "generated",
+                    GenerationJobStatus::Failed => "failed",
                 };
                 let mut status_obj = serde_json::Map::new();
                 status_obj.insert("count".to_string(), serde_json::json!(count));
@@ -1071,7 +1348,10 @@ async fn jobs_status(args: JobsStatusArgs) -> Result<(), AppError> {
                 if let Some(u) = oldest_updated {
                     status_obj.insert("oldest_updated_ms".to_string(), serde_json::json!(u));
                 }
-                output.insert(status_name.to_string(), serde_json::Value::Object(status_obj));
+                output.insert(
+                    status_name.to_string(),
+                    serde_json::Value::Object(status_obj),
+                );
             }
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
@@ -1082,12 +1362,10 @@ async fn jobs_status(args: JobsStatusArgs) -> Result<(), AppError> {
 
             for (status, (count, oldest_created, oldest_updated)) in stats {
                 let status_name = match status {
-                    EmbeddingJobStatus::Pending => "pending",
-                    EmbeddingJobStatus::Embedding => "embedding",
-                    EmbeddingJobStatus::Embedded => "embedded",
-                    EmbeddingJobStatus::Ingesting => "ingesting",
-                    EmbeddingJobStatus::Ingested => "ingested",
-                    EmbeddingJobStatus::Failed => "failed",
+                    GenerationJobStatus::Pending => "pending",
+                    GenerationJobStatus::Generating => "generating",
+                    GenerationJobStatus::Generated => "generated",
+                    GenerationJobStatus::Failed => "failed",
                 };
                 let created_str = oldest_created
                     .map(|ms| format_timestamp(ms))
@@ -1111,7 +1389,7 @@ async fn jobs_status(args: JobsStatusArgs) -> Result<(), AppError> {
 }
 
 fn format_timestamp(ms: i64) -> String {
-    use chrono::{DateTime, Utc};
+    use chrono::DateTime;
     let seconds = ms / 1000;
     let nanos = ((ms % 1000) * 1_000_000) as u32;
     match DateTime::from_timestamp(seconds, nanos) {
@@ -1120,149 +1398,326 @@ fn format_timestamp(ms: i64) -> String {
     }
 }
 
-async fn jobs_embed(args: JobsEmbedArgs) -> Result<(), AppError> {
-    use zetesis_app::services::{ReaperAction, ReaperConfig, reap_stale_jobs};
+async fn jobs_gen(args: JobsGenArgs) -> Result<(), AppError> {
+    match args.command {
+        JobsGenCommands::Submit(sub) => jobs_gen_submit(sub).await,
+        JobsGenCommands::Fetch(sub) => jobs_gen_fetch(sub).await,
+    }
+}
 
+async fn jobs_gen_submit(args: JobsGenSubmitArgs) -> Result<(), AppError> {
     if args.limit == 0 {
-        println!("jobs embed: limit must be greater than zero");
+        println!("jobs gen submit: limit must be greater than zero");
         return Ok(());
     }
 
     let ctx = build_pipeline_context(&args.embed_model)?;
+    let client =
+        GeminiBatchStructuredClient::from_env(args.gen_model.clone(), ctx.governors.io.clone())
+            .map_err(AppError::from)?;
 
-    // Run reaper to handle stale jobs before processing
-    let reaper_config = ReaperConfig::default();
-    let reaper_report = reap_stale_jobs(&ctx.jobs, &reaper_config, ReaperAction::Both)?;
-    if !reaper_report.is_empty() {
-        tracing::debug!(
-            requeued = reaper_report.requeued.len(),
-            failed = reaper_report.failed.len(),
-            skipped = reaper_report.skipped,
-            "reaper cleaned up stale jobs"
-        );
-    }
-    let mut candidates = ctx
+    let candidates = ctx
         .jobs
-        .list_by_status(EmbeddingJobStatus::Pending, args.limit.saturating_mul(8))
+        .list_by_status_with_filter(
+            GenerationJobStatus::Pending,
+            args.limit.saturating_mul(8).max(args.limit),
+            |job| {
+                job.generation_mode == GenerationMode::Batch
+                    && job.generator_key == args.gen_model
+                    && job.embedder_key == args.embed_model
+            },
+        )
         .map_err(PipelineError::from)
         .map_err(AppError::from)?;
+
     if candidates.is_empty() {
-        println!("no pending jobs to embed");
+        println!(
+            "no pending generation jobs found for generator `{}` and embedder `{}`",
+            args.gen_model, args.embed_model
+        );
         return Ok(());
     }
 
-    candidates.retain(|job| job.embedder_key == args.embed_model);
-    if candidates.is_empty() {
-        println!("no pending jobs found for embedder `{}`", args.embed_model);
-        return Ok(());
-    }
-
-    let mut processed = 0_usize;
+    let mut processed = 0usize;
     for job in candidates.into_iter().take(args.limit) {
-        match embed_single_job(&ctx, &job, true).await {
-            Ok(()) => {
-                processed = processed.saturating_add(1);
-                tracing::info!(
-                    job_id = job.job_id.as_str(),
-                    doc_id = job.doc_id.as_str(),
-                    "embedded job"
-                );
+        let mut record =
+            match ctx
+                .jobs
+                .update_status(&job.job_id, GenerationJobStatus::Generating, None)
+            {
+                Ok(record) => record,
+                Err(err) => {
+                    tracing::warn!(
+                        job_id = job.job_id.as_str(),
+                        error = %err,
+                        "failed to mark pending job as generating"
+                    );
+                    continue;
+                }
+            };
+        let (payload_kind, display_name, payload_bytes) =
+            match load_generation_payload(&ctx.paths, &record.silo, &record.doc_id) {
+                Ok(value) => value,
+                Err(err) => {
+                    let msg = format!("failed to load payload: {err}");
+                    fail_job(&ctx, &mut record, msg);
+                    continue;
+                }
+            };
+
+        let batch_input = match payload_kind {
+            GenerationPayloadKind::Pdf => {
+                let text = match extract_text_from_pdf(&payload_bytes) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        fail_job(&ctx, &mut record, err.to_string());
+                        continue;
+                    }
+                };
+                StructuredBatchInput {
+                    doc_id: record.doc_id.clone(),
+                    display_name: display_name.clone(),
+                    mime_type: "application/pdf".to_string(),
+                    bytes: payload_bytes,
+                    text,
+                }
             }
+            GenerationPayloadKind::Image { mime } => StructuredBatchInput {
+                doc_id: record.doc_id.clone(),
+                display_name: display_name.clone(),
+                mime_type: mime,
+                bytes: payload_bytes,
+                text: DOCUMENT_PROMPT.to_string(),
+            },
+        };
+
+        let submission = match client
+            .submit_job(StructuredBatchRequest::single(batch_input))
+            .await
+        {
+            Ok(response) => response,
             Err(err) => {
-                tracing::warn!(job_id = job.job_id.as_str(), error = %err, "failed to embed job");
+                fail_job(&ctx, &mut record, err.to_string());
+                continue;
             }
+        };
+
+        record.provider_kind = GenerationProviderKind::GeminiBatch;
+        record.provider_job_id = Some(submission.provider_job_id.clone());
+        record.submitted_batch_count = record
+            .submitted_batch_count
+            .saturating_add(submission.batch_count);
+        record.submitted_at_ms = Some(current_timestamp_ms());
+        record.error = None;
+        record.last_error = None;
+        record.next_retry_at_ms = None;
+        record.pending_decision = None;
+
+        if let Err(err) = ctx.jobs.upsert(&record) {
+            tracing::warn!(
+                job_id = record.job_id.as_str(),
+                error = %err,
+                "failed to persist generation job submission state"
+            );
+            continue;
         }
+
+        processed = processed.saturating_add(1);
+        tracing::info!(
+            event = "generation_job_submitted",
+            job_id = record.job_id.as_str(),
+            provider_job_id = submission.provider_job_id.as_str(),
+            "submitted generation job to provider"
+        );
     }
 
     if processed == 0 {
-        println!("no jobs processed");
+        println!("no generation jobs submitted");
     } else {
-        println!("embedded {processed} job(s)");
+        println!("submitted {processed} generation job(s)");
     }
     Ok(())
 }
 
-async fn jobs_ingest(args: JobsIngestArgs) -> Result<(), AppError> {
-    use zetesis_app::services::{ReaperAction, ReaperConfig, reap_stale_jobs};
-
+async fn jobs_gen_fetch(args: JobsGenFetchArgs) -> Result<(), AppError> {
     if args.limit == 0 {
-        println!("jobs ingest: limit must be greater than zero");
+        println!("jobs gen fetch: limit must be greater than zero");
         return Ok(());
     }
 
     let ctx = build_pipeline_context(&args.embed_model)?;
-
-    // Run reaper to handle stale jobs before processing
-    let reaper_config = ReaperConfig::default();
-    let reaper_report = reap_stale_jobs(&ctx.jobs, &reaper_config, ReaperAction::Both)?;
-    if !reaper_report.is_empty() {
-        tracing::debug!(
-            requeued = reaper_report.requeued.len(),
-            failed = reaper_report.failed.len(),
-            skipped = reaper_report.skipped,
-            "reaper cleaned up stale jobs"
-        );
-    }
-    let mut candidates = ctx
+    let candidates = ctx
         .jobs
-        .list_by_status(EmbeddingJobStatus::Embedding, args.limit.saturating_mul(8))
+        .list_by_status_with_filter(
+            GenerationJobStatus::Generating,
+            args.limit.saturating_mul(8).max(args.limit),
+            |job| {
+                job.generation_mode == GenerationMode::Batch && job.embedder_key == args.embed_model
+            },
+        )
         .map_err(PipelineError::from)
         .map_err(AppError::from)?;
+
     if candidates.is_empty() {
-        println!("no embedded jobs ready for ingestion");
+        println!(
+            "no in-flight generation jobs found for embedder `{}`",
+            args.embed_model
+        );
         return Ok(());
     }
 
-    candidates.retain(|job| job.embedder_key == args.embed_model);
-    if candidates.is_empty() {
-        println!("no embedded jobs found for embedder `{}`", args.embed_model);
-        return Ok(());
-    }
-
-    let mut processed = 0_usize;
-
+    let mut client_cache: HashMap<String, Arc<GeminiBatchStructuredClient>> = HashMap::new();
+    let mut processed = 0usize;
     for job in candidates.into_iter().take(args.limit) {
-        match ingest_single_job(&ctx, &job).await {
+        let mut record = job.clone();
+        let generator_key = record.generator_key.clone();
+        let Some(provider_job_id) = record.provider_job_id.clone() else {
+            fail_job(
+                &ctx,
+                &mut record,
+                "provider job id missing for generating job",
+            );
+            continue;
+        };
+
+        let client = match client_cache.entry(generator_key.clone()) {
+            Entry::Occupied(entry) => entry.get().clone(),
+            Entry::Vacant(entry) => match GeminiBatchStructuredClient::from_env(
+                generator_key.clone(),
+                ctx.governors.io.clone(),
+            ) {
+                Ok(client) => entry.insert(Arc::new(client)).clone(),
+                Err(err) => {
+                    fail_job(&ctx, &mut record, err.to_string());
+                    continue;
+                }
+            },
+        };
+
+        let metadata = match client.job_state(&provider_job_id).await {
+            Ok(meta) => meta,
+            Err(err) => {
+                fail_job(&ctx, &mut record, err.to_string());
+                continue;
+            }
+        };
+
+        match metadata.state {
+            ProviderJobState::Pending | ProviderJobState::Running => {
+                tracing::info!(
+                    event = "generation_job_inflight",
+                    job_id = record.job_id.as_str(),
+                    provider_job_id = provider_job_id.as_str(),
+                    attempted_fetch = metadata.failed_count,
+                    "generation job still running at provider"
+                );
+                continue;
+            }
+            ProviderJobState::Failed { message, details } => {
+                let mut full_message = message;
+                if let Some(extra) = details {
+                    if !extra.is_empty() {
+                        full_message.push_str(&format!(" ({})", extra.join(", ")));
+                    }
+                }
+                fail_job(&ctx, &mut record, full_message);
+                continue;
+            }
+            ProviderJobState::Succeeded => {}
+        }
+
+        let response = match client.fetch_job_result(&provider_job_id).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                fail_job(&ctx, &mut record, err.to_string());
+                continue;
+            }
+        };
+
+        let mut decisions = response.decisions;
+        let Some(decision) = decisions.pop() else {
+            fail_job(
+                &ctx,
+                &mut record,
+                "provider returned no structured decision payloads",
+            );
+            continue;
+        };
+
+        if decision.chunks.is_empty() {
+            fail_job(
+                &ctx,
+                &mut record,
+                "structured decision produced zero chunks",
+            );
+            continue;
+        }
+        if decision.chunks.len() > u32::MAX as usize {
+            fail_job(
+                &ctx,
+                &mut record,
+                "structured decision has more chunks than supported",
+            );
+            continue;
+        }
+
+        let chunk_count = decision.chunks.len();
+        let hash = match decision_content_hash(&decision) {
+            Ok(hash) => hash,
+            Err(err) => {
+                fail_job(&ctx, &mut record, err.to_string());
+                continue;
+            }
+        };
+
+        record.pending_decision = Some(decision.clone());
+        record.content_hash = Some(hash);
+        record.chunk_count = chunk_count as u32;
+        record.provider_kind = GenerationProviderKind::GeminiBatch;
+        record.error = None;
+        record.last_error = None;
+        record.next_retry_at_ms = None;
+
+        match finalize_generation(&ctx, &mut record, decision).await {
             Ok(()) => {
                 processed = processed.saturating_add(1);
+                if let Err(err) =
+                    remove_generation_payload(&ctx.paths, &record.silo, &record.doc_id)
+                {
+                    tracing::warn!(
+                        job_id = record.job_id.as_str(),
+                        error = %err,
+                        "failed to remove generation payload after completion"
+                    );
+                }
                 tracing::info!(
-                    job_id = job.job_id.as_str(),
-                    doc_id = job.doc_id.as_str(),
-                    "ingested job"
+                    event = "generation_job_completed",
+                    job_id = record.job_id.as_str(),
+                    provider_job_id = provider_job_id.as_str(),
+                    "generation job finalized"
                 );
             }
             Err(err) => {
-                tracing::warn!(job_id = job.job_id.as_str(), error = %err, "failed to ingest job");
+                fail_job(&ctx, &mut record, err.to_string());
             }
         }
     }
 
-    let remaining = ctx
-        .jobs
-        .list_by_status(EmbeddingJobStatus::Embedding, usize::MAX)
-        .map_err(PipelineError::from)
-        .map_err(AppError::from)?
-        .into_iter()
-        .filter(|job| job.embedder_key == args.embed_model)
-        .count();
-
     if processed == 0 {
-        println!("no jobs ingested; {remaining} job(s) still waiting for provider completion");
+        println!("no generation jobs completed during fetch");
     } else {
-        println!(
-            "ingested {processed} job(s); {remaining} job(s) still waiting for provider completion"
-        );
+        println!("completed {processed} generation job(s)");
     }
     Ok(())
 }
 
 async fn jobs_reap(args: JobsReapArgs) -> Result<(), AppError> {
+    use comfy_table::{Table, presets};
     use zetesis_app::cli::JobsReapAction;
     use zetesis_app::services::{ReaperAction, ReaperConfig, reap_stale_jobs};
-    use comfy_table::{Table, presets};
 
     let paths = AppPaths::from_project_dirs()?;
-    let store = EmbeddingJobStore::open(&paths)
+    let store = GenerationJobStore::open(&paths)
         .map_err(PipelineError::from)
         .map_err(AppError::from)?;
 
@@ -1277,11 +1732,11 @@ async fn jobs_reap(args: JobsReapArgs) -> Result<(), AppError> {
     if args.dry_run {
         println!("Dry run mode: no jobs will be modified");
         println!(
-            "Reaper config:\n  Pending max age: {} ms ({} hours)\n  Embedding max age: {} ms ({} hours)",
+            "Reaper config:\n  Pending max age: {} ms ({} hours)\n  Generating max age: {} ms ({} hours)",
             config.pending_max_age_ms,
             config.pending_max_age_ms / 3_600_000,
-            config.embedding_max_age_ms,
-            config.embedding_max_age_ms / 3_600_000
+            config.generating_max_age_ms,
+            config.generating_max_age_ms / 3_600_000
         );
         return Ok(());
     }
@@ -1298,11 +1753,7 @@ async fn jobs_reap(args: JobsReapArgs) -> Result<(), AppError> {
         if !report.requeued.is_empty() {
             let requeued_count = report.requeued.len().to_string();
             let requeued_ids = report.requeued.join(", ");
-            table.add_row(vec![
-                "Requeued".to_string(),
-                requeued_count,
-                requeued_ids,
-            ]);
+            table.add_row(vec!["Requeued".to_string(), requeued_count, requeued_ids]);
         }
         if !report.failed.is_empty() {
             let failed_count = report.failed.len().to_string();
@@ -1327,10 +1778,10 @@ async fn jobs_reap(args: JobsReapArgs) -> Result<(), AppError> {
     Ok(())
 }
 
-fn fail_job(ctx: &PipelineContext, record: &mut EmbeddingJob, message: impl Into<String>) {
+fn fail_job(ctx: &PipelineContext, record: &mut GenerationJob, message: impl Into<String>) {
     let msg = message.into();
     tracing::warn!(job_id = record.job_id.as_str(), error = %msg, "job failed");
-    record.set_status(EmbeddingJobStatus::Failed, Some(msg.clone()));
+    record.set_status(GenerationJobStatus::Failed, Some(msg.clone()));
     if let Err(err) = ctx.jobs.upsert(record) {
         tracing::warn!(
             job_id = record.job_id.as_str(),
@@ -1347,312 +1798,6 @@ fn current_timestamp_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
-}
-
-async fn embed_single_job(
-    ctx: &PipelineContext,
-    job: &EmbeddingJob,
-    enable_batch: bool,
-) -> Result<(), PipelineError> {
-    use std::str::FromStr;
-
-    let mut record = ctx
-        .jobs
-        .update_status(&job.job_id, EmbeddingJobStatus::Embedding, None)?;
-
-    let silo = match Silo::from_str(&record.silo) {
-        Ok(value) => value,
-        Err(_) => {
-            let message = format!("unknown silo `{}`", record.silo);
-            fail_job(ctx, &mut record, message.clone());
-            return Err(PipelineError::message(message));
-        }
-    };
-
-    let decision = if let Some(decision) = record.pending_decision.clone() {
-        decision
-    } else {
-        match load_structured_decision(ctx, silo, &record.doc_id) {
-            Ok(value) => value,
-            Err(err) => {
-                fail_job(ctx, &mut record, err.to_string());
-                return Err(err);
-            }
-        }
-    };
-    let chunk_texts: Vec<String> = decision
-        .chunks
-        .iter()
-        .map(|chunk| chunk.body.clone())
-        .collect();
-    if chunk_texts.is_empty() {
-        let message = "job has no semantic chunks".to_string();
-        fail_job(ctx, &mut record, message.clone());
-        return Err(PipelineError::message(message));
-    }
-    if chunk_texts.len() > u32::MAX as usize {
-        let message = "chunk count exceeds supported range".to_string();
-        fail_job(ctx, &mut record, message.clone());
-        return Err(PipelineError::message(message));
-    }
-
-    let chunk_refs: Vec<&str> = chunk_texts.iter().map(|text| text.as_str()).collect();
-
-    let content_hash =
-        decision_content_hash(&decision).map_err(|err| PipelineError::message(err.to_string()))?;
-    if let Some(expected) = &record.content_hash {
-        if expected != &content_hash {
-            let message = "job content hash mismatch; marking as stale".to_string();
-            record.stale = true;
-            fail_job(ctx, &mut record, message.clone());
-            return Err(PipelineError::message(message));
-        }
-    } else {
-        record.content_hash = Some(content_hash.clone());
-    }
-    record.chunk_count = chunk_refs.len() as u32;
-
-    if enable_batch && let Some(provider) = ctx.embed.provider() {
-        match provider
-            .submit_job(
-                &record.doc_id,
-                &chunk_texts,
-                EmbedBatchTask::Document,
-                record.mode,
-            )
-            .await
-        {
-            Ok(submission) => {
-                record.provider_kind = EmbeddingProviderKind::GeminiBatch;
-                record.provider_job_id = Some(submission.provider_job_id);
-                record.submitted_batch_count = submission.batch_count;
-                record.submitted_at_ms = Some(current_timestamp_ms());
-                ctx.jobs.upsert(&record)?;
-                return Ok(());
-            }
-            Err(err) => {
-                // Special-case Gemini batch endpoint unavailability: fall back to
-                // synchronous embedding instead of failing the job.
-                if let PipelineError::Gemini(e_box) = &err {
-                    if let gemini_ox::GeminiRequestError::BatchNotAvailable { .. } = **e_box {
-                        tracing::warn!(
-                            job_id = record.job_id.as_str(),
-                            error = %e_box,
-                            "batch endpoint unavailable; falling back to synchronous embedding"
-                        );
-                        // continue to synchronous path
-                    } else {
-                        fail_job(ctx, &mut record, err.to_string());
-                        return Err(err);
-                    }
-                } else {
-                    fail_job(ctx, &mut record, err.to_string());
-                    return Err(err);
-                }
-            }
-        }
-    }
-    // Fallback: run synchronous embedding and ingest immediately.
-    let vectors = ctx
-        .embed
-        .embed_batch(&chunk_refs, EmbedBatchTask::Document, record.mode)
-        .await?;
-
-    if vectors.len() != chunk_refs.len() {
-        let message = format!(
-            "embedding count mismatch: expected {}, got {}",
-            chunk_refs.len(),
-            vectors.len()
-        );
-        fail_job(ctx, &mut record, message.clone());
-        return Err(PipelineError::message(message));
-    }
-    for vector in &vectors {
-        if vector.len() != ctx.embed.dim {
-            let message = format!(
-                "embedding dimension mismatch: expected {}, got {}",
-                ctx.embed.dim,
-                vector.len()
-            );
-            fail_job(ctx, &mut record, message.clone());
-            return Err(PipelineError::message(message));
-        }
-    }
-
-    let index = ctx.index_for(silo)?;
-    let actor = MilliActorHandle::spawn(index, 64);
-    if let Err(err) =
-        index_structured_with_embeddings(&actor, ctx, silo, &record.doc_id, decision, vectors).await
-    {
-        actor.shutdown().await;
-        fail_job(ctx, &mut record, err.to_string());
-        return Err(err);
-    }
-    actor.shutdown().await;
-
-    record.provider_kind = EmbeddingProviderKind::Synchronous;
-    record.provider_job_id = None;
-    record.submitted_batch_count = 0;
-    record.submitted_at_ms = None;
-    record.completed_at_ms = Some(current_timestamp_ms());
-    record.pending_decision = None;
-    record.set_status(EmbeddingJobStatus::Ingested, None);
-    ctx.jobs.upsert(&record)?;
-    Ok(())
-}
-
-async fn ingest_single_job(ctx: &PipelineContext, job: &EmbeddingJob) -> Result<(), PipelineError> {
-    use std::str::FromStr;
-
-    let mut record = ctx
-        .jobs
-        .update_status(&job.job_id, EmbeddingJobStatus::Ingesting, None)?;
-
-    let silo = match Silo::from_str(&record.silo) {
-        Ok(value) => value,
-        Err(_) => {
-            let message = format!("unknown silo `{}`", record.silo);
-            fail_job(ctx, &mut record, message.clone());
-            return Err(PipelineError::message(message));
-        }
-    };
-
-    let decision = if let Some(decision) = record.pending_decision.clone() {
-        decision
-    } else {
-        match load_structured_decision(ctx, silo, &record.doc_id) {
-            Ok(value) => value,
-            Err(err) => {
-                fail_job(ctx, &mut record, err.to_string());
-                return Err(err);
-            }
-        }
-    };
-
-    let chunk_texts: Vec<String> = decision
-        .chunks
-        .iter()
-        .map(|chunk| chunk.body.clone())
-        .collect();
-    if chunk_texts.is_empty() {
-        let message = "job has no semantic chunks".to_string();
-        fail_job(ctx, &mut record, message.clone());
-        return Err(PipelineError::message(message));
-    }
-    if chunk_texts.len() > u32::MAX as usize {
-        let message = "chunk count exceeds supported range".to_string();
-        fail_job(ctx, &mut record, message.clone());
-        return Err(PipelineError::message(message));
-    }
-
-    let current_hash =
-        decision_content_hash(&decision).map_err(|err| PipelineError::message(err.to_string()))?;
-    if let Some(expected) = &record.content_hash {
-        if expected != &current_hash {
-            let message = "structured content changed while job was pending".to_string();
-            record.stale = true;
-            fail_job(ctx, &mut record, message.clone());
-            return Err(PipelineError::message(message));
-        }
-    } else {
-        record.content_hash = Some(current_hash);
-    }
-
-    if record.chunk_count == 0 {
-        record.chunk_count = chunk_texts.len() as u32;
-    } else if record.chunk_count != chunk_texts.len() as u32 {
-        let message = format!(
-            "chunk count mismatch: expected {}, got {}",
-            record.chunk_count,
-            chunk_texts.len()
-        );
-        fail_job(ctx, &mut record, message.clone());
-        return Err(PipelineError::message(message));
-    }
-
-    if record.provider_kind == EmbeddingProviderKind::Synchronous {
-        record.set_status(EmbeddingJobStatus::Ingested, None);
-        record.completed_at_ms.get_or_insert(current_timestamp_ms());
-        ctx.jobs.upsert(&record)?;
-        return Ok(());
-    }
-
-    let provider_job_id = match &record.provider_job_id {
-        Some(id) => id.clone(),
-        None => {
-            let message = "missing provider job id".to_string();
-            fail_job(ctx, &mut record, message.clone());
-            return Err(PipelineError::message(message));
-        }
-    };
-
-    let provider = match ctx.embed.provider() {
-        Some(p) => p,
-        None => {
-            let message = "embedding provider not configured".to_string();
-            fail_job(ctx, &mut record, message.clone());
-            return Err(PipelineError::message(message));
-        }
-    };
-
-    let metadata = provider.job_state(&provider_job_id).await?;
-    match metadata.state {
-        ProviderJobState::Pending | ProviderJobState::Running => {
-            record.set_status(EmbeddingJobStatus::Embedding, None);
-            ctx.jobs.upsert(&record)?;
-            return Ok(());
-        }
-        ProviderJobState::Failed { message, .. } => {
-            fail_job(ctx, &mut record, message.clone());
-            return Err(PipelineError::message(message));
-        }
-        ProviderJobState::Succeeded => {
-            if metadata.failed_count > 0 {
-                let message = format!("provider reported {} failed item(s)", metadata.failed_count);
-                fail_job(ctx, &mut record, message.clone());
-                return Err(PipelineError::message(message));
-            }
-        }
-    }
-
-    let vectors = provider.fetch_job_result(&provider_job_id).await?;
-    if vectors.len() != chunk_texts.len() {
-        let message = format!(
-            "vector count mismatch: expected {}, got {}",
-            chunk_texts.len(),
-            vectors.len()
-        );
-        fail_job(ctx, &mut record, message.clone());
-        return Err(PipelineError::message(message));
-    }
-    for vector in &vectors {
-        if vector.len() != ctx.embed.dim {
-            let message = format!(
-                "embedding dimension mismatch: expected {}, got {}",
-                ctx.embed.dim,
-                vector.len()
-            );
-            fail_job(ctx, &mut record, message.clone());
-            return Err(PipelineError::message(message));
-        }
-    }
-
-    let index = ctx.index_for(silo)?;
-    let actor = MilliActorHandle::spawn(index, 64);
-    if let Err(err) =
-        index_structured_with_embeddings(&actor, ctx, silo, &record.doc_id, decision, vectors).await
-    {
-        actor.shutdown().await;
-        fail_job(ctx, &mut record, err.to_string());
-        return Err(err);
-    }
-    actor.shutdown().await;
-
-    record.pending_decision = None;
-    record.set_status(EmbeddingJobStatus::Ingested, None);
-    record.completed_at_ms.get_or_insert(current_timestamp_ms());
-    ctx.jobs.upsert(&record)?;
-    Ok(())
 }
 
 async fn run_db(args: DbArgs) -> Result<(), AppError> {

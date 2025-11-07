@@ -11,11 +11,11 @@ use tempfile::TempDir;
 use zetesis_app::constants::{DEFAULT_EMBEDDER_KEY, DEFAULT_EMBEDDING_DIM};
 use zetesis_app::index::milli::ensure_index;
 use zetesis_app::paths::AppPaths;
-use zetesis_app::pipeline::processor::Silo;
 use zetesis_app::pipeline::index_payload::{IngestMetadata, build_document_payload};
+use zetesis_app::pipeline::processor::Silo;
 use zetesis_app::pipeline::structured::{
-    DecisionInfo, DecisionResult, Identifiers, IssueKey, IssueTag, PanelMember, PanelRole,
-    Parties, Procurement, SemanticChunk, StructuredDecision,
+    DecisionInfo, DecisionResult, Identifiers, IssueKey, IssueTag, PanelMember, PanelRole, Parties,
+    Procurement, SemanticChunk, StructuredDecision,
 };
 use zetesis_app::services::MilliActorHandle;
 
@@ -90,8 +90,13 @@ async fn test_ingest_structured_decision_with_embeddings() {
 
     // Setup: ensure index for silo "kio" with default embedder
     let silo = Silo::Kio;
-    let index = ensure_index(&app_paths, silo, DEFAULT_EMBEDDER_KEY, DEFAULT_EMBEDDING_DIM)
-        .expect("failed to ensure index");
+    let index = ensure_index(
+        &app_paths,
+        silo,
+        DEFAULT_EMBEDDER_KEY,
+        DEFAULT_EMBEDDING_DIM,
+    )
+    .expect("failed to ensure index");
 
     // Setup: MilliActorHandle
     let actor = MilliActorHandle::spawn(index, 64);
@@ -127,7 +132,10 @@ async fn test_ingest_structured_decision_with_embeddings() {
             let mut record = chunk.record;
             // Insert embeddings in the correct nested structure
             let mut vectors_map = serde_json::Map::new();
-            vectors_map.insert(DEFAULT_EMBEDDER_KEY.to_string(), serde_json::json!(embedding));
+            vectors_map.insert(
+                DEFAULT_EMBEDDER_KEY.to_string(),
+                serde_json::json!(embedding),
+            );
             record.insert("_vectors".to_string(), serde_json::json!(vectors_map));
             record
         })
@@ -151,8 +159,13 @@ async fn test_ingest_idempotency() {
 
     // Setup: ensure index for silo "kio"
     let silo = Silo::Kio;
-    let index = ensure_index(&app_paths, silo, DEFAULT_EMBEDDER_KEY, DEFAULT_EMBEDDING_DIM)
-        .expect("failed to ensure index");
+    let index = ensure_index(
+        &app_paths,
+        silo,
+        DEFAULT_EMBEDDER_KEY,
+        DEFAULT_EMBEDDING_DIM,
+    )
+    .expect("failed to ensure index");
 
     // Setup: MilliActorHandle
     let actor = MilliActorHandle::spawn(index, 64);
@@ -186,7 +199,10 @@ async fn test_ingest_idempotency() {
             .map(|(chunk, embedding)| {
                 let mut record = chunk.record;
                 let mut vectors_map = serde_json::Map::new();
-                vectors_map.insert(DEFAULT_EMBEDDER_KEY.to_string(), serde_json::json!(embedding));
+                vectors_map.insert(
+                    DEFAULT_EMBEDDER_KEY.to_string(),
+                    serde_json::json!(embedding),
+                );
                 record.insert("_vectors".to_string(), serde_json::json!(vectors_map));
                 record
             })
@@ -221,7 +237,10 @@ async fn test_ingest_idempotency() {
             .map(|(chunk, embedding)| {
                 let mut record = chunk.record;
                 let mut vectors_map = serde_json::Map::new();
-                vectors_map.insert(DEFAULT_EMBEDDER_KEY.to_string(), serde_json::json!(embedding));
+                vectors_map.insert(
+                    DEFAULT_EMBEDDER_KEY.to_string(),
+                    serde_json::json!(embedding),
+                );
                 record.insert("_vectors".to_string(), serde_json::json!(vectors_map));
                 record
             })

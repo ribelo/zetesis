@@ -14,9 +14,9 @@ use crate::constants::DEFAULT_EMBEDDING_DIM;
 use crate::index::milli::{MilliBootstrapError, ensure_index};
 use crate::index::writer::IndexWriteError;
 use crate::paths::{AppPaths, PathError};
-use crate::pipeline::Silo;
+use crate::pipeline::{Silo, structured::StructuredDecision};
 use crate::services::GeminiEmbedClient;
-use crate::services::jobs::{EmbeddingJobStore, EmbeddingJobStoreError};
+use crate::services::jobs::{GenerationJobStore, GenerationJobStoreError};
 use gemini_ox::GeminiRequestError;
 
 pub type GenericRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
@@ -86,6 +86,89 @@ pub trait EmbeddingJobClient: Send + Sync {
 }
 
 #[derive(Debug, Clone)]
+pub struct StructuredBatchInput {
+    pub doc_id: String,
+    pub display_name: String,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+    pub text: String,
+}
+
+impl StructuredBatchInput {
+    fn validate(&self) -> Result<(), PipelineError> {
+        if self.doc_id.trim().is_empty() {
+            return Err(PipelineError::message(
+                "structured batch input doc_id must not be empty",
+            ));
+        }
+        if self.display_name.trim().is_empty() {
+            return Err(PipelineError::message(
+                "structured batch input display_name must not be empty",
+            ));
+        }
+        if self.mime_type.trim().is_empty() {
+            return Err(PipelineError::message(
+                "structured batch input mime_type must not be empty",
+            ));
+        }
+        if self.bytes.is_empty() {
+            return Err(PipelineError::message(
+                "structured batch input bytes must not be empty",
+            ));
+        }
+        if self.text.trim().is_empty() {
+            return Err(PipelineError::message(
+                "structured batch input text must not be empty",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StructuredBatchRequest {
+    pub inputs: Vec<StructuredBatchInput>,
+}
+
+impl StructuredBatchRequest {
+    pub fn single(input: StructuredBatchInput) -> Self {
+        Self {
+            inputs: vec![input],
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), PipelineError> {
+        const MAX_STRUCTURED_INPUTS: usize = 32;
+        if self.inputs.is_empty() {
+            return Err(PipelineError::message(
+                "structured batch request must contain at least one input",
+            ));
+        }
+        if self.inputs.len() > MAX_STRUCTURED_INPUTS {
+            return Err(PipelineError::message(format!(
+                "structured batch request exceeds max inputs ({} > {})",
+                self.inputs.len(),
+                MAX_STRUCTURED_INPUTS
+            )));
+        }
+        if self.inputs.len() > u32::MAX as usize {
+            return Err(PipelineError::message(
+                "structured batch input count exceeds supported range",
+            ));
+        }
+        for input in &self.inputs {
+            input.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StructuredBatchResponse {
+    pub decisions: Vec<StructuredDecision>,
+}
+
+#[derive(Debug, Clone)]
 pub struct SubmittedJob {
     pub provider_job_id: String,
     pub batch_count: u32,
@@ -106,6 +189,18 @@ pub enum ProviderJobState {
         message: String,
         details: Option<Vec<String>>,
     },
+}
+
+#[async_trait]
+pub trait StructuredJobClient: Send + Sync {
+    async fn submit_job(&self, request: StructuredBatchRequest) -> PipelineResult<SubmittedJob>;
+
+    async fn job_state(&self, provider_job_id: &str) -> PipelineResult<JobMetadata>;
+
+    async fn fetch_job_result(
+        &self,
+        provider_job_id: &str,
+    ) -> PipelineResult<StructuredBatchResponse>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -156,7 +251,7 @@ pub struct Governors {
 pub struct PipelineContext {
     pub paths: AppPaths,
     pub embed: EmbedService,
-    pub jobs: Arc<EmbeddingJobStore>,
+    pub jobs: Arc<GenerationJobStore>,
     pub backoff: ExponentialBuilder,
     pub governors: Governors,
 }
@@ -194,7 +289,7 @@ pub enum PipelineError {
     #[error(transparent)]
     Embedding(#[from] EmbeddingError),
     #[error(transparent)]
-    Jobs(#[from] EmbeddingJobStoreError),
+    Jobs(#[from] GenerationJobStoreError),
 }
 
 impl PipelineError {
@@ -216,7 +311,7 @@ pub fn build_pipeline_context(embed_model: &str) -> Result<PipelineContext, Pipe
         Some(embed_limiter.clone()),
         runtime.max_batch,
     )?);
-    let job_store = EmbeddingJobStore::open(&paths)?;
+    let job_store = GenerationJobStore::open(&paths)?;
     let embed_client: Arc<dyn EmbedClient> = client.clone();
     let job_provider: Arc<dyn EmbeddingJobClient> = client.clone();
     let embed = EmbedService {

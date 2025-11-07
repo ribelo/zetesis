@@ -639,9 +639,7 @@ enum ProcessOutcome {
         existed: bool,
     },
     #[allow(dead_code)]
-    Skipped {
-        cid: String,
-    },
+    Skipped { cid: String },
 }
 
 fn spawn_workers(
@@ -755,10 +753,14 @@ async fn process_worker_task(
         }
         Ok(ProcessOutcome::Skipped { cid }) => {
             stats.skipped.fetch_add(1, Ordering::Relaxed);
-            send_event(&stats.event_tx, KioEvent::BlobSkipped {
-                cid,
-                upstream_id: doc_id,
-            }).await?;
+            send_event(
+                &stats.event_tx,
+                KioEvent::BlobSkipped {
+                    cid,
+                    upstream_id: doc_id,
+                },
+            )
+            .await?;
             Ok(())
         }
         Err(err) => {

@@ -2,7 +2,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::paths::{AppPaths, PathError};
 use crate::pipeline::structured::StructuredDecision;
-use crate::services::context::EmbedMode;
 use bincode::config;
 use bincode::error::{DecodeError, EncodeError};
 use bincode::serde::{decode_from_slice, encode_to_vec};
@@ -19,42 +18,47 @@ fn default_max_retries() -> u32 {
     DEFAULT_MAX_RETRIES
 }
 
-/// Lifecycle state of an embedding job.
+/// Lifecycle state of a structured generation job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum EmbeddingJobStatus {
+pub enum GenerationJobStatus {
     Pending,
-    Embedding,
-    Embedded,
-    Ingesting,
-    Ingested,
+    Generating,
+    Generated,
     Failed,
 }
 
-/// Metadata persisted for every embedding job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GenerationMode {
+    Sync,
+    Batch,
+}
+
+/// Metadata persisted for every generation job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmbeddingJob {
+pub struct GenerationJob {
     pub job_id: String,
     pub doc_id: String,
     pub silo: String,
     pub embedder_key: String,
-    pub status: EmbeddingJobStatus,
-    pub mode: EmbedMode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generator_key: String,
+    pub status: GenerationJobStatus,
+    pub generation_mode: GenerationMode,
+    #[serde(default)]
     pub provider_job_id: Option<String>,
     #[serde(default)]
-    pub provider_kind: EmbeddingProviderKind,
+    pub provider_kind: GenerationProviderKind,
     #[serde(default)]
     pub submitted_batch_count: u32,
     #[serde(default)]
     pub chunk_count: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub content_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub submitted_at_ms: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub completed_at_ms: Option<i64>,
     pub error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub pending_decision: Option<StructuredDecision>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -64,28 +68,27 @@ pub struct EmbeddingJob {
     pub retry_count: u32,
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub last_error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub next_retry_at_ms: Option<i64>,
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EmbeddingProviderKind {
+pub enum GenerationProviderKind {
     #[default]
-    GeminiBatch,
     Synchronous,
+    GeminiBatch,
 }
 
-impl EmbeddingJob {
+impl GenerationJob {
     #[must_use]
     pub fn new(
         doc_id: impl Into<String>,
         silo: impl Into<String>,
         embedder_key: impl Into<String>,
-        mode: EmbedMode,
-        chunk_count: u32,
-        content_hash: Option<String>,
+        generator_key: impl Into<String>,
+        generation_mode: GenerationMode,
     ) -> Self {
         let doc_id = doc_id.into();
         debug_assert!(!doc_id.is_empty());
@@ -95,13 +98,14 @@ impl EmbeddingJob {
             doc_id,
             silo: silo.into(),
             embedder_key: embedder_key.into(),
-            status: EmbeddingJobStatus::Pending,
-            mode,
+            generator_key: generator_key.into(),
+            status: GenerationJobStatus::Pending,
+            generation_mode,
             provider_job_id: None,
-            provider_kind: EmbeddingProviderKind::default(),
+            provider_kind: GenerationProviderKind::default(),
             submitted_batch_count: 0,
-            chunk_count,
-            content_hash,
+            chunk_count: 0,
+            content_hash: None,
             submitted_at_ms: None,
             completed_at_ms: None,
             error: None,
@@ -117,14 +121,14 @@ impl EmbeddingJob {
     }
 
     #[must_use]
-    pub fn with_status(mut self, status: EmbeddingJobStatus, error: Option<String>) -> Self {
+    pub fn with_status(mut self, status: GenerationJobStatus, error: Option<String>) -> Self {
         self.status = status;
         self.error = error;
         self.updated_at_ms = current_timestamp_ms();
         self
     }
 
-    pub fn set_status(&mut self, status: EmbeddingJobStatus, error: Option<String>) {
+    pub fn set_status(&mut self, status: GenerationJobStatus, error: Option<String>) {
         self.status = status;
         self.error = error;
         self.updated_at_ms = current_timestamp_ms();
@@ -140,7 +144,7 @@ pub(crate) fn current_timestamp_ms() -> i64 {
 
 /// Errors emitted by the embedding job store.
 #[derive(Debug, Error)]
-pub enum EmbeddingJobStoreError {
+pub enum GenerationJobStoreError {
     #[error(transparent)]
     Path(#[from] PathError),
     #[error(transparent)]
@@ -161,14 +165,14 @@ pub enum EmbeddingJobStoreError {
 
 /// LMDB-backed persistence for embedding jobs.
 #[derive(Debug)]
-pub struct EmbeddingJobStore {
+pub struct GenerationJobStore {
     env: Env,
     jobs: Database<Str, Bytes>,
 }
 
-impl EmbeddingJobStore {
-    pub fn open(paths: &AppPaths) -> Result<Self, EmbeddingJobStoreError> {
-        let path = paths.embedding_jobs_lmdb_dir()?;
+impl GenerationJobStore {
+    pub fn open(paths: &AppPaths) -> Result<Self, GenerationJobStoreError> {
+        let path = paths.generation_jobs_lmdb_dir()?;
         debug_assert!(path.exists());
 
         let mut options = EnvOpenOptions::new();
@@ -195,28 +199,28 @@ impl EmbeddingJobStore {
         Ok(Self { env, jobs })
     }
 
-    pub fn enqueue(&self, job: &EmbeddingJob) -> Result<(), EmbeddingJobStoreError> {
+    pub fn enqueue(&self, job: &GenerationJob) -> Result<(), GenerationJobStoreError> {
         debug_assert!(!job.job_id.is_empty());
-        debug_assert!(job.status == EmbeddingJobStatus::Pending);
+        debug_assert!(job.status == GenerationJobStatus::Pending);
 
         let mut wtxn = self.env.write_txn()?;
         if self.jobs.get(&wtxn, job.job_id.as_str())?.is_some() {
-            return Err(EmbeddingJobStoreError::Duplicate(job.job_id.clone()));
+            return Err(GenerationJobStoreError::Duplicate(job.job_id.clone()));
         }
         let encoded = encode_to_vec(job, config::standard())?;
         self.jobs
             .put(&mut wtxn, job.job_id.as_str(), encoded.as_slice())
-            .map_err(EmbeddingJobStoreError::from)?;
+            .map_err(GenerationJobStoreError::from)?;
         wtxn.commit()?;
         Ok(())
     }
 
-    pub fn get(&self, job_id: &str) -> Result<Option<EmbeddingJob>, EmbeddingJobStoreError> {
+    pub fn get(&self, job_id: &str) -> Result<Option<GenerationJob>, GenerationJobStoreError> {
         debug_assert!(!job_id.is_empty());
         let rtxn = self.env.read_txn()?;
         let value = self.jobs.get(&rtxn, job_id)?;
         if let Some(raw) = value {
-            let (job, _) = decode_from_slice::<EmbeddingJob, _>(raw, config::standard())?;
+            let (job, _) = decode_from_slice::<GenerationJob, _>(raw, config::standard())?;
             Ok(Some(job))
         } else {
             Ok(None)
@@ -230,9 +234,21 @@ impl EmbeddingJobStore {
     /// immediate re-processing of recently failed jobs.
     pub fn list_by_status(
         &self,
-        status: EmbeddingJobStatus,
+        status: GenerationJobStatus,
         limit: usize,
-    ) -> Result<Vec<EmbeddingJob>, EmbeddingJobStoreError> {
+    ) -> Result<Vec<GenerationJob>, GenerationJobStoreError> {
+        self.list_by_status_with_filter(status, limit, |_| true)
+    }
+
+    pub fn list_by_status_with_filter<F>(
+        &self,
+        status: GenerationJobStatus,
+        limit: usize,
+        mut predicate: F,
+    ) -> Result<Vec<GenerationJob>, GenerationJobStoreError>
+    where
+        F: FnMut(&GenerationJob) -> bool,
+    {
         debug_assert!(limit > 0);
         let now_ms = current_timestamp_ms();
         let rtxn = self.env.read_txn()?;
@@ -240,18 +256,21 @@ impl EmbeddingJobStore {
         let mut out = Vec::new();
         for entry in iter {
             let (_, raw) = entry?;
-            let (job, _) = decode_from_slice::<EmbeddingJob, _>(raw, config::standard())?;
-            if job.status == status {
-                // Skip jobs that are scheduled for retry in the future
-                if let Some(retry_at) = job.next_retry_at_ms {
-                    if retry_at > now_ms {
-                        continue;
-                    }
+            let (job, _) = decode_from_slice::<GenerationJob, _>(raw, config::standard())?;
+            if job.status != status {
+                continue;
+            }
+            if let Some(retry_at) = job.next_retry_at_ms {
+                if retry_at > now_ms {
+                    continue;
                 }
-                out.push(job);
-                if out.len() >= limit {
-                    break;
-                }
+            }
+            if !predicate(&job) {
+                continue;
+            }
+            out.push(job);
+            if out.len() >= limit {
+                break;
             }
         }
         Ok(out)
@@ -260,16 +279,16 @@ impl EmbeddingJobStore {
     pub fn update_status(
         &self,
         job_id: &str,
-        status: EmbeddingJobStatus,
+        status: GenerationJobStatus,
         error: Option<String>,
-    ) -> Result<EmbeddingJob, EmbeddingJobStoreError> {
+    ) -> Result<GenerationJob, GenerationJobStoreError> {
         debug_assert!(!job_id.is_empty());
         let mut wtxn = self.env.write_txn()?;
         let existing = self.jobs.get(&wtxn, job_id)?;
         let Some(raw) = existing else {
-            return Err(EmbeddingJobStoreError::NotFound(job_id.to_string()));
+            return Err(GenerationJobStoreError::NotFound(job_id.to_string()));
         };
-        let (mut job, _) = decode_from_slice::<EmbeddingJob, _>(raw, config::standard())?;
+        let (mut job, _) = decode_from_slice::<GenerationJob, _>(raw, config::standard())?;
         job.set_status(status, error);
         let encoded = encode_to_vec(&job, config::standard())?;
         self.jobs.put(&mut wtxn, job_id, encoded.as_slice())?;
@@ -277,27 +296,27 @@ impl EmbeddingJobStore {
         Ok(job)
     }
 
-    pub fn upsert(&self, job: &EmbeddingJob) -> Result<(), EmbeddingJobStoreError> {
+    pub fn upsert(&self, job: &GenerationJob) -> Result<(), GenerationJobStoreError> {
         debug_assert!(!job.job_id.is_empty());
         let mut wtxn = self.env.write_txn()?;
         let encoded = encode_to_vec(job, config::standard())?;
         self.jobs
             .put(&mut wtxn, job.job_id.as_str(), encoded.as_slice())
-            .map_err(EmbeddingJobStoreError::from)?;
+            .map_err(GenerationJobStoreError::from)?;
         wtxn.commit()?;
         Ok(())
     }
 
     pub fn count_by_status(
         &self,
-        status: EmbeddingJobStatus,
-    ) -> Result<usize, EmbeddingJobStoreError> {
+        status: GenerationJobStatus,
+    ) -> Result<usize, GenerationJobStoreError> {
         let rtxn = self.env.read_txn()?;
         let iter = self.jobs.iter(&rtxn)?;
         let mut count = 0_usize;
         for entry in iter {
             let (_, raw) = entry?;
-            let (job, _) = decode_from_slice::<EmbeddingJob, _>(raw, config::standard())?;
+            let (job, _) = decode_from_slice::<GenerationJob, _>(raw, config::standard())?;
             if job.status == status {
                 count = count.saturating_add(1);
             }
@@ -308,10 +327,10 @@ impl EmbeddingJobStore {
     /// List jobs with given status that have not been updated within the threshold.
     pub fn list_stale_jobs(
         &self,
-        status: EmbeddingJobStatus,
+        status: GenerationJobStatus,
         age_threshold_ms: i64,
         limit: usize,
-    ) -> Result<Vec<EmbeddingJob>, EmbeddingJobStoreError> {
+    ) -> Result<Vec<GenerationJob>, GenerationJobStoreError> {
         debug_assert!(limit > 0);
         debug_assert!(age_threshold_ms > 0);
         let now_ms = current_timestamp_ms();
@@ -322,7 +341,7 @@ impl EmbeddingJobStore {
         let mut out = Vec::new();
         for entry in iter {
             let (_, raw) = entry?;
-            let (job, _) = decode_from_slice::<EmbeddingJob, _>(raw, config::standard())?;
+            let (job, _) = decode_from_slice::<GenerationJob, _>(raw, config::standard())?;
             if job.status == status && job.updated_at_ms <= cutoff_ms {
                 // Skip jobs that are scheduled for retry in the future
                 if let Some(retry_at) = job.next_retry_at_ms {
@@ -342,8 +361,8 @@ impl EmbeddingJobStore {
     /// Get the oldest timestamp (both created_at and updated_at) for a given status.
     pub fn oldest_by_status(
         &self,
-        status: EmbeddingJobStatus,
-    ) -> Result<Option<(i64, i64)>, EmbeddingJobStoreError> {
+        status: GenerationJobStatus,
+    ) -> Result<Option<(i64, i64)>, GenerationJobStoreError> {
         let rtxn = self.env.read_txn()?;
         let iter = self.jobs.iter(&rtxn)?;
         let mut oldest_created: Option<i64> = None;
@@ -351,7 +370,7 @@ impl EmbeddingJobStore {
 
         for entry in iter {
             let (_, raw) = entry?;
-            let (job, _) = decode_from_slice::<EmbeddingJob, _>(raw, config::standard())?;
+            let (job, _) = decode_from_slice::<GenerationJob, _>(raw, config::standard())?;
             if job.status == status {
                 oldest_created = Some(match oldest_created {
                     None => job.created_at_ms,
@@ -373,16 +392,19 @@ impl EmbeddingJobStore {
     /// Get counts and oldest timestamps for all statuses efficiently.
     pub fn list_all_with_counts(
         &self,
-    ) -> Result<std::collections::HashMap<EmbeddingJobStatus, (usize, Option<i64>, Option<i64>)>, EmbeddingJobStoreError> {
+    ) -> Result<
+        std::collections::HashMap<GenerationJobStatus, (usize, Option<i64>, Option<i64>)>,
+        GenerationJobStoreError,
+    > {
         use std::collections::HashMap;
         let rtxn = self.env.read_txn()?;
         let iter = self.jobs.iter(&rtxn)?;
-        let mut stats: HashMap<EmbeddingJobStatus, (usize, Option<i64>, Option<i64>)> =
+        let mut stats: HashMap<GenerationJobStatus, (usize, Option<i64>, Option<i64>)> =
             HashMap::new();
 
         for entry in iter {
             let (_, raw) = entry?;
-            let (job, _) = decode_from_slice::<EmbeddingJob, _>(raw, config::standard())?;
+            let (job, _) = decode_from_slice::<GenerationJob, _>(raw, config::standard())?;
             let stat_entry = stats.entry(job.status).or_insert((0, None, None));
             stat_entry.0 = stat_entry.0.saturating_add(1);
             stat_entry.1 = Some(match stat_entry.1 {
@@ -402,25 +424,28 @@ impl EmbeddingJobStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::AppPaths;
+    use tempfile::TempDir;
 
     #[test]
-    fn embed_job_new_sets_defaults() {
-        let job = EmbeddingJob::new(
+    fn generation_job_new_sets_defaults() {
+        let job = GenerationJob::new(
             "doc-123",
             "kio",
             "embed-model",
-            EmbedMode::Batched,
-            7,
-            Some("hash".to_string()),
+            "gen-model",
+            GenerationMode::Sync,
         );
 
         assert_eq!(job.job_id, "doc-123");
         assert_eq!(job.doc_id, "doc-123");
         assert_eq!(job.embedder_key, "embed-model");
-        assert_eq!(job.status, EmbeddingJobStatus::Pending);
-        assert_eq!(job.provider_kind, EmbeddingProviderKind::GeminiBatch);
-        assert_eq!(job.chunk_count, 7);
-        assert_eq!(job.content_hash.as_deref(), Some("hash"));
+        assert_eq!(job.generator_key, "gen-model");
+        assert_eq!(job.generation_mode, GenerationMode::Sync);
+        assert_eq!(job.status, GenerationJobStatus::Pending);
+        assert_eq!(job.provider_kind, GenerationProviderKind::Synchronous);
+        assert_eq!(job.chunk_count, 0);
+        assert!(job.content_hash.is_none());
         assert!(job.provider_job_id.is_none());
         assert!(job.pending_decision.is_none());
         assert_eq!(job.retry_count, 0);
@@ -429,4 +454,83 @@ mod tests {
         assert!(job.next_retry_at_ms.is_none());
     }
 
+    #[test]
+    fn job_enqueue_is_idempotent() {
+        let temp = TempDir::new().expect("temp dir");
+        let paths = AppPaths::new(temp.path()).expect("app paths");
+        let store = GenerationJobStore::open(&paths).expect("open store");
+
+        let job = GenerationJob::new(
+            "doc-id",
+            "kio",
+            "embed-model",
+            "gen-model",
+            GenerationMode::Sync,
+        );
+
+        store.enqueue(&job).expect("initial enqueue succeeds");
+        let err = store.enqueue(&job).expect_err("duplicate enqueue fails");
+        match err {
+            GenerationJobStoreError::Duplicate(id) => assert_eq!(id, "doc-id"),
+            other => panic!("expected duplicate error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generation_job_roundtrip_serialization() {
+        let job = GenerationJob::new(
+            "doc-rt",
+            "kio",
+            "embed-model",
+            "gen-model",
+            GenerationMode::Batch,
+        );
+        let encoded = encode_to_vec(&job, config::standard()).expect("encode");
+        let (decoded, _) =
+            decode_from_slice::<GenerationJob, _>(&encoded, config::standard()).expect("decode");
+        assert_eq!(decoded.job_id, job.job_id);
+        assert_eq!(decoded.silo, job.silo);
+        assert_eq!(decoded.generation_mode, GenerationMode::Batch);
+        assert_eq!(decoded.status, GenerationJobStatus::Pending);
+    }
+
+    #[test]
+    fn update_status_persists() {
+        let temp = TempDir::new().expect("temp dir");
+        let paths = AppPaths::new(temp.path()).expect("app paths");
+        let store = GenerationJobStore::open(&paths).expect("open store");
+
+        let job = GenerationJob::new(
+            "doc-456",
+            "kio",
+            "embed-model",
+            "gen-model",
+            GenerationMode::Sync,
+        );
+
+        store.enqueue(&job).expect("enqueue succeeds");
+        let persisted_before = store
+            .get(&job.job_id)
+            .expect("fetch succeeds")
+            .expect("job exists");
+        assert_eq!(
+            persisted_before.status,
+            GenerationJobStatus::Pending,
+            "enqueue must store pending status"
+        );
+        let updated = store
+            .update_status(&job.job_id, GenerationJobStatus::Generating, None)
+            .expect("status update succeeds");
+        assert_eq!(updated.status, GenerationJobStatus::Generating);
+
+        let fetched = store
+            .get(&job.job_id)
+            .expect("fetch succeeds")
+            .expect("job exists");
+        assert_eq!(fetched.status, GenerationJobStatus::Generating);
+        assert!(
+            fetched.updated_at_ms >= fetched.created_at_ms,
+            "update timestamp should be >= creation"
+        );
+    }
 }

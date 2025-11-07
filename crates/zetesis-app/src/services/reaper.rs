@@ -1,9 +1,8 @@
 use crate::services::jobs::{
-    current_timestamp_ms, EmbeddingJob, EmbeddingJobStatus, EmbeddingJobStore,
-    EmbeddingJobStoreError,
+    GenerationJob, GenerationJobStatus, GenerationJobStore, GenerationJobStoreError,
+    current_timestamp_ms,
 };
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 /// Configuration for the stale job reaper.
@@ -11,8 +10,8 @@ use thiserror::Error;
 pub struct ReaperConfig {
     /// Maximum age for jobs in Pending status (milliseconds)
     pub pending_max_age_ms: i64,
-    /// Maximum age for jobs in Embedding status (milliseconds)
-    pub embedding_max_age_ms: i64,
+    /// Maximum age for jobs in Generating status (milliseconds)
+    pub generating_max_age_ms: i64,
     /// Base delay for exponential backoff (milliseconds)
     pub base_retry_delay_ms: i64,
     /// Maximum retry delay cap (milliseconds)
@@ -22,10 +21,10 @@ pub struct ReaperConfig {
 impl Default for ReaperConfig {
     fn default() -> Self {
         Self {
-            pending_max_age_ms: 172_800_000,    // 48 hours
-            embedding_max_age_ms: 43_200_000,   // 12 hours
-            base_retry_delay_ms: 300_000,       // 5 minutes
-            max_retry_delay_ms: 3_600_000,      // 1 hour
+            pending_max_age_ms: 172_800_000,   // 48 hours
+            generating_max_age_ms: 43_200_000, // 12 hours
+            base_retry_delay_ms: 300_000,      // 5 minutes
+            max_retry_delay_ms: 3_600_000,     // 1 hour
         }
     }
 }
@@ -65,17 +64,13 @@ impl ReaperReport {
 #[derive(Debug, Error)]
 pub enum ReaperError {
     #[error(transparent)]
-    Store(#[from] EmbeddingJobStoreError),
+    Store(#[from] GenerationJobStoreError),
     #[error("reaper configuration invalid: {0}")]
     InvalidConfig(String),
 }
 
 /// Calculate next retry time using exponential backoff with jitter.
-pub fn calculate_retry_backoff(
-    retry_count: u32,
-    base_delay_ms: i64,
-    max_delay_ms: i64,
-) -> i64 {
+pub fn calculate_retry_backoff(retry_count: u32, base_delay_ms: i64, max_delay_ms: i64) -> i64 {
     use rand::Rng;
     debug_assert!(base_delay_ms > 0);
     debug_assert!(max_delay_ms >= base_delay_ms);
@@ -98,12 +93,12 @@ pub fn calculate_retry_backoff(
 
 /// Reap stale jobs from the store.
 pub fn reap_stale_jobs(
-    store: &EmbeddingJobStore,
+    store: &GenerationJobStore,
     config: &ReaperConfig,
     action: ReaperAction,
 ) -> Result<ReaperReport, ReaperError> {
     // Validate config
-    if config.pending_max_age_ms <= 0 || config.embedding_max_age_ms <= 0 {
+    if config.pending_max_age_ms <= 0 || config.generating_max_age_ms <= 0 {
         return Err(ReaperError::InvalidConfig(
             "age thresholds must be positive".to_string(),
         ));
@@ -120,18 +115,18 @@ pub fn reap_stale_jobs(
         store,
         config,
         action,
-        EmbeddingJobStatus::Pending,
+        GenerationJobStatus::Pending,
         config.pending_max_age_ms,
         &mut report,
     )?;
 
-    // Reap embedding jobs
+    // Reap generating jobs
     reap_status(
         store,
         config,
         action,
-        EmbeddingJobStatus::Embedding,
-        config.embedding_max_age_ms,
+        GenerationJobStatus::Generating,
+        config.generating_max_age_ms,
         &mut report,
     )?;
 
@@ -139,10 +134,10 @@ pub fn reap_stale_jobs(
 }
 
 fn reap_status(
-    store: &EmbeddingJobStore,
+    store: &GenerationJobStore,
     config: &ReaperConfig,
     action: ReaperAction,
-    status: EmbeddingJobStatus,
+    status: GenerationJobStatus,
     age_threshold_ms: i64,
     report: &mut ReaperReport,
 ) -> Result<(), ReaperError> {
@@ -172,13 +167,13 @@ fn reap_status(
 }
 
 fn requeue_job(
-    store: &EmbeddingJobStore,
+    store: &GenerationJobStore,
     config: &ReaperConfig,
-    job: &EmbeddingJob,
+    job: &GenerationJob,
     report: &mut ReaperReport,
 ) -> Result<(), ReaperError> {
     let mut updated_job = job.clone();
-    updated_job.status = EmbeddingJobStatus::Pending;
+    updated_job.status = GenerationJobStatus::Pending;
     updated_job.stale = true;
     updated_job.retry_count = updated_job.retry_count.saturating_add(1);
     updated_job.updated_at_ms = current_timestamp_ms();
@@ -199,8 +194,7 @@ fn requeue_job(
     // Update error message
     let retry_msg = format!(
         "stale job requeued (attempt {} of {})",
-        updated_job.retry_count,
-        updated_job.max_retries
+        updated_job.retry_count, updated_job.max_retries
     );
     updated_job.error = Some(retry_msg);
 
@@ -211,12 +205,12 @@ fn requeue_job(
 }
 
 fn fail_job(
-    store: &EmbeddingJobStore,
-    job: &EmbeddingJob,
+    store: &GenerationJobStore,
+    job: &GenerationJob,
     report: &mut ReaperReport,
 ) -> Result<(), ReaperError> {
     let mut updated_job = job.clone();
-    updated_job.status = EmbeddingJobStatus::Failed;
+    updated_job.status = GenerationJobStatus::Failed;
     updated_job.stale = true;
     updated_job.updated_at_ms = current_timestamp_ms();
 
@@ -249,6 +243,12 @@ fn fail_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::AppPaths;
+    use crate::services::jobs::{
+        GenerationJob, GenerationJobStatus, GenerationJobStore, GenerationMode,
+        GenerationProviderKind,
+    };
+    use tempfile::TempDir;
 
     #[test]
     fn backoff_increases_exponentially() {
@@ -282,6 +282,83 @@ mod tests {
         let delay = calculate_retry_backoff(10, base, max);
         assert!(delay <= max);
         assert!(delay >= (max as f64 * 0.9) as i64); // Should be close to max
+    }
+
+    #[test]
+    fn reaper_requeues_generating_jobs() {
+        let temp = TempDir::new().expect("temp dir");
+        let paths = AppPaths::new(temp.path()).expect("app paths");
+        let store = GenerationJobStore::open(&paths).expect("open store");
+
+        let mut job = GenerationJob::new(
+            "doc-requeue",
+            "kio",
+            "embed-model",
+            "gen-model",
+            GenerationMode::Batch,
+        );
+        job.status = GenerationJobStatus::Generating;
+        job.provider_kind = GenerationProviderKind::GeminiBatch;
+        job.updated_at_ms = current_timestamp_ms().saturating_sub(10_000);
+        store.upsert(&job).expect("store job");
+
+        let mut config = ReaperConfig::default();
+        config.generating_max_age_ms = 1;
+        let report = reap_stale_jobs(&store, &config, ReaperAction::Requeue).expect("reaper runs");
+        assert!(report.requeued.contains(&job.job_id));
+
+        let refreshed = store
+            .get(&job.job_id)
+            .expect("fetch job")
+            .expect("job present");
+        assert_eq!(refreshed.status, GenerationJobStatus::Pending);
+        assert_eq!(refreshed.retry_count, 1);
+        assert!(refreshed.next_retry_at_ms.is_some());
+    }
+
+    #[test]
+    fn reaper_marks_jobs_failed_when_retries_exhausted() {
+        let temp = TempDir::new().expect("temp dir");
+        let paths = AppPaths::new(temp.path()).expect("app paths");
+        let store = GenerationJobStore::open(&paths).expect("open store");
+
+        let mut job = GenerationJob::new(
+            "doc-fail",
+            "kio",
+            "embed-model",
+            "gen-model",
+            GenerationMode::Batch,
+        );
+        job.status = GenerationJobStatus::Generating;
+        job.provider_kind = GenerationProviderKind::GeminiBatch;
+        job.retry_count = job.max_retries;
+        job.error = Some("previous failure".to_string());
+        job.updated_at_ms = current_timestamp_ms().saturating_sub(10_000);
+        store.upsert(&job).expect("store job");
+
+        let mut config = ReaperConfig::default();
+        config.generating_max_age_ms = 1;
+        let report = reap_stale_jobs(&store, &config, ReaperAction::Both).expect("reaper runs");
+        assert!(report.failed.contains(&job.job_id));
+
+        let refreshed = store
+            .get(&job.job_id)
+            .expect("fetch job")
+            .expect("job present");
+        assert_eq!(refreshed.status, GenerationJobStatus::Failed);
+        assert!(
+            refreshed
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("max retries"),
+            "error message should mention max retries"
+        );
+        assert_eq!(
+            refreshed.last_error.as_deref(),
+            Some("previous failure"),
+            "last_error should capture previous message"
+        );
     }
 
     #[test]
@@ -322,7 +399,7 @@ mod tests {
     fn default_config_has_sensible_values() {
         let config = ReaperConfig::default();
         assert_eq!(config.pending_max_age_ms, 172_800_000); // 48 hours
-        assert_eq!(config.embedding_max_age_ms, 43_200_000); // 12 hours
+        assert_eq!(config.generating_max_age_ms, 43_200_000); // 12 hours
         assert_eq!(config.base_retry_delay_ms, 300_000); // 5 minutes
         assert_eq!(config.max_retry_delay_ms, 3_600_000); // 1 hour
     }

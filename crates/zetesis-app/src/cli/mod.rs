@@ -89,6 +89,12 @@ pub enum KioSource {
     Saos,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum GenModeArg {
+    Sync,
+    Batch,
+}
+
 pub const DEFAULT_KIO_UZP_URL: &str = "https://orzeczenia.uzp.gov.pl/";
 pub const DEFAULT_KIO_SAOS_URL: &str = "https://www.saos.org.pl/";
 
@@ -117,21 +123,24 @@ pub struct IngestArgs {
     pub index: String,
     /// File or directory containing documents to ingest.
     pub path: PathBuf,
-    /// Submit embedding jobs via the Gemini batch API instead of synchronous embedding.
-    #[arg(long, action = ArgAction::SetTrue)]
-    pub batch: bool,
+    /// Structured generation mode (`sync` runs locally, `batch` submits jobs to the provider).
+    #[arg(long = "gen-mode", value_enum, default_value_t = GenModeArg::Sync)]
+    pub gen_mode: GenModeArg,
     /// Limit the number of files processed when ingesting a directory.
     #[arg(long)]
     pub limit: Option<usize>,
     /// Embedding model identifier used for chunk vectors.
     #[arg(long, default_value_t = DEFAULT_EMBEDDER_KEY.to_string())]
     pub embed_model: String,
-    /// Gemini model identifier used for structured extraction.
-    #[arg(long, default_value = DEFAULT_EXTRACTOR_MODEL)]
-    pub extractor_model: String,
+    /// Gemini model identifier used for structured generation (alias: --extractor-model).
+    #[arg(long = "gen-model", default_value = DEFAULT_EXTRACTOR_MODEL, alias = "extractor-model")]
+    pub gen_model: String,
     /// Create the Milli index if it does not already exist.
     #[arg(long, action = ArgAction::SetTrue)]
     pub create_index: bool,
+    /// Deprecated alias for `--gen-mode batch`.
+    #[arg(long, action = ArgAction::SetTrue, hide = true)]
+    pub batch: bool,
 }
 
 /// Audit command namespace.
@@ -372,15 +381,13 @@ pub struct JobsArgs {
     pub command: JobsCommands,
 }
 
-/// Supported embedding job subcommands.
+/// Supported generation job subcommands.
 #[derive(Debug, Subcommand)]
 pub enum JobsCommands {
-    /// Display counts for pending, running, and completed embedding jobs.
+    /// Display counts for pending, generating, and completed jobs.
     Status(JobsStatusArgs),
-    /// Embed pending jobs into vectors.
-    Embed(JobsEmbedArgs),
-    /// Ingest embedded jobs into Milli.
-    Ingest(JobsIngestArgs),
+    /// Process generation jobs (submit or fetch results).
+    Gen(JobsGenArgs),
     /// Reap stale jobs and optionally requeue or fail them.
     Reap(JobsReapArgs),
 }
@@ -422,24 +429,40 @@ pub struct JobsReapArgs {
     pub dry_run: bool,
 }
 
-/// Options for the `jobs embed` command.
+/// Options for the `jobs gen` command.
 #[derive(Debug, Args)]
-pub struct JobsEmbedArgs {
+pub struct JobsGenArgs {
+    #[command(subcommand)]
+    pub command: JobsGenCommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum JobsGenCommands {
+    /// Submit pending generation jobs to the provider.
+    Submit(JobsGenSubmitArgs),
+    /// Fetch completed generation jobs and finalize indexing.
+    Fetch(JobsGenFetchArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct JobsGenSubmitArgs {
+    /// Generation model key to match queued jobs.
+    #[arg(long, default_value = DEFAULT_EXTRACTOR_MODEL)]
+    pub gen_model: String,
     /// Embedder model key to match queued jobs.
     #[arg(long, default_value_t = DEFAULT_EMBEDDER_KEY.to_string())]
     pub embed_model: String,
-    /// Maximum number of jobs to process in this run.
+    /// Maximum number of jobs to submit in this run.
     #[arg(long, default_value_t = 4)]
     pub limit: usize,
 }
 
-/// Options for the `jobs ingest` command.
 #[derive(Debug, Args)]
-pub struct JobsIngestArgs {
-    /// Embedder model key to match embedded jobs.
+pub struct JobsGenFetchArgs {
+    /// Embedder model key to match in-flight jobs.
     #[arg(long, default_value_t = DEFAULT_EMBEDDER_KEY.to_string())]
     pub embed_model: String,
-    /// Maximum number of jobs to ingest in this run.
+    /// Maximum number of jobs to fetch in this run.
     #[arg(long, default_value_t = 4)]
     pub limit: usize,
 }
@@ -447,6 +470,7 @@ pub struct JobsIngestArgs {
 // Validator functions for CLI arguments.
 
 /// Maximum attachment size for inline processing (20 MiB).
+#[cfg(feature = "cli-debug")]
 const MAX_INLINE_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 
 /// Validate PDF file: must exist, have .pdf extension, and be under size limit.
