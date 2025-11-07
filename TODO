@@ -42,8 +42,8 @@ Legend: [ ] = open · [~] = in progress · [x] = done
 - [x] T13: Config load from env/files; XDG-aware paths; CORS off by default (P2) — Completed 2025-11-07: Added TOML-only precedence, env overrides, and configurable CORS defaults
 - [x] T14: Typeahead-optimized keyword endpoint: small fields, limit ≤ 10, p95 ≤ 100 ms; per-IP rate limit and 2s LRU cache (P0) (covers REQ-ZE-UI-TYPEAHEAD)
 
-## WP-UI — Dioxus 0.7 (SSR + Islands)
-- [ ] T15: Minimal SSR route `/ui/hello` rendered by Dioxus 0.7; CI check for gzipped bundle ≤ 150 KiB (P0) (covers REQ-ZE-UI-DIOXUS)
+## WP-UI — Dioxus 0.7.1 (SSR + Islands)
+- [ ] T15: Minimal SSR route `/ui/hello` rendered by Dioxus 0.7.1; CI check for gzipped bundle ≤ 150 KiB (P0) (covers REQ-ZE-UI-DIOXUS)
 - [ ] T16: Wire Dioxus SSR into Axum under `/ui/*`; keep `/v1/*` JSON APIs separate (P0) (covers REQ-ZE-UI-AXUM)
 - [ ] T17: Implement search page: SSR shell + hydrated results island with typeahead (debounce 200ms, min 2 chars, limit 10, cancellable) (P1) (covers REQ-ZE-UI-TYPEAHEAD)
 - [ ] T18: Add “Refine with semantics” action to run hybrid once (RRF, bounded k), swap results (P1) (covers REQ-ZE-UI-REFINE)
@@ -58,7 +58,7 @@ Legend: [ ] = open · [~] = in progress · [x] = done
 ## WP-INGEST — Ingestion Pipeline
 - [x] T24: Route KIO/SAOS downloaded PDFs to blob store via `AppPaths::blob_path` (content-addressed) and store CID reference (P0) (covers REQ-ZE-STORAGE-FS, REQ-ZE-ID-CANONICAL) — Completed 2025-11-07: Removed redundant NDJSON manifest; CID is canonical doc_id; both UZP and SAOS flow verified via E2E tests
 - [x] T25: Add end-to-end ingest test that indexes a tiny PDF fixture and verifies `doc` + `chunk` shapes (P1) (covers REQ-ZE-INDEX-IDEMPOTENT, REQ-ZE-INDEX-FIELDS) — Completed 2025-11-07: Added tests/ingest_e2e.rs with StructuredDecision indexing, precomputed embeddings, and idempotency verification
- - [x] T52: Refactor ingest pipeline: structured generation uses jobs (sync by default, optional batch); embeddings always run synchronously after generation; remove embedding batch paths (P0) (covers REQ-ZE-EMBED-SYNC, REQ-ZE-GEN-MODES, REQ-ZE-PIPELINE-ORDER) — Completed 2025-11-07: Added generation job lifecycle, payload staging, and synchronous embedding finalization.
+- [x] T52: Refactor ingest pipeline: structured generation uses jobs (sync by default, optional batch); embeddings always run synchronously after generation; remove embedding batch paths (P0) (covers REQ-ZE-EMBED-SYNC, REQ-ZE-GEN-MODES, REQ-ZE-PIPELINE-ORDER) — Completed 2025-11-07: Added generation job lifecycle, payload staging, and synchronous embedding finalization.
 
 ## WP-INDEX — Milli Configuration
 - [ ] T26: Property test for index bootstrap: searchable/filterable/sortable sets equal SPEC; primary key=`id`; Hannoy backend; embedder dims (P1) (covers REQ-ZE-INDEX-EMBEDDER, REQ-ZE-INDEX-SEARCHABLE, REQ-ZE-INDEX-FILTERABLE, REQ-ZE-INDEX-SORTABLE)
@@ -73,9 +73,9 @@ Legend: [ ] = open · [~] = in progress · [x] = done
 - [ ] T31: Document token usage logging and provider-specific retries in docs/ocr_costs.md (P2) (covers REQ-ZE-OCR-RETRY)
 
 ## WP-HYBRID — Hybrid Search Fusion
-- [ ] T32: Confirm Milli lacks built-in RRF; document hybrid support scope (P0) (covers REQ-ZE-INDEX-SEARCHABLE)
-- [ ] T33: Implement client-side RRF fusion in CLI/server (run keyword + vector, fuse with k=60, bounded k); tests for tie and overlap (P1)
-- [ ] T34: Add optional weighted-linear fusion with tunable weights; default to RRF (P2)
+- [x] T32: Confirm Milli lacks built-in RRF; document hybrid support scope (P0) (covers REQ-ZE-INDEX-SEARCHABLE) — Completed 2025-11-08: Documented Milli gap + hybrid plan in docs/architecture.md §4.1.
+- [x] T33: Implement client-side RRF fusion in CLI/server (run keyword + vector, fuse with k=60, bounded k); tests for tie and overlap (P1) — Completed 2025-11-08: Added bounded hybrid service, CLI/HTTP wiring, and regression tests.
+- [x] T34: Add optional weighted-linear fusion with tunable weights; default to RRF (P2) — Completed 2025-11-08: Added weighted fusion path with normalized weights + validation/tests.
 
 ## WP-TEXT — Segmentation
 - [ ] T35: Add more YAML regression cases for abbreviations and enumerations; include negative cases (P2) (covers REQ-ZE-TEXT-SEGMENT)

@@ -24,6 +24,11 @@ Zetesis is a lightweight SaaS for full-text and similarity search over documents
 5. **Index**: Write structured decision + chunk records (with vectors) into Milli; clear job `pending_decision` as the job transitions to `Generated`.
 6. **Query**: HTTP endpoints and CLI utilities route keyword/vector searches through Milli, returning ranked results with metadata pulled from LMDB.
 
+## 4.1 Hybrid Search (WP-HYBRID)
+- **No native RRF in Milli (T32):** Milli v1.24.0 exposes lexical and semantic searches only; `rg -n "rrf"` / `rg -n "reciprocal"` across the vendored sources returned no hits, so Zetesis performs RRF/weighted fusion client-side. This keeps the call graph acyclic and bounded—two Milli searches per hybrid query, nothing more.
+- **Default fusion (T33):** Hybrid search runs keyword + vector queries in parallel, caps each branch at 50 hits (bounded work), applies RRF with `k=60`, deduplicates by `doc_id`, and emits at most 100 fused rows. Fused scores overwrite base scores so downstream consumers do not need to infer which ranking strategy ran.
+- **Weighted alternative (T34):** Requests may opt into a linear fusion that normalizes caller-provided weights (default 0.5 keyword / 0.5 vector, documented in CLI/HTTP help). When the weighted mode is chosen both weights must be non-negative and not both zero; the code renormalizes them to keep the math stable.
+
 ## 5. Interfaces
 - **HTTP API**: Axum routes for search, document management, and health checks. Use Tower middleware for tracing and auth when defined.
 - **CLI**: Clap commands for operational tasks (document ingestion, scrapers, migrations, job orchestration). Notable flows: `ingest --gen-mode sync|batch` (legacy `--batch` prints a deprecation warning and forwards to `--gen-mode batch`), `jobs status`, `jobs gen submit|gen fetch`, and `jobs reap`.
