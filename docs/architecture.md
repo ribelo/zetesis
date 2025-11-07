@@ -17,15 +17,16 @@ Zetesis is a lightweight SaaS for full-text and similarity search over documents
 - Auxiliary application metadata (e.g., configuration caches, counters) may live in separate LMDB environments, but documents themselves never leave Milli.
 
 ## 4. Ingest & Search Pipeline
-1. **Scrape**: Fetch documents (HTML, Markdown, PDF). TODO: choose extraction tooling (e.g., `scraper`, `selectolax`, or external services).
-2. **Normalize**: Convert to clean text, capture metadata (title, URL, tags).
-3. **Persist**: Upsert canonical structured documents into Milli (doc record) and derived chunk records with vectors.
-4. **Index**: Configure Milli searchable/filterable fields and user-provided vectors generated through `ai-ox`.
-5. **Query**: HTTP endpoints and CLI utilities route queries through milli, returning ranked results with metadata pulled from LMDB.
+1. **Scrape / Collect**: Fetch upstream documents (PDF or images) using the SAOS/UZP scrapers or manual ingest.
+2. **Stage Payload**: Compute the canonical `doc_id` (BLAKE3 of bytes), persist the original blob under `${XDG_DATA_HOME}/zetesis/blobs`, and enqueue a generation job in LMDB.
+3. **Structured Generation**: Run the Gemini extractor either synchronously (default) or queue the request for batch submission. Batch mode stores payloads under `jobs/payloads/{silo}` and is processed via `jobs gen submit`.
+4. **Embedding**: Once structured data exists (immediately for sync, or during `jobs gen fetch` for batch), embed semantic chunks synchronously via the configured Gemini embedder; enforce vector count/dimension invariants.
+5. **Index**: Write structured decision + chunk records (with vectors) into Milli; clear job `pending_decision` as the job transitions to `Generated`.
+6. **Query**: HTTP endpoints and CLI utilities route keyword/vector searches through Milli, returning ranked results with metadata pulled from LMDB.
 
 ## 5. Interfaces
 - **HTTP API**: Axum routes for search, document management, and health checks. Use Tower middleware for tracing and auth when defined.
-- **CLI**: Clap commands for operational tasks (document ingestion, scrapers, migrations). Matches server modules for reuse.
+- **CLI**: Clap commands for operational tasks (document ingestion, scrapers, migrations, job orchestration). Notable flows: `ingest --gen-mode sync|batch` (legacy `--batch` prints a deprecation warning and forwards to `--gen-mode batch`), `jobs status`, `jobs gen submit|gen fetch`, and `jobs reap`.
 - **Web UI**: TBD (Svelte vs Dioxus). Scaffold will reserve a `web/` entry point once the framework decision is made.
 
 ## 6. Observability & Operations

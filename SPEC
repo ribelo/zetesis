@@ -55,20 +55,22 @@
 - [REQ-ZE-TEXT-CLEANUP] Normalize extracted text (token separation, whitespace, diacritics intact) prior to segmentation.
 - [REQ-ZE-TEXT-SEGMENT] Segment Polish legal text with ICU segmenter plus abbreviation/ordinal stitching and enumeration splitting. Provide deterministic ranges and strings with no empty outputs.
 
-### Embedding & Jobs
+### Generation, Embedding & Jobs
 - [REQ-ZE-EMBED-MODELS] Use Gemini embeddings for `RetrievalDocument`/`RetrievalQuery` with configured output dimension. Replace empty texts with all-zero vectors for shape stability.
-- [REQ-ZE-EMBED-MODES] Support `Batched` and `Sequential` modes; batch size bounded by configuration and provider limits.
-- [REQ-ZE-JOBS-STORE] Persist embedding jobs in LMDB under `$XDG_DATA_HOME/zetesis/lmdb/jobs` with status lifecycle: Pending → Embedding → Embedded → Ingesting → Ingested | Failed; job_id equals `doc_id`.
-- [REQ-ZE-JOBS-BATCH] Submit embeddings to Gemini Batch API when `--batch` is set; poll status; ingest results into Milli; mark errors with message in job record and doc.ingest.error.
+- [REQ-ZE-EMBED-SYNC] Always compute embeddings synchronously after structured generation completes (whether generation was sync or async). Enforce vector count = chunk count and dimension = `DEFAULT_EMBEDDING_DIM`; apply a rate limiter. (Updated 2025-11-06 — embeddings no longer use jobs)
+- [REQ-ZE-GEN-JOBS-STORE] Persist structured generation jobs in LMDB under `$XDG_DATA_HOME/zetesis/lmdb/jobs` with status lifecycle: Pending → Generating → Generated | Failed; `job_id` equals `doc_id`. Store provider metadata (`provider_job_id`, usage, error) and timestamps. (Updated 2025-11-06 — migrated from embedding jobs)
+- [REQ-ZE-GEN-MODES] Support two generation modes: `sync` (default) and `batch` via Gemini Batch API. Sync runs execute immediately and record a completed job for observability. Batch runs submit to provider, record `provider_job_id`, and finalize upon result fetch; include bounds and provider rate limits. (Added 2025-11-06)
 
 ### CLI Surface
-- [REQ-ZE-CLI-CMDS] Provide subcommands: `serve`, `fetch-kio` (uzp|saos), `ingest`, `audit structured`, `search (keyword|vector)`, `db (list|stats|get|find|backup|purge|recover)`, `jobs (status|embed|ingest)`.
+- [REQ-ZE-CLI-CMDS] Provide subcommands: `serve`, `fetch-kio` (uzp|saos), `ingest`, `audit structured`, `search (keyword|vector)`, `db (list|stats|get|find|backup|purge|recover)`, `jobs (status|gen submit|gen fetch|reap)`.
 - [REQ-ZE-CLI-LIMITS] Validate inputs and enforce bounds: positive worker counts, non-empty index names without separators, file size limits for inline attachments (≤ 20 MiB), and supported document types (PDF, common images).
 - [REQ-ZE-CLI-SEARCH] Keyword/vector search accept filters, pagination, field selection, and pretty output; vector search embeds the query with index embedder when not provided.
 
+- [REQ-ZE-CLI-INGEST-GEN-MODE] `ingest` accepts `--gen-mode sync|batch` (default `sync`) and `--gen-model <id>`. The old `--batch` flag is deprecated immediately; show a warning and map it to `--gen-mode batch` for one release window before removal. (Added 2025-11-06)
+
 ### Identity & Paths
 - [REQ-ZE-ID-CANONICAL] Canonical `doc_id` is lowercase hex BLAKE3 of exact original content bytes. Never derive from filenames, URLs, or upstream IDs.
-- [REQ-ZE-PATHS] Resolve data paths under `$XDG_DATA_HOME/zetesis`: `milli/{silo}`, `lmdb/{app,jobs}`, `blobs/{silo}/{prefix}/{cid}`, and embedding job staging under `jobs/{payloads,results}/{silo}`. Ensure directories exist before use.
+- [REQ-ZE-PATHS] Resolve data paths under `$XDG_DATA_HOME/zetesis`: `milli/{silo}`, `lmdb/{app,jobs}`, `blobs/{silo}/{prefix}/{cid}`, and generation job staging under `jobs/{payloads,results}/{silo}`. Ensure directories exist before use.
 
 ### Observability & Safety
 - [REQ-ZE-ASSERTS] Use assertions to enforce invariants (non-empty ids, bounded sizes, non-zero concurrency) and fail fast on configuration errors.
@@ -94,6 +96,9 @@
 - [REQ-ZE-BACKUP-RECOVER] Provide `db recover --dry-run` to validate a restore target; block in-place recoveries unless `--force` is set.
 
 ### Job Queue & Reliability
-- [REQ-ZE-JOBS-LOCAL] Use the LMDB-backed `EmbeddingJobStore` as the primary queue; persist status transitions and timestamps; no external broker required.
-- [REQ-ZE-JOBS-REAPER] Add a stale job reaper (age-based) and idempotent retry policy with bounded attempts and exponential backoff.
-- [REQ-ZE-JOBS-LIMITS] Enforce bounded concurrency and back-pressure via rate limiters; expose `jobs status` to report counts and oldest age by state.
+- [REQ-ZE-JOBS-LOCAL] Use the LMDB-backed job store as the primary queue for structured generation jobs; persist status transitions and timestamps; no external broker required. (Updated 2025-11-06)
+- [REQ-ZE-JOBS-REAPER] Add a stale job reaper (age-based) for generation jobs and idempotent retry policy with bounded attempts and exponential backoff. Target Pending/Generating states. (Updated 2025-11-06)
+- [REQ-ZE-JOBS-LIMITS] Enforce bounded concurrency and back-pressure via rate limiters on provider calls; expose `jobs status` to report counts and oldest age by state. (Updated 2025-11-06)
+
+### Pipeline Order
+- [REQ-ZE-PIPELINE-ORDER] Ingest flow: fetch blob → structured generation (sync or batch job) → synchronous embedding of chunks → index in Milli → update status/usage metrics. (Added 2025-11-06)

@@ -33,6 +33,7 @@ Legend: [ ] = open · [~] = in progress · [x] = done
 - [x] T7: Remove dead CLI (`ocr`, `segment`) and unreachable wiring; keep services internal; update SPEC + help output tests (P0) (covers REQ-ZE-CLI-CMDS)
 - [x] T8: Validate index names and file size bounds at parse time; add negative tests (P1) (covers REQ-ZE-CLI-LIMITS)
 - [x] T9: Add examples and `--help` coverage for `search keyword|vector` including filters and fields (P2) (covers REQ-ZE-CLI-SEARCH)
+ - [x] T51: Add `--gen-mode sync|batch` and `--gen-model` to `ingest`; show immediate deprecation warning when `--batch` is used and map it to `--gen-mode batch` (P0) (covers REQ-ZE-CLI-INGEST-GEN-MODE) — Completed 2025-11-07: Added CLI args, warning, and internal plumbing.
 
 ## WP-SERVER — HTTP Surface
 - [x] T10: Implement Axum POC with `/healthz` + graceful shutdown (P0) (covers REQ-ZE-CLI-CMDS)
@@ -57,14 +58,15 @@ Legend: [ ] = open · [~] = in progress · [x] = done
 ## WP-INGEST — Ingestion Pipeline
 - [x] T24: Route KIO/SAOS downloaded PDFs to blob store via `AppPaths::blob_path` (content-addressed) and store CID reference (P0) (covers REQ-ZE-STORAGE-FS, REQ-ZE-ID-CANONICAL) — Completed 2025-11-07: Removed redundant NDJSON manifest; CID is canonical doc_id; both UZP and SAOS flow verified via E2E tests
 - [x] T25: Add end-to-end ingest test that indexes a tiny PDF fixture and verifies `doc` + `chunk` shapes (P1) (covers REQ-ZE-INDEX-IDEMPOTENT, REQ-ZE-INDEX-FIELDS) — Completed 2025-11-07: Added tests/ingest_e2e.rs with StructuredDecision indexing, precomputed embeddings, and idempotency verification
+ - [x] T52: Refactor ingest pipeline: structured generation uses jobs (sync by default, optional batch); embeddings always run synchronously after generation; remove embedding batch paths (P0) (covers REQ-ZE-EMBED-SYNC, REQ-ZE-GEN-MODES, REQ-ZE-PIPELINE-ORDER) — Completed 2025-11-07: Added generation job lifecycle, payload staging, and synchronous embedding finalization.
 
 ## WP-INDEX — Milli Configuration
 - [ ] T26: Property test for index bootstrap: searchable/filterable/sortable sets equal SPEC; primary key=`id`; Hannoy backend; embedder dims (P1) (covers REQ-ZE-INDEX-EMBEDDER, REQ-ZE-INDEX-SEARCHABLE, REQ-ZE-INDEX-FILTERABLE, REQ-ZE-INDEX-SORTABLE)
 
-## WP-JOBS — Embedding Jobs
-- [ ] T27: Add stale job reaper and recovery (Pending/Embedding with old timestamps → mark Failed or requeue) (P1) (covers REQ-ZE-JOBS-REAPER, REQ-ZE-JOBS-LIMITS)
-- [ ] T28: Add `jobs status` output with counts by status and oldest timestamp (P2) (covers REQ-ZE-JOBS-LOCAL)
-- [ ] T29: Idempotency tests for enqueue/update/upsert; bounded retries policy (P2) (covers REQ-ZE-JOBS-LIMITS)
+## WP-GEN-JOBS — Structured Generation Jobs
+- [x] T27: Add stale generation job reaper and recovery (Pending/Generating with old timestamps → requeue with backoff or mark Failed) (P1) (covers REQ-ZE-JOBS-REAPER, REQ-ZE-JOBS-LIMITS) — Completed 2025-11-07: Reaper now targets Pending/Generating and preserves retry backoff.
+- [x] T28: `jobs status` reports generation job counts and oldest timestamps by state (P2) (covers REQ-ZE-JOBS-LOCAL) — Completed 2025-11-07.
+- [x] T29: Idempotency tests for generation job enqueue/update/upsert; bounded retries (P2) (covers REQ-ZE-JOBS-LIMITS) — Completed 2025-11-07 with new job store unit tests.
 
 ## WP-OCR — OCR Providers
 - [ ] T30: Add negative tests for exceeding `MAX_PAGES_PER_DOCUMENT`, zero concurrency, and inflight budget mismatches (P1) (covers REQ-ZE-OCR-LIMITS)
@@ -100,3 +102,8 @@ Legend: [ ] = open · [~] = in progress · [x] = done
 - [ ] T48: Update help texts and examples to prefer `--silo`; add deprecation notes for old forms (P1)
 - [ ] T49: Docs: `docs/data-quickstart.md` with end-to-end flow (source→ingest→jobs→search→backup) (P1)
 - [ ] T50: Migration: keep old `db` as alias to `index` and positional `INDEX` for one release; add warnings and a removal date (P2)
+ - [x] T53: `jobs` namespace focuses on generation: `jobs (status|gen submit|gen fetch|reap)`; update help and examples (P1) (covers REQ-ZE-JOBS-LOCAL) — Completed 2025-11-07: Added submit/fetch subcommands and help text.
+
+## WP-DOCS — Spec and Architecture
+ - [x] T54: Update SPEC to reflect generation jobs and synchronous embeddings; add REQ-ZE-EMBED-SYNC, REQ-ZE-GEN-MODES, REQ-ZE-PIPELINE-ORDER, REQ-ZE-CLI-INGEST-GEN-MODE (P0) — Completed 2025-11-07.
+ - [x] T55: Update `docs/architecture.md` with the new pipeline order and job scope; add deprecation note for `--batch` (P1) — Completed 2025-11-07.
