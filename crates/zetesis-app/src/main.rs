@@ -28,9 +28,10 @@ use uuid::Uuid;
 use zetesis_app::cli::{
     AuditArgs, AuditCommands, Cli, Commands, DEFAULT_KIO_SAOS_URL, DEFAULT_KIO_UZP_URL, DbArgs,
     DbBackupArgs, DbCommands, DbFindArgs, DbGetArgs, DbPurgeArgs, DbRecoverArgs, DbStatsArgs,
-    FetchKioArgs, GenModeArg, IngestArgs, JobsArgs, JobsCommands, JobsGenArgs, JobsGenCommands,
-    JobsGenFetchArgs, JobsGenSubmitArgs, JobsReapArgs, JobsStatusArgs, KeywordSearchArgs,
-    KioSource, SearchArgs, SearchCommands, StructuredAuditArgs, VectorSearchArgs,
+    FetchKioArgs, GenModeArg, HybridFusionArg, HybridSearchArgs, IngestArgs, JobsArgs,
+    JobsCommands, JobsGenArgs, JobsGenCommands, JobsGenFetchArgs, JobsGenSubmitArgs, JobsReapArgs,
+    JobsStatusArgs, KeywordSearchArgs, KioSource, SearchArgs, SearchCommands, StructuredAuditArgs,
+    VectorSearchArgs,
 };
 #[cfg(feature = "cli-debug")]
 use zetesis_app::cli::{DebugArgs, DebugCommands};
@@ -43,11 +44,13 @@ use zetesis_app::pdf::extract_text_from_pdf;
 use zetesis_app::pipeline::structured::StructuredDecision;
 use zetesis_app::services::{
     EmbedBatchTask, GeminiBatchStructuredClient, GenerationJob, GenerationJobStatus,
-    GenerationJobStore, GenerationMode, GenerationProviderKind, KeywordSearchParams,
+    GenerationJobStore, GenerationMode, GenerationProviderKind, HYBRID_DEFAULT_RRF_K,
+    HYBRID_PER_SOURCE_LIMIT_MAX, HybridFusion, HybridSearchParams, KeywordSearchParams,
     MilliActorHandle, PipelineContext, PipelineError, ProviderJobState, StructuredBatchInput,
     StructuredBatchRequest, StructuredExtractor, StructuredJobClient, VectorSearchParams,
-    build_pipeline_context, decision_content_hash, index_structured_with_embeddings, keyword,
-    normalize_index_name, open_index_read_only, project_value, resolve_index_dir, vector,
+    build_pipeline_context, decision_content_hash, hybrid, index_structured_with_embeddings,
+    keyword, normalize_hybrid_weights, normalize_index_name, open_index_read_only, project_value,
+    resolve_index_dir, vector,
 };
 use zetesis_app::text::cleanup_text;
 use zetesis_app::{config, ingestion, paths::AppPaths, pipeline::Silo, server};
@@ -1304,6 +1307,7 @@ async fn run_search(args: SearchArgs) -> Result<(), AppError> {
     match args.command {
         SearchCommands::Keyword(sub) => search_keyword(sub).await?,
         SearchCommands::Vector(sub) => search_vector(sub).await?,
+        SearchCommands::Hybrid(sub) => search_hybrid(sub).await?,
     }
     Ok(())
 }
@@ -1857,6 +1861,61 @@ async fn search_vector(args: VectorSearchArgs) -> Result<(), AppError> {
         top_k,
     };
     let rows = vector(&params).await?;
+    emit_json_rows(&rows, pretty)?;
+    Ok(())
+}
+
+async fn search_hybrid(args: HybridSearchArgs) -> Result<(), AppError> {
+    let HybridSearchArgs {
+        index,
+        query,
+        filter,
+        embedder,
+        limit,
+        fields,
+        fusion,
+        keyword_weight,
+        vector_weight,
+        pretty,
+    } = args;
+    let per_branch_limit = limit.min(HYBRID_PER_SOURCE_LIMIT_MAX).max(1);
+    let keyword_params = KeywordSearchParams {
+        index: index.clone(),
+        query: query.clone(),
+        filter: filter.clone(),
+        sort: Vec::new(),
+        fields: fields.clone(),
+        limit: per_branch_limit,
+        offset: 0,
+    };
+    let vector_params = VectorSearchParams {
+        index,
+        query,
+        embedder,
+        filter,
+        fields,
+        top_k: per_branch_limit,
+    };
+    let fusion_mode = match fusion {
+        HybridFusionArg::Rrf => HybridFusion::Rrf {
+            k: HYBRID_DEFAULT_RRF_K,
+        },
+        HybridFusionArg::Weighted => {
+            let (kw, vw) = normalize_hybrid_weights(keyword_weight, vector_weight)
+                .map_err(|msg| AppError::Config(msg.to_string()))?;
+            HybridFusion::Weighted {
+                keyword_weight: kw,
+                vector_weight: vw,
+            }
+        }
+    };
+    let params = HybridSearchParams {
+        keyword: keyword_params,
+        vector: vector_params,
+        limit,
+        fusion: fusion_mode,
+    };
+    let rows = hybrid(&params).await?;
     emit_json_rows(&rows, pretty)?;
     Ok(())
 }

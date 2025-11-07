@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
 use crate::constants::{DEFAULT_EMBEDDER_KEY, DEFAULT_EXTRACTOR_MODEL};
+use crate::services::HYBRID_DEFAULT_WEIGHT;
 
 /// Top-level CLI entry point.
 #[derive(Default, Debug, Parser)]
@@ -188,6 +189,8 @@ pub enum SearchCommands {
     Keyword(KeywordSearchArgs),
     /// Perform vector similarity search on chunk embeddings.
     Vector(VectorSearchArgs),
+    /// Perform hybrid RRF/weighted search that fuses keyword and vector rankings.
+    Hybrid(HybridSearchArgs),
 }
 
 /// Arguments for keyword search.
@@ -265,6 +268,55 @@ pub struct VectorSearchArgs {
     /// Pretty-print JSON output.
     #[arg(long, action = ArgAction::SetTrue)]
     pub pretty: bool,
+}
+
+/// Arguments for hybrid search.
+#[derive(Debug, Args)]
+#[command(after_help = "\
+EXAMPLES:
+  # Default RRF-based hybrid search
+  zetesis search hybrid kio --q \"public procurement dispute\"
+
+  # Hybrid search with weighted fusion
+  zetesis search hybrid kio --q \"appeal\" --fusion weighted --keyword-weight 0.7 --vector-weight 0.3
+")]
+pub struct HybridSearchArgs {
+    /// Name of the index to query (e.g. `kio`).
+    #[arg(value_parser = validate_index_slug)]
+    pub index: String,
+    /// Query text shared by both keyword and vector searches.
+    #[arg(long = "q", value_name = "QUERY")]
+    pub query: String,
+    /// Optional Milli filter expression.
+    #[arg(long)]
+    pub filter: Option<String>,
+    /// Embedder key to use for the vector branch.
+    #[arg(long = "embedder")]
+    pub embedder: Option<String>,
+    /// Maximum number of fused results to return (1-100).
+    #[arg(long, default_value_t = 20, value_parser = validate_search_limit)]
+    pub limit: usize,
+    /// Comma-separated list of fields to include in the output.
+    #[arg(long = "fields", value_delimiter = ',', num_args = 0..)]
+    pub fields: Vec<String>,
+    /// Fusion strategy (`rrf` or `weighted`).
+    #[arg(long, value_enum, default_value_t = HybridFusionArg::Rrf)]
+    pub fusion: HybridFusionArg,
+    /// Relative weight for the keyword branch (only used when --fusion weighted).
+    #[arg(long = "keyword-weight", default_value_t = HYBRID_DEFAULT_WEIGHT, value_parser = validate_weight)]
+    pub keyword_weight: f32,
+    /// Relative weight for the vector branch (only used when --fusion weighted).
+    #[arg(long = "vector-weight", default_value_t = HYBRID_DEFAULT_WEIGHT, value_parser = validate_weight)]
+    pub vector_weight: f32,
+    /// Pretty-print JSON output.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub pretty: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum HybridFusionArg {
+    Rrf,
+    Weighted,
 }
 
 /// Top-level namespace for database maintenance commands.
@@ -581,6 +633,19 @@ fn validate_vector_k(s: &str) -> Result<usize, String> {
     Ok(value)
 }
 
+fn validate_weight(s: &str) -> Result<f32, String> {
+    let value = s
+        .parse::<f32>()
+        .map_err(|_| format!("invalid number: {}", s))?;
+    if !value.is_finite() {
+        return Err("weight must be finite".to_string());
+    }
+    if value < 0.0 || value > 1.0 {
+        return Err("weight must be between 0.0 and 1.0".to_string());
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,6 +756,15 @@ mod tests {
             "zetesis", "search", "vector", "kio", "--q", "test", "--k", "20",
         ]);
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn weight_validator_enforces_bounds() {
+        assert!(validate_weight("0").is_ok());
+        assert!(validate_weight("1").is_ok());
+        assert!(validate_weight("0.5").is_ok());
+        assert!(validate_weight("-0.1").is_err());
+        assert!(validate_weight("1.1").is_err());
     }
 
     #[test]

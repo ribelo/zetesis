@@ -51,8 +51,10 @@ pub use reaper::{
     ReaperAction, ReaperConfig, ReaperError, ReaperReport, calculate_retry_backoff, reap_stale_jobs,
 };
 pub use search::{
-    KeywordSearchParams, VectorSearchParams, build_search_row, keyword, normalize_index_name,
-    open_index_read_only, project_value, resolve_index_dir, vector,
+    HYBRID_DEFAULT_RRF_K, HYBRID_DEFAULT_WEIGHT, HYBRID_PER_SOURCE_LIMIT_MAX,
+    HYBRID_RESULT_LIMIT_MAX, HybridFusion, HybridSearchParams, KeywordSearchParams,
+    VectorSearchParams, build_search_row, hybrid, keyword, normalize_hybrid_weights,
+    normalize_index_name, open_index_read_only, project_value, resolve_index_dir, vector,
 };
 
 pub use search::set_data_dir_override;

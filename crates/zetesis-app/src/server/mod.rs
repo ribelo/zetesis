@@ -34,12 +34,17 @@ use tower_http::{
 
 use crate::config::{AppConfig, CorsConfig, RateLimitConfig, RouteLimitConfig, ServerConfig};
 use crate::error::AppError;
-use crate::services::{KeywordSearchParams, VectorSearchParams, keyword, vector};
+use crate::services::{
+    HYBRID_DEFAULT_RRF_K, HYBRID_DEFAULT_WEIGHT, HYBRID_PER_SOURCE_LIMIT_MAX,
+    HYBRID_RESULT_LIMIT_MAX, HybridFusion, HybridSearchParams, KeywordSearchParams,
+    VectorSearchParams, hybrid, keyword, normalize_hybrid_weights, vector,
+};
 
 const HEALTHZ_PATH: &str = "/v1/healthz";
 const KEYWORD_PATH: &str = "/v1/search/keyword";
 const VECTOR_PATH: &str = "/v1/search/vector";
 const TYPEAHEAD_PATH: &str = "/v1/search/typeahead";
+const HYBRID_PATH: &str = "/v1/search/hybrid";
 const HEALTHZ_STATUS: &str = "ok";
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FIELD_COUNT: usize = 64;
@@ -102,6 +107,38 @@ struct VectorQuery {
     top_k: usize,
     #[serde(default, deserialize_with = "deserialize_string_list")]
     fields: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HybridQuery {
+    index: String,
+    #[serde(rename = "q")]
+    query: String,
+    filter: Option<String>,
+    embedder: Option<String>,
+    #[serde(default = "HybridQuery::default_limit")]
+    limit: usize,
+    #[serde(default, deserialize_with = "deserialize_string_list")]
+    fields: Vec<String>,
+    #[serde(default)]
+    fusion: HybridFusionQuery,
+    #[serde(default)]
+    keyword_weight: Option<f32>,
+    #[serde(default)]
+    vector_weight: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, Copy, Clone)]
+#[serde(rename_all = "lowercase")]
+enum HybridFusionQuery {
+    Rrf,
+    Weighted,
+}
+
+impl Default for HybridFusionQuery {
+    fn default() -> Self {
+        HybridFusionQuery::Rrf
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,6 +233,7 @@ pub enum ServerError {
 struct RateLimitState {
     keyword: Arc<DefaultKeyedRateLimiter<String>>,
     vector: Arc<DefaultKeyedRateLimiter<String>>,
+    hybrid: Arc<DefaultKeyedRateLimiter<String>>,
     typeahead: Arc<DefaultKeyedRateLimiter<String>>,
     window_ms: u64,
     proxy_mode: crate::config::ProxyMode,
@@ -209,10 +247,12 @@ impl RateLimitState {
         let window_ms = cfg.window_ms.get();
         let kw = build_keyed_limiter(&cfg.keyword, window_ms);
         let vec = build_keyed_limiter(&cfg.vector, window_ms);
+        let hybrid = build_keyed_limiter(&cfg.hybrid, window_ms);
         let ta = build_keyed_limiter(&cfg.typeahead, window_ms);
         Ok(Arc::new(Self {
             keyword: Arc::new(kw),
             vector: Arc::new(vec),
+            hybrid: Arc::new(hybrid),
             typeahead: Arc::new(ta),
             window_ms,
             proxy_mode: cfg.proxy_mode,
@@ -255,6 +295,8 @@ async fn rate_limit_middleware(
         ("keyword", &state.keyword)
     } else if path == VECTOR_PATH {
         ("vector", &state.vector)
+    } else if path == HYBRID_PATH {
+        ("hybrid", &state.hybrid)
     } else if path == TYPEAHEAD_PATH {
         ("typeahead", &state.typeahead)
     } else {
@@ -402,6 +444,75 @@ impl VectorQuery {
             fields,
             top_k,
         })
+    }
+}
+
+impl HybridQuery {
+    fn into_params(self) -> Result<HybridSearchParams, ApiError> {
+        let HybridQuery {
+            index,
+            query,
+            filter,
+            embedder,
+            limit,
+            fields,
+            fusion,
+            keyword_weight,
+            vector_weight,
+        } = self;
+        let limit = limit;
+        ensure_range("limit", limit, 1, HYBRID_RESULT_LIMIT_MAX)?;
+        let index = trim_non_empty("index", index)?;
+        let query = trim_non_empty("q", query)?;
+        let filter = sanitize_optional(filter);
+        let embedder = sanitize_optional(embedder);
+        let fields = expand_csv(fields);
+        validate_list("fields", &fields, MAX_FIELD_COUNT)?;
+        let per_branch_limit = limit.min(HYBRID_PER_SOURCE_LIMIT_MAX).max(1);
+        let keyword_params = KeywordSearchParams {
+            index: index.clone(),
+            query: query.clone(),
+            filter: filter.clone(),
+            sort: Vec::new(),
+            fields: fields.clone(),
+            limit: per_branch_limit,
+            offset: 0,
+        };
+        let vector_params = VectorSearchParams {
+            index,
+            query,
+            embedder,
+            filter,
+            fields,
+            top_k: per_branch_limit,
+        };
+        let fusion_mode = match fusion {
+            HybridFusionQuery::Rrf => HybridFusion::Rrf {
+                k: HYBRID_DEFAULT_RRF_K,
+            },
+            HybridFusionQuery::Weighted => {
+                let kw = keyword_weight.unwrap_or(HYBRID_DEFAULT_WEIGHT);
+                let vw = vector_weight.unwrap_or(HYBRID_DEFAULT_WEIGHT);
+                validate_weight_param("keyword_weight", kw)?;
+                validate_weight_param("vector_weight", vw)?;
+                let (kw_norm, vw_norm) = normalize_hybrid_weights(kw, vw)
+                    .map_err(|msg| ApiError::invalid_param("fusion", msg))?;
+                HybridFusion::Weighted {
+                    keyword_weight: kw_norm,
+                    vector_weight: vw_norm,
+                }
+            }
+        };
+        Ok(HybridSearchParams {
+            keyword: keyword_params,
+            vector: vector_params,
+            limit,
+            fusion: fusion_mode,
+        })
+    }
+
+    const fn default_limit() -> usize {
+        20
     }
 }
 
@@ -777,6 +888,20 @@ fn validate_top_k(k: usize) -> Result<(), ApiError> {
     ensure_range("k", k, 1, 100)
 }
 
+fn validate_weight_param(field: &str, value: f32) -> Result<(), ApiError> {
+    debug_assert!(!field.is_empty());
+    if !value.is_finite() {
+        return Err(ApiError::invalid_param(field, "must be finite"));
+    }
+    if !(0.0..=1.0).contains(&value) {
+        return Err(ApiError::invalid_param(
+            field,
+            "must be between 0.0 and 1.0",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -818,6 +943,46 @@ mod tests {
     fn expand_csv_splits_commas() {
         let values = expand_csv(vec!["a,b".to_string(), "c".to_string()]);
         assert_eq!(values, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn hybrid_query_defaults_limit_and_weights() {
+        let query = HybridQuery {
+            index: "kio".to_string(),
+            query: "foo".to_string(),
+            filter: None,
+            embedder: None,
+            limit: 20,
+            fields: Vec::new(),
+            fusion: HybridFusionQuery::Rrf,
+            keyword_weight: None,
+            vector_weight: None,
+        };
+        let params = query.into_params().expect("defaults must be valid");
+        assert_eq!(params.limit, 20);
+        if let HybridFusion::Rrf { k } = params.fusion {
+            assert_eq!(k, HYBRID_DEFAULT_RRF_K);
+        } else {
+            panic!("expected RRF for default fusion");
+        }
+        assert_eq!(params.keyword.limit, 20);
+        assert_eq!(params.vector.top_k, 20);
+    }
+
+    #[test]
+    fn hybrid_query_rejects_invalid_weight() {
+        let query = HybridQuery {
+            index: "kio".to_string(),
+            query: "foo".to_string(),
+            filter: None,
+            embedder: None,
+            limit: 10,
+            fields: Vec::new(),
+            fusion: HybridFusionQuery::Weighted,
+            keyword_weight: Some(-0.1),
+            vector_weight: Some(0.5),
+        };
+        assert!(query.into_params().is_err());
     }
 
     #[test]
@@ -1037,6 +1202,10 @@ pub fn build_api_router() -> Router {
             get(vector_search).fallback(method_not_allowed_handler),
         )
         .route(
+            HYBRID_PATH,
+            get(hybrid_search).fallback(method_not_allowed_handler),
+        )
+        .route(
             TYPEAHEAD_PATH,
             get(typeahead_search)
                 .with_state(typeahead_state)
@@ -1242,6 +1411,13 @@ async fn vector_search(Query(query): Query<VectorQuery>) -> Result<Json<Vec<Valu
     debug_assert!(!VECTOR_PATH.is_empty());
     let params = query.into_params()?;
     let rows = vector(&params).await.map_err(ApiError::from)?;
+    Ok(Json(rows))
+}
+
+async fn hybrid_search(Query(query): Query<HybridQuery>) -> Result<Json<Vec<Value>>, ApiError> {
+    debug_assert!(!HYBRID_PATH.is_empty());
+    let params = query.into_params()?;
+    let rows = hybrid(&params).await.map_err(ApiError::from)?;
     Ok(Json(rows))
 }
 

@@ -1,6 +1,7 @@
 //! Shared search helpers for CLI and HTTP entrypoints.
 
 use std::{
+    collections::HashMap,
     env,
     path::{Path, PathBuf},
     str::FromStr,
@@ -11,6 +12,7 @@ use milli::score_details::ScoreDetails;
 use milli::vector::embedder::{Embedder, EmbedderOptions, manual};
 use milli::{AscDesc, Filter, Index as MilliIndex, Search as MilliSearch, all_obkv_to_json};
 use serde_json::Value;
+use tokio::task;
 
 use crate::constants::DEFAULT_EMBEDDER_KEY;
 use crate::error::AppError;
@@ -19,6 +21,11 @@ use crate::services::{PipelineError, build_pipeline_context};
 
 const LMDB_MAP_SIZE_BYTES: usize = 1 << 30;
 static DATA_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+pub const HYBRID_RESULT_LIMIT_MAX: usize = 100;
+pub const HYBRID_PER_SOURCE_LIMIT_MAX: usize = 50;
+pub const HYBRID_DEFAULT_RRF_K: usize = 60;
+pub const HYBRID_DEFAULT_WEIGHT: f32 = 0.5;
+const HYBRID_WEIGHT_EPSILON: f32 = f32::EPSILON;
 
 fn data_dir_override() -> &'static Mutex<Option<PathBuf>> {
     DATA_DIR_OVERRIDE.get_or_init(|| Mutex::new(None))
@@ -51,6 +58,25 @@ pub struct VectorSearchParams {
     pub filter: Option<String>,
     pub fields: Vec<String>,
     pub top_k: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum HybridFusion {
+    Rrf {
+        k: usize,
+    },
+    Weighted {
+        keyword_weight: f32,
+        vector_weight: f32,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct HybridSearchParams {
+    pub keyword: KeywordSearchParams,
+    pub vector: VectorSearchParams,
+    pub limit: usize,
+    pub fusion: HybridFusion,
 }
 
 pub fn keyword(params: &KeywordSearchParams) -> Result<Vec<Value>, AppError> {
@@ -166,6 +192,22 @@ pub async fn vector(params: &VectorSearchParams) -> Result<Vec<Value>, AppError>
     }
     drop(rtxn);
     Ok(rows)
+}
+
+pub async fn hybrid(params: &HybridSearchParams) -> Result<Vec<Value>, AppError> {
+    debug_assert!(params.limit >= 1);
+    debug_assert!(params.limit <= HYBRID_RESULT_LIMIT_MAX);
+    let keyword_params = params.keyword.clone();
+    let vector_params = params.vector.clone();
+    let keyword_future = run_keyword_task(keyword_params);
+    let vector_future = async move { vector(&vector_params).await };
+    let (keyword_rows, vector_rows) = tokio::try_join!(keyword_future, vector_future)?;
+    Ok(fuse_hybrid_rows(
+        keyword_rows,
+        vector_rows,
+        params.limit,
+        params.fusion,
+    ))
 }
 
 pub fn normalize_index_name(raw: &str) -> Result<String, AppError> {
@@ -318,10 +360,204 @@ pub fn build_search_row(original: &Value, projected: Value, score: Option<f64>) 
     Value::Object(map)
 }
 
+pub fn normalize_hybrid_weights(
+    keyword_weight: f32,
+    vector_weight: f32,
+) -> Result<(f32, f32), &'static str> {
+    if !keyword_weight.is_finite() || !vector_weight.is_finite() {
+        return Err("weights must be finite");
+    }
+    if keyword_weight < 0.0 || vector_weight < 0.0 {
+        return Err("weights must be non-negative");
+    }
+    let sum = keyword_weight + vector_weight;
+    if sum <= HYBRID_WEIGHT_EPSILON {
+        return Err("weights must not both be zero");
+    }
+    Ok((keyword_weight / sum, vector_weight / sum))
+}
+
+async fn run_keyword_task(params: KeywordSearchParams) -> Result<Vec<Value>, AppError> {
+    debug_assert!(!params.index.trim().is_empty());
+    task::spawn_blocking(move || keyword(&params))
+        .await
+        .map_err(|err| join_error("keyword_search", err))?
+}
+
+fn fuse_hybrid_rows(
+    keyword_rows: Vec<Value>,
+    vector_rows: Vec<Value>,
+    limit: usize,
+    fusion: HybridFusion,
+) -> Vec<Value> {
+    debug_assert!(limit >= 1);
+    debug_assert!(limit <= HYBRID_RESULT_LIMIT_MAX);
+    let capacity = keyword_rows.len().saturating_add(vector_rows.len());
+    let mut entries: HashMap<String, FusionEntry> = HashMap::with_capacity(capacity);
+    ingest_rows(&mut entries, keyword_rows, HybridSource::Keyword);
+    ingest_rows(&mut entries, vector_rows, HybridSource::Vector);
+    let mut fused: Vec<(String, f64, FusionEntry)> =
+        Vec::with_capacity(entries.len().min(limit + 4));
+    for (doc_id, mut entry) in entries {
+        entry.fused_score = match fusion {
+            HybridFusion::Rrf { k } => fused_rrf_score(&entry, k),
+            HybridFusion::Weighted {
+                keyword_weight,
+                vector_weight,
+            } => fused_weighted_score(&entry, keyword_weight, vector_weight),
+        };
+        apply_fused_score(&mut entry.row, entry.fused_score);
+        fused.push((doc_id, entry.fused_score, entry));
+    }
+    fused.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| rank_value(&a.2.keyword_rank).cmp(&rank_value(&b.2.keyword_rank)))
+            .then_with(|| rank_value(&a.2.vector_rank).cmp(&rank_value(&b.2.vector_rank)))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    fused.truncate(limit);
+    fused.into_iter().map(|(_, _, entry)| entry.row).collect()
+}
+
+fn ingest_rows(entries: &mut HashMap<String, FusionEntry>, rows: Vec<Value>, source: HybridSource) {
+    debug_assert!(rows.len() <= HYBRID_RESULT_LIMIT_MAX);
+    for (rank, row) in rows.into_iter().enumerate() {
+        if let Some(doc_id) = extract_doc_identifier(&row) {
+            let score = read_score(&row);
+            let entry = entries
+                .entry(doc_id)
+                .or_insert_with(|| FusionEntry::new(row.clone()));
+            entry.attach(source, rank, score);
+        }
+    }
+}
+
+fn extract_doc_identifier(row: &Value) -> Option<String> {
+    match row {
+        Value::Object(map) => map
+            .get("doc_id")
+            .or_else(|| map.get("id"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string()),
+        _ => None,
+    }
+}
+
+fn read_score(row: &Value) -> Option<f64> {
+    match row {
+        Value::Object(map) => map.get("score").and_then(|value| value.as_f64()),
+        _ => None,
+    }
+}
+
+fn apply_fused_score(row: &mut Value, fused_score: f64) {
+    if let Value::Object(map) = row {
+        if let Some(value) = number_value(fused_score) {
+            map.insert("score".to_string(), value);
+        }
+    }
+}
+
+fn fused_rrf_score(entry: &FusionEntry, k: usize) -> f64 {
+    debug_assert!(k > 0);
+    let mut total = 0.0;
+    if let Some(rank) = entry.keyword_rank {
+        total += reciprocal_rank_score(rank, k);
+    }
+    if let Some(rank) = entry.vector_rank {
+        total += reciprocal_rank_score(rank, k);
+    }
+    total
+}
+
+fn fused_weighted_score(entry: &FusionEntry, keyword_weight: f32, vector_weight: f32) -> f64 {
+    debug_assert!(keyword_weight >= 0.0);
+    debug_assert!(vector_weight >= 0.0);
+    let kw = normalized_component(entry.keyword_score, entry.keyword_rank);
+    let vv = normalized_component(entry.vector_score, entry.vector_rank);
+    f64::from(keyword_weight) * kw + f64::from(vector_weight) * vv
+}
+
+fn normalized_component(score: Option<f64>, rank: Option<usize>) -> f64 {
+    if let Some(value) = score {
+        if value.is_finite() && value >= 0.0 {
+            return value;
+        }
+    }
+    rank.map(|pos| 1.0 / (1.0 + pos as f64)).unwrap_or(0.0)
+}
+
+fn reciprocal_rank_score(rank: usize, k: usize) -> f64 {
+    let base = (k as f64) + 1.0 + (rank as f64);
+    if base <= 0.0 {
+        return 0.0;
+    }
+    1.0 / base
+}
+
+fn rank_value(rank: &Option<usize>) -> usize {
+    rank.map(|value| value + 1).unwrap_or(usize::MAX)
+}
+
+#[derive(Debug)]
+struct FusionEntry {
+    row: Value,
+    keyword_rank: Option<usize>,
+    vector_rank: Option<usize>,
+    keyword_score: Option<f64>,
+    vector_score: Option<f64>,
+    fused_score: f64,
+}
+
+impl FusionEntry {
+    fn new(row: Value) -> Self {
+        Self {
+            row,
+            keyword_rank: None,
+            vector_rank: None,
+            keyword_score: None,
+            vector_score: None,
+            fused_score: 0.0,
+        }
+    }
+
+    fn attach(&mut self, source: HybridSource, rank: usize, score: Option<f64>) {
+        match source {
+            HybridSource::Keyword => {
+                if self.keyword_rank.is_none() {
+                    self.keyword_rank = Some(rank);
+                    self.keyword_score = score;
+                }
+            }
+            HybridSource::Vector => {
+                if self.vector_rank.is_none() {
+                    self.vector_rank = Some(rank);
+                    self.vector_score = score;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+enum HybridSource {
+    Keyword,
+    Vector,
+}
+
+fn join_error(task: &str, err: task::JoinError) -> AppError {
+    let message = format!("{task} task panicked: {err}");
+    PipelineError::message(message).into()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{extract_path, number_value, project_value};
-    use serde_json::json;
+    use super::{
+        HYBRID_DEFAULT_RRF_K, HybridFusion, extract_path, fuse_hybrid_rows,
+        normalize_hybrid_weights, number_value, project_value,
+    };
+    use serde_json::{Value, json};
 
     #[test]
     fn project_value_returns_full_object_when_fields_empty() {
@@ -342,5 +578,44 @@ mod tests {
         assert!(number_value(f64::NAN).is_none());
         assert!(number_value(f64::INFINITY).is_none());
         assert_eq!(number_value(1.5), Some(json!(1.5)));
+    }
+
+    #[test]
+    fn normalize_weights_rejects_zero_sum() {
+        let err = normalize_hybrid_weights(0.0, 0.0).unwrap_err();
+        assert!(err.contains("zero"));
+    }
+
+    #[test]
+    fn hybrid_fusion_merges_duplicates() {
+        let keyword_rows = vec![row("doc-a", 0.8), row("doc-b", 0.7), row("doc-c", 0.6)];
+        let vector_rows = vec![row("doc-b", 0.95), row("doc-d", 0.5)];
+        let fused = fuse_hybrid_rows(
+            keyword_rows,
+            vector_rows,
+            4,
+            HybridFusion::Rrf {
+                k: HYBRID_DEFAULT_RRF_K,
+            },
+        );
+        assert_eq!(fused.len(), 4);
+        let ids: Vec<String> = fused
+            .into_iter()
+            .filter_map(|row| {
+                row.get("doc_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .collect();
+        assert!(ids.contains(&"doc-b".to_string()));
+        assert!(ids.contains(&"doc-d".to_string()));
+    }
+
+    fn row(doc_id: &str, score: f64) -> Value {
+        json!({
+            "doc_id": doc_id,
+            "score": score,
+            "value": { "doc_id": doc_id }
+        })
     }
 }

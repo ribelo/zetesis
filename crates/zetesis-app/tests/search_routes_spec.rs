@@ -110,6 +110,46 @@ async fn vector_missing_embedder_defaults() {
 }
 
 #[tokio::test]
+async fn hybrid_limit_zero_returns_400() {
+    let _lock = test_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    set_data_dir_override(None);
+
+    let app = build_api_router();
+    let request = Request::builder()
+        .method("GET")
+        .uri("/v1/search/hybrid?index=kio&q=test&limit=0")
+        .body(Body::empty())
+        .expect("request builder must not fail");
+
+    let response = app.oneshot(request).await.expect("handler should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    set_data_dir_override(None);
+}
+
+#[tokio::test]
+async fn hybrid_zero_weights_returns_400() {
+    let _lock = test_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    set_data_dir_override(None);
+
+    let app = build_api_router();
+    let request = Request::builder()
+        .method("GET")
+        .uri("/v1/search/hybrid?index=kio&q=test&limit=10&fusion=weighted&keyword_weight=0&vector_weight=0")
+        .body(Body::empty())
+        .expect("request builder must not fail");
+
+    let response = app.oneshot(request).await.expect("handler should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    set_data_dir_override(None);
+}
+
+#[tokio::test]
 async fn typeahead_short_query_returns_400() {
     let _lock = test_mutex()
         .lock()
