@@ -81,6 +81,7 @@ pub async fn index_structured_decision(
         &decision,
         silo,
         doc_id,
+        &[doc_id],
         &ctx.embed.embedder_key,
         IngestMetadata::pending(),
     )
@@ -105,6 +106,7 @@ pub async fn index_structured_decision(
                 &decision,
                 silo,
                 doc_id,
+                &[doc_id],
                 &ctx.embed.embedder_key,
                 IngestMetadata::errored(&message),
             )
@@ -148,6 +150,7 @@ pub async fn index_structured_decision(
         &decision,
         silo,
         doc_id,
+        &[doc_id],
         &ctx.embed.embedder_key,
         IngestMetadata::indexed(&ctx.embed.embedder_key, chunk_count),
     )
@@ -196,6 +199,7 @@ pub async fn index_structured_with_embeddings(
         &decision,
         silo,
         doc_id,
+        &[doc_id],
         &ctx.embed.embedder_key,
         IngestMetadata::pending(),
     )
@@ -220,6 +224,7 @@ pub async fn index_structured_with_embeddings(
                 &decision,
                 silo,
                 doc_id,
+                &[doc_id],
                 &ctx.embed.embedder_key,
                 IngestMetadata::errored(&message),
             )
@@ -263,6 +268,7 @@ pub async fn index_structured_with_embeddings(
         &decision,
         silo,
         doc_id,
+        &[doc_id],
         &ctx.embed.embedder_key,
         IngestMetadata::indexed(&ctx.embed.embedder_key, chunk_count),
     )
@@ -402,6 +408,7 @@ async fn mark_ingest_error(
         decision,
         silo,
         doc_id,
+        &[doc_id],
         embedder_key,
         IngestMetadata::errored(message),
     ) {

@@ -7,10 +7,12 @@ use thiserror::Error;
 
 use crate::config;
 use crate::index::milli::MilliBootstrapError;
+use crate::index::writer::IndexWriteError;
 use crate::ingestion;
 use crate::paths::PathError;
 use crate::pdf::{PdfRenderError, PdfTextError};
 use crate::server;
+use crate::services::blob_store::BlobError;
 use crate::services::{
     GenerationJobStoreError, OcrError, PipelineError, ReaperError, StructuredExtractError,
 };
@@ -24,6 +26,8 @@ pub enum AppError {
     Config(String),
     #[error("storage error: {0}")]
     Storage(String),
+    #[error("blob store error: {0}")]
+    BlobStore(#[from] BlobError),
     #[error(transparent)]
     Server(#[from] server::ServerError),
     #[error(transparent)]
@@ -44,6 +48,8 @@ pub enum AppError {
     Paths(#[from] PathError),
     #[error(transparent)]
     Milli(#[from] Box<milli::Error>),
+    #[error(transparent)]
+    IndexWrite(#[from] IndexWriteError),
     #[error(transparent)]
     Heed(#[from] Box<heed::Error>),
     #[error(transparent)]

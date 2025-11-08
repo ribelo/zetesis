@@ -14,6 +14,7 @@ use std::{
 use ai_ox::content::part::Part as AttachmentPart;
 use chrono::Utc;
 use futures_util::stream::{Stream, StreamExt};
+use heed::EnvOpenOptions;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use inquire::{InquireError, Text};
 use milli::Index as MilliIndex;
@@ -25,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing_subscriber::{filter::LevelFilter, fmt};
 use uuid::Uuid;
+use zetesis_app::cli::db_delete::DbDeleteArgs;
 use zetesis_app::cli::{
     AuditArgs, AuditCommands, Cli, Commands, DEFAULT_KIO_SAOS_URL, DEFAULT_KIO_UZP_URL, DbArgs,
     DbBackupArgs, DbCommands, DbFindArgs, DbGetArgs, DbPurgeArgs, DbRecoverArgs, DbStatsArgs,
@@ -36,6 +38,7 @@ use zetesis_app::cli::{
 #[cfg(feature = "cli-debug")]
 use zetesis_app::cli::{DebugArgs, DebugCommands};
 use zetesis_app::error::AppError;
+use zetesis_app::index::deleter::DocumentDeleter;
 use zetesis_app::index::milli::{ensure_index, open_existing_index};
 use zetesis_app::ingestion::{
     KioEvent, KioSaosScraper, KioScrapeOptions, KioScraperSummary, KioUzpScraper,
@@ -1813,6 +1816,7 @@ async fn run_db(args: DbArgs) -> Result<(), AppError> {
         DbCommands::Backup(sub) => db_backup(sub)?,
         DbCommands::Purge(sub) => db_purge(sub)?,
         DbCommands::Recover(sub) => db_recover(sub)?,
+        DbCommands::Delete(sub) => db_delete(sub).await?,
     }
     Ok(())
 }
@@ -2213,6 +2217,112 @@ fn db_recover(args: DbRecoverArgs) -> Result<(), AppError> {
     copy_directory(&source, &target)?;
     println!("recovered index `{}` from {}", index_name, source.display());
     Ok(())
+}
+
+async fn db_delete(args: DbDeleteArgs) -> Result<(), AppError> {
+    let (index_name, index_path) = resolve_index_dir(&args.index)?;
+    let index = open_index_without_config(&index_path)?;
+    let deleter = DocumentDeleter::new(index);
+
+    let Some(plan) = deleter.plan(&args.id)? else {
+        println!("Document '{}' not found in index '{}'", args.id, index_name);
+        return Ok(());
+    };
+
+    println!(
+        "Found {} records ({} chunks) for doc_id '{}'",
+        plan.info().record_count,
+        plan.info().num_chunks,
+        args.id
+    );
+    if plan.info().blob_cids.is_empty() {
+        println!("No blob CIDs discovered for this document.");
+    } else {
+        println!("Blob CIDs slated for deletion:");
+        for cid in plan.blob_cids() {
+            println!("  - {cid}");
+        }
+    }
+
+    if args.dry_run {
+        println!(
+            "DRY RUN: Would delete document '{}' from index '{}'",
+            args.id, index_name
+        );
+        return Ok(());
+    }
+
+    if !args.assume_yes {
+        let token = generate_confirmation_token();
+        let prompt_message = format!(
+            "Type `{}` to confirm deleting document '{}' from index '{}'",
+            token.as_str(),
+            args.id,
+            index_name.as_str()
+        );
+        let input = match Text::new(prompt_message.as_str())
+            .with_placeholder("confirmation token")
+            .with_help_message(
+                "This will permanently delete the document and all associated chunks.",
+            )
+            .prompt()
+        {
+            Ok(value) => value,
+            Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
+                return Err(AppError::PurgeConfirmationCancelled { index: index_name });
+            }
+            Err(err) => {
+                return Err(AppError::PurgePromptFailed { source: err });
+            }
+        };
+        if input.trim() != token {
+            return Err(AppError::PurgeConfirmationRejected { index: index_name });
+        }
+    }
+
+    let summary = deleter.execute(plan)?;
+    println!(
+        "Deleted document '{}' ({} records) from index '{}'",
+        args.id, summary.record_count, index_name
+    );
+
+    if summary.blob_cids.is_empty() {
+        return Ok(());
+    }
+
+    // Attempt to parse the silo, but skip blob deletion for non-silo indexes
+    // This allows db delete to work with any valid index (including those restored via db recover)
+    // without leaving orphaned blob data or returning errors
+    match Silo::from_str(&index_name) {
+        Ok(silo) => {
+            let cfg = config::load()?;
+            let blob_store = build_blob_store(&cfg.storage).await?;
+            for cid in &summary.blob_cids {
+                match blob_store.delete(silo, cid).await {
+                    Ok(true) => println!("Deleted blob {cid} from silo '{}'", silo.slug()),
+                    Ok(false) => println!("Blob {cid} already absent in silo '{}'", silo.slug()),
+                    Err(err) => {
+                        tracing::warn!(%cid, error = %err, "failed to delete blob");
+                        return Err(err.into());
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            // Index name is not a known silo (e.g., a custom index from db recover)
+            // Skip blob deletion but don't error - the Milli records were successfully deleted
+            tracing::info!("Skipping blob cleanup for non-silo index '{}'", index_name);
+        }
+    }
+
+    Ok(())
+}
+
+fn open_index_without_config(path: &Path) -> Result<MilliIndex, AppError> {
+    const DEFAULT_MAP_SIZE_BYTES: usize = 1 << 30;
+    let mut env_opts = EnvOpenOptions::new().read_txn_without_tls();
+    env_opts.map_size(DEFAULT_MAP_SIZE_BYTES);
+    MilliIndex::new(env_opts, path, false).map_err(AppError::from)
 }
 
 fn io_error(path: &Path, source: std::io::Error) -> AppError {

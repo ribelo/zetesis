@@ -21,6 +21,7 @@ bcrypt = "0.17.1"
 bincode = { version = "2.0.1", features = ["serde"] }
 blake3 = "1.8.2"
 bon = "3.8.1"
+bumpalo = "3.16"
 bytes = "1.9.0"
 chrono = { version = "0.4.42", features = ["serde"] }
 comfy-table = "7.2.1"

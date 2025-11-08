@@ -326,6 +326,9 @@ pub struct DbArgs {
     pub command: DbCommands,
 }
 
+pub mod db_delete;
+pub use self::db_delete::DbDeleteArgs;
+
 /// Database maintenance subcommands.
 #[derive(Debug, Subcommand)]
 pub enum DbCommands {
@@ -343,6 +346,8 @@ pub enum DbCommands {
     Purge(DbPurgeArgs),
     /// Restore a Milli index from a backup directory.
     Recover(DbRecoverArgs),
+    /// Delete a document and associated chunks/blobs.
+    Delete(DbDeleteArgs),
 }
 
 /// Arguments for `db stats`.

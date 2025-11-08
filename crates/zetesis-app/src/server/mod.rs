@@ -179,7 +179,7 @@ enum TypeaheadCacheStatus {
     Miss,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ApiErrorBody {
     error: &'static str,
     message: String,
@@ -191,7 +191,7 @@ struct ApiErrorBody {
     request_id: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ApiError {
     status: StatusCode,
     body: ApiErrorBody,
@@ -616,7 +616,7 @@ impl TypeaheadState {
         match self.cache.try_get_with(key, loader).await {
             Ok(rows) => Ok((rows, TypeaheadCacheStatus::Miss)),
             Err(error) => {
-                let owned = Arc::try_unwrap(error).unwrap_or_else(|_| ApiError::internal());
+                let owned = Arc::try_unwrap(error).unwrap_or_else(|arc| arc.as_ref().clone());
                 Err(owned)
             }
         }

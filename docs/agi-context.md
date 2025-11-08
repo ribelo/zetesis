@@ -140,12 +140,13 @@ pub fn build_document_payload(
     decision: &StructuredDecision,
     silo: Silo,
     doc_id: &str,
+    blob_cids: &[&str],
     ingest: IngestMetadata<'_>,
 ) -> Result<PreparedDocumentRecords, serde_json::Error> {
     debug_assert!(!doc_id.is_empty());
     debug_assert!(decision.chunks.len() < u32::MAX as usize);
 
-    let doc_record = build_doc_record(decision, silo, doc_id, ingest)?;
+    let doc_record = build_doc_record(decision, silo, doc_id, blob_cids, ingest)?;
     let chunks = make_chunk_records(decision, silo, doc_id);
     Ok(PreparedDocumentRecords {
         doc: doc_record,
@@ -157,6 +158,7 @@ pub fn build_doc_record(
     decision: &StructuredDecision,
     silo: Silo,
     doc_id: &str,
+    blob_cids: &[&str],
     ingest: IngestMetadata<'_>,
 ) -> Result<JsonMap<String, JsonValue>, serde_json::Error> {
     debug_assert!(decision.summary_short.len() > 0);
@@ -176,6 +178,7 @@ pub fn build_doc_record(
         JsonValue::String(DOC_TYPE_DOC.to_string()),
     );
     record.insert("doc_id".to_string(), JsonValue::String(doc_id.to_string()));
+    record.insert("blob_cids".to_string(), json!(blob_cids));
     record.insert(
         "summary_short".to_string(),
         JsonValue::String(decision.summary_short.clone()),
@@ -183,7 +186,7 @@ pub fn build_doc_record(
     record.insert("structured".to_string(), serde_json::to_value(decision)?);
     record.insert(
         "ingest".to_string(),
-        JsonValue::Object(build_ingest_object(ingest)),
+        JsonValue::Object(build_ingest_object(ingest, blob_cids)),
     );
     Ok(record)
 }
@@ -274,7 +277,7 @@ fn make_chunk_records(
     out
 }
 
-fn build_ingest_object(meta: IngestMetadata<'_>) -> JsonMap<String, JsonValue> {
+fn build_ingest_object(meta: IngestMetadata<'_>, blob_cids: &[&str]) -> JsonMap<String, JsonValue> {
     let mut ingest = JsonMap::new();
     ingest.insert(
         "status".to_string(),
@@ -300,6 +303,7 @@ fn build_ingest_object(meta: IngestMetadata<'_>) -> JsonMap<String, JsonValue> {
             .map(|msg| JsonValue::String(msg.to_string()))
             .unwrap_or(JsonValue::Null),
     );
+    ingest.insert("blob_cids".to_string(), json!(blob_cids));
     ingest
 }
 
@@ -420,7 +424,14 @@ pub async fn index_structured_decision(
     debug_assert!(!doc_id.is_empty());
     debug_assert!(decision.chunks.len() > 0);
 
-    let pending = build_document_payload(&decision, silo, doc_id, IngestMetadata::pending())
+    let blob_refs = [doc_id];
+    let pending = build_document_payload(
+        &decision,
+        silo,
+        doc_id,
+        &blob_refs,
+        IngestMetadata::pending(),
+    )
         .map_err(|err| PipelineError::message(err.to_string()))?;
     actor.upsert(std::slice::from_ref(&pending.doc))?;
 
@@ -434,9 +445,14 @@ pub async fn index_structured_decision(
                 error = %message,
                 "structured indexing failed"
             );
-            let error_doc =
-                build_doc_record(&decision, silo, doc_id, IngestMetadata::errored(&message))
-                    .map_err(|err| PipelineError::message(err.to_string()))?;
+            let error_doc = build_doc_record(
+                &decision,
+                silo,
+                doc_id,
+                &blob_refs,
+                IngestMetadata::errored(&message),
+            )
+            .map_err(|err| PipelineError::message(err.to_string()))?;
             actor.upsert(std::slice::from_ref(&error_doc))?;
             return Err(err);
         }
@@ -450,6 +466,7 @@ pub async fn index_structured_decision(
         &decision,
         silo,
         doc_id,
+        &blob_refs,
         IngestMetadata::indexed(&ctx.embed.embedder_key, chunk_records.len()),
     )
     .map_err(|err| PipelineError::message(err.to_string()))?;

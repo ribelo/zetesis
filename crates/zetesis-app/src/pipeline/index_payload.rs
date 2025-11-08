@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use chrono::Utc;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
@@ -78,13 +80,14 @@ pub fn build_document_payload(
     decision: &StructuredDecision,
     silo: Silo,
     doc_id: &str,
+    blob_cids: &[&str],
     embedder_key: &str,
     ingest: IngestMetadata<'_>,
 ) -> Result<PreparedDocumentRecords, serde_json::Error> {
     debug_assert!(!doc_id.is_empty());
     debug_assert!(decision.chunks.len() < u32::MAX as usize);
 
-    let doc_record = build_doc_record(decision, silo, doc_id, embedder_key, ingest)?;
+    let doc_record = build_doc_record(decision, silo, doc_id, blob_cids, embedder_key, ingest)?;
     let chunks = make_chunk_records(decision, silo, doc_id);
     Ok(PreparedDocumentRecords {
         doc: doc_record,
@@ -96,6 +99,7 @@ pub fn build_doc_record(
     decision: &StructuredDecision,
     silo: Silo,
     doc_id: &str,
+    blob_cids: &[&str],
     embedder_key: &str,
     ingest: IngestMetadata<'_>,
 ) -> Result<JsonMap<String, JsonValue>, serde_json::Error> {
@@ -138,6 +142,17 @@ pub fn build_doc_record(
         JsonValue::String(DOC_TYPE_DOC.to_string()),
     );
     record.insert("doc_id".to_string(), JsonValue::String(doc_id.to_string()));
+    let normalized_blob_cids = normalize_blob_cids(blob_cids);
+    record.insert(
+        "blob_cids".to_string(),
+        JsonValue::Array(
+            normalized_blob_cids
+                .iter()
+                .cloned()
+                .map(JsonValue::String)
+                .collect(),
+        ),
+    );
     record.insert(
         "summary_short".to_string(),
         JsonValue::String(decision.summary_short.clone()),
@@ -218,7 +233,7 @@ pub fn build_doc_record(
     record.insert("structured".to_string(), serde_json::to_value(decision)?);
     record.insert(
         "ingest".to_string(),
-        JsonValue::Object(build_ingest_object(ingest)),
+        JsonValue::Object(build_ingest_object(ingest, normalized_blob_cids.as_slice())),
     );
     let mut vectors = JsonMap::new();
     vectors.insert(embedder_key.to_string(), JsonValue::Null);
@@ -414,7 +429,10 @@ fn make_chunk_records(
     out
 }
 
-fn build_ingest_object(meta: IngestMetadata<'_>) -> JsonMap<String, JsonValue> {
+fn build_ingest_object(
+    meta: IngestMetadata<'_>,
+    blob_cids: &[String],
+) -> JsonMap<String, JsonValue> {
     let mut ingest = JsonMap::new();
     ingest.insert(
         "status".to_string(),
@@ -440,7 +458,34 @@ fn build_ingest_object(meta: IngestMetadata<'_>) -> JsonMap<String, JsonValue> {
             .map(|msg| JsonValue::String(msg.to_string()))
             .unwrap_or(JsonValue::Null),
     );
+    ingest.insert(
+        "blob_cids".to_string(),
+        JsonValue::Array(blob_cids.iter().cloned().map(JsonValue::String).collect()),
+    );
     ingest
+}
+
+fn normalize_blob_cids(blob_cids: &[&str]) -> Vec<String> {
+    if blob_cids.is_empty() {
+        return Vec::new();
+    }
+
+    let mut seen = HashSet::with_capacity(blob_cids.len());
+    let mut out = Vec::with_capacity(blob_cids.len());
+    for cid in blob_cids {
+        let trimmed = cid.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if !lower.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            continue;
+        }
+        if seen.insert(lower.clone()) {
+            out.push(lower);
+        }
+    }
+    out
 }
 
 fn decision_result_value(result: DecisionResult) -> String {

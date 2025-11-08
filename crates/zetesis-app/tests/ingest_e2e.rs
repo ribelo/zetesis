@@ -6,6 +6,7 @@
 //! 3. All required fields match SPEC requirements
 //! 4. Idempotent ReplaceDocuments behavior on re-index
 
+use serde_json::json;
 use tempfile::TempDir;
 
 use zetesis_app::constants::{DEFAULT_EMBEDDER_KEY, DEFAULT_EMBEDDING_DIM};
@@ -108,14 +109,24 @@ async fn test_ingest_structured_decision_with_embeddings() {
     let embeddings = generate_test_embeddings(chunk_count);
 
     // Build document payload (doc + chunks)
+    let doc_id_ref = doc_id.as_str();
     let payload = build_document_payload(
         &decision,
         silo,
-        &doc_id,
+        doc_id_ref,
+        &[doc_id_ref],
         DEFAULT_EMBEDDER_KEY,
         IngestMetadata::indexed(DEFAULT_EMBEDDER_KEY, chunk_count),
     )
     .expect("failed to build document payload");
+
+    assert_eq!(payload.doc.get("blob_cids"), Some(&json!([doc_id_ref])));
+    let ingest_meta = payload
+        .doc
+        .get("ingest")
+        .and_then(|value| value.as_object())
+        .expect("ingest metadata missing");
+    assert_eq!(ingest_meta.get("blob_cids"), Some(&json!([doc_id_ref])));
 
     // Upsert document record
     actor
@@ -172,6 +183,7 @@ async fn test_ingest_idempotency() {
 
     // Setup: test data
     let doc_id = compute_test_doc_id();
+    let doc_id_ref = doc_id.as_str();
     let decision = build_test_decision();
     let chunk_count = decision.chunks.len();
     let embeddings = generate_test_embeddings(chunk_count);
@@ -181,7 +193,8 @@ async fn test_ingest_idempotency() {
         let payload = build_document_payload(
             &decision,
             silo,
-            &doc_id,
+            doc_id_ref,
+            &[doc_id_ref],
             DEFAULT_EMBEDDER_KEY,
             IngestMetadata::indexed(DEFAULT_EMBEDDER_KEY, chunk_count),
         )
@@ -219,7 +232,8 @@ async fn test_ingest_idempotency() {
         let payload = build_document_payload(
             &decision,
             silo,
-            &doc_id,
+            doc_id_ref,
+            &[doc_id_ref],
             DEFAULT_EMBEDDER_KEY,
             IngestMetadata::indexed(DEFAULT_EMBEDDER_KEY, chunk_count),
         )
