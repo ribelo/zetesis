@@ -10,7 +10,7 @@ EARS-style requirements for Zetesis. Never renumber IDs; append new ones.
 - Type: ubiquitous
 - EARS: The system shall load settings from TOML files only, honoring precedence `/etc/xdg/zetesis/settings.toml` (override root via `$ZETESIS_ETC_CONFIG_DIR`), `$XDG_CONFIG_HOME/zetesis/settings.toml`, `./config/settings.toml`, then `$ZETESIS_CONFIG_FILE`, before applying `ZETESIS__` environment overrides with double-underscore separators; no implicit `.env` loading.
 - Status: accepted
-- Trace: [T-CONFIG-20251107-01](TASKS.md#t-config-20251107-01)
+- Trace: [T-CONFIG-20251107-01](TODO#t-config-20251107-01)
 - History:
   - 2025-11-07: Created.
 
@@ -18,7 +18,7 @@ EARS-style requirements for Zetesis. Never renumber IDs; append new ones.
 - Type: state-driven
 - EARS: CORS shall remain disabled by default; enabling it requires explicit http/https origins, an `OPTIONS`-inclusive method list, header/expose lists bounded to ≤64 entries of ≤128 characters, and `max_age_secs ≤ 86400`, producing headers that mirror the configured allow/expose/credentials choices.
 - Status: accepted
-- Trace: [T-CONFIG-20251107-01](TASKS.md#t-config-20251107-01)
+- Trace: [T-CONFIG-20251107-01](TODO#t-config-20251107-01)
 - History:
   - 2025-11-07: Created.
 
@@ -36,7 +36,7 @@ EARS-style requirements for Zetesis. Never renumber IDs; append new ones.
 - Type: ubiquitous
 - EARS: Blobs shall live under `$XDG_DATA_HOME/zetesis/blobs/{silo}/{prefix}/{cid}` where `cid` is lowercase hex BLAKE3 of original bytes. Callers may additionally cache KIO downloads in user-provided folders.
 - Status: accepted
-- Trace: [T-STORAGE-20251107-01](TASKS.md#t-storage-20251107-01)
+- Trace: [T-STORAGE-20251107-01](TODO#t-storage-20251107-01)
 - History:
   - 2025-11-04: Updated.
 
