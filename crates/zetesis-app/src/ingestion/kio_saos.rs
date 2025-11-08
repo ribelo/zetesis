@@ -29,6 +29,8 @@ use crate::ingestion::kio_types::{
     KioDocumentMetadata, KioEvent, KioScrapeError, KioScrapeOptions, KioScraperSummary,
 };
 
+pub const DEFAULT_KIO_SAOS_URL: &str = "https://www.saos.org.pl/";
+
 const SILO_SLUG: &str = "kio-saos";
 const SEARCH_ENDPOINT: &str = "api/search/judgments";
 const DETAIL_ENDPOINT_PREFIX: &str = "api/judgments/";
@@ -538,6 +540,7 @@ impl KioSaosScraper {
             .await
     }
 
+    #[allow(dead_code)]
     async fn fetch_pdf_len(&self, pdf_path: &str) -> Result<Option<u64>, KioScrapeError> {
         let url = self
             .base_url

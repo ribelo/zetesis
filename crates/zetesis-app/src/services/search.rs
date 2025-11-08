@@ -14,18 +14,19 @@ use milli::{AscDesc, Filter, Index as MilliIndex, Search as MilliSearch, all_obk
 use serde_json::Value;
 use tokio::task;
 
+use async_trait::async_trait;
+
 use crate::constants::DEFAULT_EMBEDDER_KEY;
 use crate::error::AppError;
 use crate::paths::AppPaths;
 use crate::services::{PipelineError, build_pipeline_context};
+use zetesis_server::search::{
+    HYBRID_RESULT_LIMIT_MAX, HybridFusion, HybridSearchParams, KeywordSearchParams, SearchError,
+    SearchProvider, VectorSearchParams,
+};
 
 const LMDB_MAP_SIZE_BYTES: usize = 1 << 30;
 static DATA_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
-pub const HYBRID_RESULT_LIMIT_MAX: usize = 100;
-pub const HYBRID_PER_SOURCE_LIMIT_MAX: usize = 50;
-pub const HYBRID_DEFAULT_RRF_K: usize = 60;
-pub const HYBRID_DEFAULT_WEIGHT: f32 = 0.5;
-const HYBRID_WEIGHT_EPSILON: f32 = f32::EPSILON;
 
 fn data_dir_override() -> &'static Mutex<Option<PathBuf>> {
     DATA_DIR_OVERRIDE.get_or_init(|| Mutex::new(None))
@@ -39,44 +40,28 @@ pub fn set_data_dir_override(path: Option<PathBuf>) {
     *guard = path;
 }
 
-#[derive(Debug, Clone)]
-pub struct KeywordSearchParams {
-    pub index: String,
-    pub query: String,
-    pub filter: Option<String>,
-    pub sort: Vec<String>,
-    pub fields: Vec<String>,
-    pub limit: usize,
-    pub offset: usize,
+#[derive(Clone, Debug, Default)]
+pub struct DefaultSearchProvider;
+
+impl DefaultSearchProvider {
+    pub fn new() -> Self {
+        Self
+    }
 }
 
-#[derive(Debug, Clone)]
-pub struct VectorSearchParams {
-    pub index: String,
-    pub query: String,
-    pub embedder: Option<String>,
-    pub filter: Option<String>,
-    pub fields: Vec<String>,
-    pub top_k: usize,
-}
+#[async_trait]
+impl SearchProvider for DefaultSearchProvider {
+    async fn keyword(&self, params: KeywordSearchParams) -> Result<Vec<Value>, SearchError> {
+        run_keyword_task(params).await.map_err(map_app_error)
+    }
 
-#[derive(Debug, Clone, Copy)]
-pub enum HybridFusion {
-    Rrf {
-        k: usize,
-    },
-    Weighted {
-        keyword_weight: f32,
-        vector_weight: f32,
-    },
-}
+    async fn vector(&self, params: VectorSearchParams) -> Result<Vec<Value>, SearchError> {
+        vector(&params).await.map_err(map_app_error)
+    }
 
-#[derive(Debug, Clone)]
-pub struct HybridSearchParams {
-    pub keyword: KeywordSearchParams,
-    pub vector: VectorSearchParams,
-    pub limit: usize,
-    pub fusion: HybridFusion,
+    async fn hybrid(&self, params: HybridSearchParams) -> Result<Vec<Value>, SearchError> {
+        hybrid(&params).await.map_err(map_app_error)
+    }
 }
 
 pub fn keyword(params: &KeywordSearchParams) -> Result<Vec<Value>, AppError> {
@@ -360,23 +345,6 @@ pub fn build_search_row(original: &Value, projected: Value, score: Option<f64>) 
     Value::Object(map)
 }
 
-pub fn normalize_hybrid_weights(
-    keyword_weight: f32,
-    vector_weight: f32,
-) -> Result<(f32, f32), &'static str> {
-    if !keyword_weight.is_finite() || !vector_weight.is_finite() {
-        return Err("weights must be finite");
-    }
-    if keyword_weight < 0.0 || vector_weight < 0.0 {
-        return Err("weights must be non-negative");
-    }
-    let sum = keyword_weight + vector_weight;
-    if sum <= HYBRID_WEIGHT_EPSILON {
-        return Err("weights must not both be zero");
-    }
-    Ok((keyword_weight / sum, vector_weight / sum))
-}
-
 async fn run_keyword_task(params: KeywordSearchParams) -> Result<Vec<Value>, AppError> {
     debug_assert!(!params.index.trim().is_empty());
     task::spawn_blocking(move || keyword(&params))
@@ -448,6 +416,32 @@ fn read_score(row: &Value) -> Option<f64> {
     match row {
         Value::Object(map) => map.get("score").and_then(|value| value.as_f64()),
         _ => None,
+    }
+}
+
+fn map_app_error(error: AppError) -> SearchError {
+    match error {
+        AppError::MissingIndex { index, .. } => {
+            SearchError::not_found("index", format!("index `{index}` not found"))
+        }
+        AppError::InvalidIndexName { name } => {
+            SearchError::invalid_param("index", format!("invalid index `{name}`"))
+        }
+        AppError::InvalidSort { spec, reason } => {
+            SearchError::invalid_param("sort", format!("invalid sort `{spec}`: {reason}"))
+        }
+        AppError::InvalidFilter { expression, reason } => {
+            SearchError::invalid_param("filter", format!("invalid filter `{expression}`: {reason}"))
+        }
+        AppError::EmbedderNotFound { name, .. } => SearchError::invalid_param(
+            "embedder",
+            format!("embedder `{name}` not configured for index"),
+        ),
+        AppError::UnsupportedEmbedder { name, .. } => SearchError::invalid_param(
+            "embedder",
+            format!("embedder `{name}` does not support vector search"),
+        ),
+        other => SearchError::internal(other.to_string()),
     }
 }
 
@@ -553,11 +547,9 @@ fn join_error(task: &str, err: task::JoinError) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        HYBRID_DEFAULT_RRF_K, HybridFusion, extract_path, fuse_hybrid_rows,
-        normalize_hybrid_weights, number_value, project_value,
-    };
+    use super::{HybridFusion, extract_path, fuse_hybrid_rows, number_value, project_value};
     use serde_json::{Value, json};
+    use zetesis_server::search::{HYBRID_DEFAULT_RRF_K, normalize_hybrid_weights};
 
     #[test]
     fn project_value_returns_full_object_when_fields_empty() {

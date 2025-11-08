@@ -30,6 +30,8 @@ use crate::ingestion::kio_types::{
     KioDocumentMetadata, KioEvent, KioScrapeError, KioScrapeOptions, KioScraperSummary,
 };
 
+pub const DEFAULT_KIO_UZP_URL: &str = "https://orzeczenia.uzp.gov.pl/";
+
 const SILO_SLUG: &str = "kio-uzp";
 const SEARCH_ENDPOINT: &str = "Home/GetResults";
 const KIND_PARAM: &str = "KIO";
@@ -471,6 +473,7 @@ impl KioUzpScraper {
             .await
     }
 
+    #[allow(dead_code)]
     async fn fetch_pdf_len(&self, pdf_path: &str) -> Result<Option<u64>, KioScrapeError> {
         let url = self
             .base_url

@@ -182,6 +182,7 @@ impl FsBlobStore {
     }
 
     /// Fsync a file descriptor.
+    #[allow(dead_code)]
     async fn fsync_file(&self, file: &mut fs::File) -> Result<(), BlobError> {
         file.sync_all()
             .await

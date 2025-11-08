@@ -1,9 +1,7 @@
 use clap::{Args, ValueEnum};
 
 use crate::cli::validators::validate_workers;
-
-pub const DEFAULT_KIO_UZP_URL: &str = "https://orzeczenia.uzp.gov.pl/";
-pub const DEFAULT_KIO_SAOS_URL: &str = "https://www.saos.org.pl/";
+use crate::ingestion::kio_uzp::DEFAULT_KIO_UZP_URL;
 
 /// Identify which source we are scraping for KIO judgments.
 #[derive(Debug, Clone, Copy, ValueEnum)]

@@ -13,7 +13,6 @@ pub mod indexer;
 pub mod jobs;
 pub mod milli_actor;
 pub mod ocr;
-pub mod orchestrator;
 pub mod reaper;
 pub mod search;
 pub mod structured;
@@ -43,19 +42,20 @@ pub use jobs::{
 };
 pub use milli_actor::MilliActorHandle;
 pub use ocr::{
-    DeepInfraOcr, GeminiOcr, OcrConfig, OcrDocumentResult, OcrError, OcrInput, OcrMimeType,
-    OcrPageResult, OcrService, OcrSpan,
+    GeminiOcr, OcrConfig, OcrDocumentResult, OcrError, OcrInput, OcrMimeType, OcrPageResult,
+    OcrService, OcrSpan, OcrTokenUsage,
 };
-pub use orchestrator::run_for_silo;
 pub use reaper::{
     ReaperAction, ReaperConfig, ReaperError, ReaperReport, calculate_retry_backoff, reap_stale_jobs,
 };
 pub use search::{
+    DefaultSearchProvider, build_search_row, hybrid, keyword, normalize_index_name,
+    open_index_read_only, project_value, resolve_index_dir, set_data_dir_override, vector,
+};
+pub use zetesis_server::search::{
     HYBRID_DEFAULT_RRF_K, HYBRID_DEFAULT_WEIGHT, HYBRID_PER_SOURCE_LIMIT_MAX,
-    HYBRID_RESULT_LIMIT_MAX, HybridFusion, HybridSearchParams, KeywordSearchParams,
-    VectorSearchParams, build_search_row, hybrid, keyword, normalize_hybrid_weights,
-    normalize_index_name, open_index_read_only, project_value, resolve_index_dir, vector,
+    HYBRID_RESULT_LIMIT_MAX, HybridFusion, HybridSearchParams, KeywordSearchParams, SearchProvider,
+    VectorSearchParams, normalize_hybrid_weights,
 };
 
-pub use search::set_data_dir_override;
 pub use structured::{StructuredExtractError, StructuredExtraction, StructuredExtractor};

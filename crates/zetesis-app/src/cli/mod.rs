@@ -112,13 +112,13 @@ pub enum Commands {
 
 pub use audit::{AuditArgs, AuditCommands, StructuredAuditArgs};
 pub use db::{
-    DbArgs, DbBackupArgs, DbCommands, DbFindArgs, DbGetArgs, DbPurgeArgs, DbRecoverArgs,
-    DbStatsArgs,
+    DbArgs, DbBackupArgs, DbCommands, DbCreateArgs, DbFindArgs, DbGetArgs, DbPurgeArgs,
+    DbRecoverArgs, DbStatsArgs,
 };
 pub use db_delete::DbDeleteArgs;
 #[cfg(feature = "cli-debug")]
 pub use debug::{DebugArgs, DebugCommands, DebugTextArgs};
-pub use fetch_kio::{DEFAULT_KIO_SAOS_URL, DEFAULT_KIO_UZP_URL, FetchKioArgs, KioSource};
+pub use fetch_kio::{FetchKioArgs, KioSource};
 pub use ingest::{GenModeArg, IngestArgs};
 pub use jobs::{
     JobsArgs, JobsCommands, JobsGenArgs, JobsGenCommands, JobsGenFetchArgs, JobsGenSubmitArgs,

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use crate::cli::db_delete::DbDeleteArgs;
 use crate::cli::validators::validate_index_slug;
+use crate::constants::DEFAULT_EMBEDDING_DIM;
 
 /// Top-level namespace for database maintenance commands.
 #[derive(Debug, Args)]
@@ -14,6 +15,8 @@ pub struct DbArgs {
 /// Database maintenance subcommands.
 #[derive(Debug, Subcommand)]
 pub enum DbCommands {
+    /// Create an empty Milli index with optional configuration.
+    Create(DbCreateArgs),
     /// List available Milli indexes and their on-disk sizes.
     List,
     /// Show summary statistics for a specific Milli index.
@@ -30,6 +33,23 @@ pub enum DbCommands {
     Recover(DbRecoverArgs),
     /// Delete a document and associated chunks/blobs.
     Delete(DbDeleteArgs),
+}
+
+/// Arguments for `db create`.
+#[derive(Debug, Args)]
+pub struct DbCreateArgs {
+    /// Positional index slug (deprecated alias for `--silo`).
+    #[arg(value_parser = validate_index_slug)]
+    pub index: Option<String>,
+    /// Embedding model identifier to configure for the index.
+    #[arg(long = "embed-model", default_value_t = crate::constants::DEFAULT_EMBEDDER_KEY.to_string())]
+    pub embed_model: String,
+    /// Embedding dimensionality for the index.
+    #[arg(long = "embed-dim", default_value_t = DEFAULT_EMBEDDING_DIM)]
+    pub embed_dim: usize,
+    /// Allow overwriting the index if it already exists.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub force: bool,
 }
 
 /// Arguments for `db stats`.

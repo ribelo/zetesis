@@ -22,11 +22,6 @@ use backon::{ExponentialBuilder, Retryable};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bon::Builder;
-use deepinfra_ox::{
-    ChatRequest as DeepInfraChatRequest, DeepInfra, ImageUrl, Message as DeepInfraMessage,
-    MessageContent as DeepInfraMessageContent, MessageContentPart as DeepInfraMessageContentPart,
-    TokenUsage,
-};
 use futures_concurrency::{concurrent_stream::IntoConcurrentStream, prelude::ConcurrentStream};
 use gemini_ox::generate_content::GenerationConfig;
 use governor::{
@@ -38,7 +33,6 @@ use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::{PngDecoder, PngEncoder};
 use image::imageops::FilterType;
 use image::{ColorType, GenericImageView, ImageDecoder, ImageEncoder};
-use regex::Regex;
 use serde::Serialize;
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -50,15 +44,6 @@ type OcrRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 const MAX_BATCH_INPUTS: usize = 64;
 const MAX_PAGES_PER_DOCUMENT: usize = 1024;
 const GEMINI_SYSTEM_INSTRUCTION: &str = "You are a meticulous OCR engine. Return faithful plain text transcription and preserve layout with Markdown where appropriate. Avoid inventing bounding boxes or extra metadata.";
-
-fn deepinfra_rate_limiter() -> &'static Arc<OcrRateLimiter> {
-    static LIMITER: OnceLock<Arc<OcrRateLimiter>> = OnceLock::new();
-    LIMITER.get_or_init(|| {
-        let quota = Quota::per_second(NonZeroU32::new(200).expect("non-zero quota"))
-            .allow_burst(NonZeroU32::new(200).expect("non-zero burst"));
-        Arc::new(RateLimiter::direct(quota))
-    })
-}
 
 impl From<GenerateContentError> for OcrError {
     fn from(e: GenerateContentError) -> Self {
@@ -276,8 +261,6 @@ pub enum OcrError {
     #[error(transparent)]
     PdfRender(#[from] crate::pdf::PdfRenderError),
     #[error(transparent)]
-    DeepInfra(#[from] deepinfra_ox::DeepInfraRequestError),
-    #[error(transparent)]
     Gemini(#[from] Box<GenerateContentError>),
     #[error("failed to read input file {path}: {source}")]
     Io {
@@ -301,8 +284,6 @@ pub enum OcrError {
         #[source]
         source: image::ImageError,
     },
-    #[error("missing DEEPINFRA_API_KEY environment variable")]
-    MissingDeepInfraApiKey,
     #[error("missing GOOGLE_AI_API_KEY or GEMINI_API_KEY environment variable")]
     MissingGeminiApiKey,
     #[error("OCR task join failed: {0}")]
@@ -320,7 +301,7 @@ pub struct OcrPageResult {
     pub mime_type: &'static str,
     pub plain_text: Option<String>,
     pub spans: Vec<OcrSpan>,
-    pub usage: Option<TokenUsage>,
+    pub usage: Option<OcrTokenUsage>,
 }
 
 /// A single OCR span with bounding box metadata.
@@ -405,202 +386,17 @@ pub struct OcrDocumentResult {
     pub pages: Vec<OcrPageResult>,
 }
 
-#[derive(Clone)]
-struct DeepInfraProvider {
-    client: Arc<DeepInfra>,
-    limiter: Arc<OcrRateLimiter>,
-    backoff: ExponentialBuilder,
-}
-
-impl DeepInfraProvider {
-    fn from_env() -> Result<Self, OcrError> {
-        let client = DeepInfra::load_from_env().map_err(|_| OcrError::MissingDeepInfraApiKey)?;
-        let backoff = ExponentialBuilder::default()
-            .with_min_delay(Duration::from_millis(200))
-            .with_max_delay(Duration::from_secs(5))
-            .with_max_times(5)
-            .with_jitter();
-
-        Ok(Self {
-            client: Arc::new(client),
-            limiter: Arc::clone(deepinfra_rate_limiter()),
-            backoff,
-        })
-    }
-
-    async fn call_with_backoff(
-        &self,
-        prepared: &PreparedOcrImage,
-        prompt: &str,
-        max_tokens: u32,
-        model: &str,
-    ) -> Result<deepinfra_ox::ChatCompletionResponse, OcrError> {
-        let attempt = || async { self.invoke_model(prepared, prompt, max_tokens, model).await };
-        attempt.retry(self.backoff).await
-    }
-
-    async fn invoke_model(
-        &self,
-        prepared: &PreparedOcrImage,
-        prompt: &str,
-        max_tokens: u32,
-        model: &str,
-    ) -> Result<deepinfra_ox::ChatCompletionResponse, OcrError> {
-        let mut image_url = ImageUrl::new(format!(
-            "data:{};base64,{}",
-            prepared.mime_type,
-            BASE64_STANDARD.encode(&prepared.data)
-        ));
-        image_url = image_url.with_detail("auto");
-
-        let parts = vec![
-            DeepInfraMessageContentPart::image_url(image_url),
-            DeepInfraMessageContentPart::text(prompt.to_string()),
-        ];
-        let message = DeepInfraMessage::user(DeepInfraMessageContent::new(parts));
-        let mut request = DeepInfraChatRequest::new(model.to_string(), vec![message]);
-        request.max_tokens = Some(max_tokens);
-        request.temperature = Some(0.0);
-
-        self.limiter.until_ready().await;
-        let response = self.client.send(&request).await?;
-        if let Some(usage) = response.usage.as_ref() {
-            debug!(
-                prompt = prompt,
-                max_tokens,
-                completion_tokens = usage.completion_tokens,
-                prompt_tokens = usage.prompt_tokens,
-                total_tokens = usage.total_tokens,
-                "deepinfra ocr invocation usage"
-            );
-        }
-        Ok(response)
-    }
-}
-
-#[async_trait]
-impl PageProvider for DeepInfraProvider {
-    async fn process_page(
-        &self,
-        input: Arc<OcrInput>,
-        config: Arc<OcrConfig>,
-        page: PdfPageImage,
-    ) -> Result<OcrPageResult, OcrError> {
-        let page_index = page.page_index;
-        let render_width = page.width;
-        let render_height = page.height;
-        let max_edge = config.image_max_edge;
-        let input_id = input.id.clone();
-        let page_image = page;
-
-        let prepared = tokio::task::spawn_blocking({
-            let input_id = input_id.clone();
-            move || prepare_image_for_ocr(&input_id, page_index, &page_image, max_edge)
-        })
-        .await
-        .map_err(OcrError::TaskJoin)??;
-
-        assert!(
-            prepared.width > 0 && prepared.height > 0,
-            "prepared image must be non-empty"
-        );
-
-        let default_prompt = build_grounded_prompt(
-            config
-                .detail
-                .as_deref()
-                .unwrap_or("<|grounding|>Convert the document to markdown."),
-        );
-        let fallback_prompt = build_grounded_prompt("<|grounding|>OCR this image.");
-
-        let mut prompt = default_prompt.clone();
-        let mut max_tokens = config.max_tokens;
-
-        for attempt in 0..=1 {
-            let response = self
-                .call_with_backoff(&prepared, &prompt, max_tokens, &config.model)
-                .await?;
-
-            let usage = response.usage.clone();
-            let content = response
-                .choices
-                .first()
-                .and_then(|choice| choice.message.content.clone());
-
-            let raw_text = content.as_ref().and_then(flatten_message_content_text);
-            let (plain_text_str, spans) = match raw_text.as_deref() {
-                Some(raw) => parse_deepseek_output(raw, prepared.width, prepared.height),
-                None => (String::new(), Vec::new()),
-            };
-
-            let plain_text = if plain_text_str.trim().is_empty() {
-                None
-            } else {
-                Some(plain_text_str.clone())
-            };
-
-            let truncated = usage
-                .as_ref()
-                .and_then(|u| u.completion_tokens)
-                .is_some_and(|tokens| tokens >= u64::from(max_tokens));
-            let looks_noise = plain_text.as_deref().is_some_and(text_is_numeric_noise);
-
-            if attempt == 0 && (truncated || looks_noise) {
-                warn!(
-                    doc_id = %input.id,
-                    page = page_index,
-                    truncated,
-                    looks_noise,
-                    "retrying OCR page with fallback prompt",
-                );
-                prompt = fallback_prompt.clone();
-                max_tokens = max_tokens.clamp(512, 2048);
-                continue;
-            }
-
-            return Ok(OcrPageResult {
-                page_index,
-                render_width,
-                render_height,
-                ocr_width: prepared.width,
-                ocr_height: prepared.height,
-                mime_type: prepared.mime_type,
-                plain_text,
-                spans,
-                usage,
-            });
-        }
-
-        Err(OcrError::UnsupportedInput {
-            id: input.id.clone(),
-            mime_type: input.mime_type.to_string(),
-        })
-    }
-}
-
-#[derive(Clone)]
-pub struct DeepInfraOcr {
-    engine: OcrEngine<DeepInfraProvider>,
-}
-
-impl DeepInfraOcr {
-    pub fn from_env() -> Result<Self, OcrError> {
-        let provider = DeepInfraProvider::from_env()?;
-        Ok(Self {
-            engine: OcrEngine::new(provider),
-        })
-    }
-}
-
-#[async_trait]
-impl OcrService for DeepInfraOcr {
-    async fn run_batch(
-        &self,
-        inputs: Vec<OcrInput>,
-        config: &OcrConfig,
-    ) -> Result<Vec<OcrDocumentResult>, OcrError> {
-        self.engine.run_batch(inputs, config).await
-    }
+/// Token accounting metadata returned by OCR providers.
+#[derive(Debug, Clone, Serialize)]
+pub struct OcrTokenUsage {
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub tool_prompt_tokens: Option<u64>,
+    pub thoughts_tokens: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -846,13 +642,13 @@ fn build_generation_config(max_tokens: u32) -> GenerationConfig {
         .build()
 }
 
-fn usage_to_token_usage(usage: &AiUsage) -> TokenUsage {
+fn usage_to_token_usage(usage: &AiUsage) -> OcrTokenUsage {
     let prompt = usage.input_tokens();
     let completion = usage.output_tokens();
     let total = usage.total_tokens();
     let tool_tokens = usage.tool_tokens_by_modality.values().copied().sum::<u64>();
 
-    TokenUsage {
+    OcrTokenUsage {
         prompt_tokens: (prompt > 0).then_some(prompt),
         completion_tokens: (completion > 0).then_some(completion),
         total_tokens: (total > 0).then_some(total),
@@ -917,128 +713,6 @@ fn prepare_image_for_ocr(
         height: final_height,
         mime_type: "image/jpeg",
     })
-}
-
-fn flatten_message_content_text(content: &DeepInfraMessageContent) -> Option<String> {
-    if let Some(text) = content.as_text() {
-        return Some(text.to_string());
-    }
-
-    let mut buffer = String::new();
-    for part in content.parts() {
-        if let DeepInfraMessageContentPart::Text { text, .. } = part {
-            if !buffer.is_empty() {
-                buffer.push('\n');
-            }
-            buffer.push_str(text);
-        } else {
-            return None;
-        }
-    }
-
-    if buffer.is_empty() {
-        None
-    } else {
-        Some(buffer)
-    }
-}
-
-fn parse_deepseek_output(raw: &str, width: u32, height: u32) -> (String, Vec<OcrSpan>) {
-    static BBOX_RE: OnceLock<Regex> = OnceLock::new();
-    let bbox_re = BBOX_RE.get_or_init(|| {
-        Regex::new(r"^([A-Za-z_]+)\[\[(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\]\]$").unwrap()
-    });
-
-    let mut plain_lines = Vec::new();
-    let mut spans = Vec::new();
-    let mut current: Option<SpanBuilder> = None;
-
-    for line in raw.lines() {
-        let trimmed = line.trim_end();
-        if trimmed.trim().is_empty() {
-            plain_lines.push(String::new());
-            if let Some(span) = current.as_mut() {
-                span.lines.push(String::new());
-            }
-            continue;
-        }
-
-        if let Some(caps) = bbox_re.captures(trimmed.trim()) {
-            if let Some(span) = current.take() {
-                finalize_span(span, &mut spans, width, height);
-            }
-
-            let coords = (
-                caps.get(2).and_then(|v| v.as_str().parse::<u32>().ok()),
-                caps.get(3).and_then(|v| v.as_str().parse::<u32>().ok()),
-                caps.get(4).and_then(|v| v.as_str().parse::<u32>().ok()),
-                caps.get(5).and_then(|v| v.as_str().parse::<u32>().ok()),
-            );
-
-            let bbox = match coords {
-                (Some(x1), Some(y1), Some(x2), Some(y2)) => Some([x1, y1, x2, y2]),
-                _ => None,
-            };
-
-            current = Some(SpanBuilder {
-                kind: caps[1].to_string(),
-                bbox,
-                lines: Vec::new(),
-            });
-
-            continue;
-        }
-
-        plain_lines.push(trimmed.to_string());
-
-        if let Some(span) = current.as_mut() {
-            span.lines.push(trimmed.to_string());
-        } else {
-            current = Some(SpanBuilder {
-                kind: "text".to_string(),
-                bbox: None,
-                lines: vec![trimmed.to_string()],
-            });
-        }
-    }
-
-    if let Some(span) = current.take() {
-        finalize_span(span, &mut spans, width, height);
-    }
-
-    let plain_text = plain_lines.join("\n");
-
-    (plain_text, spans)
-}
-
-struct SpanBuilder {
-    kind: String,
-    bbox: Option<[u32; 4]>,
-    lines: Vec<String>,
-}
-
-fn finalize_span(span: SpanBuilder, spans: &mut Vec<OcrSpan>, width: u32, height: u32) {
-    let joined = span.lines.join("\n");
-    let text = joined.trim_matches('\n').trim_end().to_string();
-    if text.trim().is_empty() {
-        return;
-    }
-
-    let bbox_norm = span.bbox.map(|[x1, y1, x2, y2]| {
-        [
-            x1 as f32 / width.max(1) as f32,
-            y1 as f32 / height.max(1) as f32,
-            x2 as f32 / width.max(1) as f32,
-            y2 as f32 / height.max(1) as f32,
-        ]
-    });
-
-    spans.push(OcrSpan {
-        kind: span.kind,
-        bbox: span.bbox,
-        bbox_norm,
-        text,
-    });
 }
 
 fn png_bytes_to_page(id: &str, bytes: &[u8]) -> Result<PdfPageImage, OcrError> {
