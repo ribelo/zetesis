@@ -93,8 +93,7 @@
 - Shared crates live under `crates/`; add only once code proves reusable.
 - Layout: CLI in `src/cli/`; orchestration-only services in `src/services/`; pure transforms/utilities in `src/text/`, `src/pdf.rs`, and `src/pipeline/`; integration suites in `tests/`; docs in `docs/`. New code must respect this boundary.
 - OCR providers plug into `services::ocr` via the `PageProvider` trait and `OcrEngine`; reuse the shared concurrency/rate-limiting pipeline instead of cloning ad-hoc loops.
-- Gemini OCR pricing (Gemini API paid tier, per 1 M tokens): input text/image/video $0.10, output (incl. thinking) $0.40. Batch API halves this ($0.05 / $0.20). Free tier is zero-cost but rate-limited.
-- DeepSeek-OCR on DeepInfra (per 1 M tokens): input $0.03, output $0.10. OlmOCR pricing is not currently published on DeepInfra—confirm with dashboards before committing workloads.
+- Gemini OCR pricing (Gemini API paid tier, per 1 M tokens): input text/image/video $0.10, output (incl. thinking) $0.40. Batch API halves this ($0.05 / $0.20). Free tier is zero-cost but rate-limited. DeepInfra providers were removed; do not reintroduce them without a new SPEC entry.
 
 ## Communication Defaults
 - Lead with the answer, then evidence; numbered questions keep alignment and force plain speech.

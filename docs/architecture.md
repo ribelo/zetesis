@@ -4,8 +4,15 @@
 Zetesis is a lightweight SaaS for full-text and similarity search over documents, starting with feature parity to https://szukio.pl/. This document captures the foundational architecture so code, docs, and operations stay aligned.
 
 ## 2. System Components
-- **Server (`zetesis-app`)**: Single binary exposing both the Axum HTTP API and a Clap-powered maintenance CLI.
-- **CLI Commands**: Share the binary entry point; subcommands such as `serve`, `documents add`, and `scrape ...` will be introduced once requirements solidify.
+- **Server (`zetesis-app`)**: Single binary exposing both the Axum HTTP API and a comprehensive maintenance CLI.
+- **CLI Commands**: Well-organized modular command structure with explicit namespaces:
+  - `db` - Database and index management (create, delete, list, stats, backup, purge, recover)
+  - `silo` - Silo resource management
+  - `source` - Data source ingestion pipelines (KIO fetch)
+  - `search` - Ad-hoc search queries (keyword, vector, hybrid)
+  - `ingest` - Local document ingestion with auto-creation support
+  - `sys` - System utilities (serve, init, doctor)
+  - `audit` - Consistency checks and validation
 - **Storage / Search**: A single Milli index (backed by LMDB internally) stores canonical structured documents, chunk records, and user-provided vectors.
 - **Blob Store**: Original PDFs are written to the filesystem using content-addressed paths under the XDG data directory.
 - **AI & Embeddings**: The local `ai-ox` crate supplies LLM utilities and embedding models; treat it as the sole integration point for AI tasks.
@@ -31,8 +38,27 @@ Zetesis is a lightweight SaaS for full-text and similarity search over documents
 
 ## 5. Interfaces
 - **HTTP API**: Axum routes for search, document management, and health checks. Use Tower middleware for tracing and auth when defined.
-- **CLI**: Clap commands for operational tasks (document ingestion, scrapers, migrations, job orchestration). Notable flows: `ingest --gen-mode sync|batch` (legacy `--batch` prints a deprecation warning and forwards to `--gen-mode batch`), `jobs status`, `jobs gen submit|gen fetch`, and `jobs reap`.
-- **Web UI**: Dioxus 0.7.1 with SSR + Islands architecture, served under `/ui/*` routes separate from `/v1/*` API routes.
+- **CLI**: Comprehensive modular command structure with atomic operations:
+  - **Index Management**: `db create` (explicit index creation with embedder configuration), `db delete` (atomic document deletion with blob cleanup)
+  - **Data Ingestion**: `ingest` (local files with `--create-index` auto-creation), `source kio fetch` (automated scraping)
+  - **Search**: `search keyword|vector|hybrid` for ad-hoc queries with various fusion options
+  - **System**: `sys serve|init|doctor` for deployment and maintenance
+- **Web UI**: Planned Dioxus 0.7.1 with SSR + Islands architecture (deferred implementation).
+
+## 5.1 Recent Cleanup & Modularization (2025-11-08)
+
+### CLI Restructuring
+- **Modular Commands**: Split single-file CLI into focused modules per command namespace
+- **Explicit Index Management**: Added `db create` for explicit index creation with configurable embedders
+- **Atomic Operations**: Enhanced `db delete` with comprehensive dry-run and blob cleanup
+- **URL Constants**: Moved domain-specific URLs from CLI to appropriate scraper modules
+- **Code Consolidation**: Removed unused embedding implementations and placeholder code
+
+### Database Operations
+- **Explicit Creation**: `zetesis db create <index>` - creates empty Milli index with specified embedder
+- **Atomic Deletion**: `zetesis db delete <index> --id <doc-id>` - safely removes documents and associated blobs
+- **Auto-Creation**: `zetesis ingest --create-index` maintains backward compatibility
+- **Safety Features**: Interactive confirmations, dry-run modes, force options
 
 ## 5.1 Web UI Architecture (Dioxus 0.7.1 + SSR + Islands)
 
@@ -42,7 +68,19 @@ Zetesis is a lightweight SaaS for full-text and similarity search over documents
 - **CSS**: Native Tailwind CSS support via dx-cli 0.7
 - **Components**: Dioxus first-party primitives (Radix-like headless components)
 
-### Crate Structure
+### Current Crate Structure
+```
+crates/
+├── zetesis-app/         # Single binary with HTTP API + comprehensive CLI
+```
+
+### Planned Crate Structure (Deferred)
+The multi-crate separation (zetesis-ui, zetesis-server, zetesis-shared) has been deferred due to:
+- **Production Stability**: Current monolithic structure is working reliably
+- **Complexity**: Server extraction requires extensive refactoring of service interfaces
+- **Risk Assessment**: High architectural change carries significant testing overhead
+- **Priority**: CLI improvements provide immediate value with lower risk
+
 ```
 crates/
 ├── zetesis-ui/          # Dioxus UI components (SSR + Web features)
