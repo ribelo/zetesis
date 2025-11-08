@@ -65,12 +65,14 @@
 - [REQ-ZE-CLI-CMDS] Provide subcommands: `serve`, `fetch-kio` (uzp|saos), `ingest`, `audit structured`, `search (keyword|vector)`, `db (list|stats|get|find|backup|purge|recover)`, `jobs (status|gen submit|gen fetch|reap)`.
 - [REQ-ZE-CLI-LIMITS] Validate inputs and enforce bounds: positive worker counts, non-empty index names without separators, file size limits for inline attachments (≤ 20 MiB), and supported document types (PDF, common images).
 - [REQ-ZE-CLI-SEARCH] Keyword/vector search accept filters, pagination, field selection, and pretty output; vector search embeds the query with index embedder when not provided.
-
+- [REQ-ZE-CLI-INDEX-EXISTENCE] The system shall ensure target index exists before `ingest` or `db` operations and provide an explicit command to create indexes when they do not exist.
+- [REQ-ZE-CLI-STRUCTURE] The CLI code shall be organized with one module file per command to improve maintainability and clarity.
 - [REQ-ZE-CLI-INGEST-GEN-MODE] `ingest` accepts `--gen-mode sync|batch` (default `sync`) and `--gen-model <id>`. The old `--batch` flag is deprecated immediately; show a warning and map it to `--gen-mode batch` for one release window before removal. (Added 2025-11-06)
 
 ### Identity & Paths
 - [REQ-ZE-ID-CANONICAL] Canonical `doc_id` is lowercase hex BLAKE3 of exact original content bytes. Never derive from filenames, URLs, or upstream IDs.
 - [REQ-ZE-PATHS] Resolve data paths under `$XDG_DATA_HOME/zetesis`: `milli/{silo}`, `lmdb/{app,jobs}`, `blobs/{silo}/{prefix}/{cid}`, and generation job staging under `jobs/{payloads,results}/{silo}`. Ensure directories exist before use.
+- [REQ-ZE-URL-STRATEGY] Default source URLs shall be defined in domain-specific modules, not in CLI modules.
 
 ### Observability & Safety
 - [REQ-ZE-ASSERTS] Use assertions to enforce invariants (non-empty ids, bounded sizes, non-zero concurrency) and fail fast on configuration errors.
@@ -99,6 +101,13 @@
 - [REQ-ZE-JOBS-LOCAL] Use the LMDB-backed job store as the primary queue for structured generation jobs; persist status transitions and timestamps; no external broker required. (Updated 2025-11-06)
 - [REQ-ZE-JOBS-REAPER] Add a stale job reaper (age-based) for generation jobs and idempotent retry policy with bounded attempts and exponential backoff. Target Pending/Generating states. (Updated 2025-11-06)
 - [REQ-ZE-JOBS-LIMITS] Enforce bounded concurrency and back-pressure via rate limiters on provider calls; expose `jobs status` to report counts and oldest age by state. (Updated 2025-11-06)
+
+### HTTP & Server
+- [REQ-ZE-SERVER-MODULARITY] The system shall provide a modular HTTP server architecture that supports separation of concerns and reusability.
+- [REQ-ZE-DB-DELETE] The system shall support deletion of individual documents with atomic removal of all associated data including index entries, chunks, and blobs, with dry-run capability.
+- [REQ-ZE-OCR-PROVIDER] The system shall support OCR operations exclusively through the Gemini provider, removing legacy OCR implementations.
+- [REQ-ZE-EMBED-UNIFICATION] The system shall provide a single, unified embedding implementation without duplicate modules.
+- [REQ-ZE-CODEBASE-CLEANLINESS] The system shall maintain a clean codebase without unused or ambiguous modules such as orchestrator implementations or legacy PDF parsing code.
 
 ### Pipeline Order
 - [REQ-ZE-PIPELINE-ORDER] Ingest flow: fetch blob → structured generation (sync or batch job) → synchronous embedding of chunks → index in Milli → update status/usage metrics. (Added 2025-11-06)
