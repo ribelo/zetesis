@@ -5,6 +5,7 @@
 //! `crate::text`, `crate::pdf`, or other dedicated modules so concurrency and
 //! resource accounting stay localized.
 
+pub mod backup;
 pub mod batch_structured;
 pub mod blob_store;
 pub mod context;
@@ -17,6 +18,9 @@ pub mod reaper;
 pub mod search;
 pub mod structured;
 
+pub use backup::{
+    BackupConfig, BackupError, BackupService, RestoreSummary, RetentionPolicy, VerificationResult,
+};
 pub use blob_store::{
     BlobError, BlobMeta, BlobStore, ByteStream, Cid, DurableWrite, FsBlobStore, PutResult,
     blake3_cid, validate_cid,

@@ -51,14 +51,15 @@ use zetesis_app::ingestion::{
 use zetesis_app::pdf::extract_text_from_pdf;
 use zetesis_app::pipeline::structured::StructuredDecision;
 use zetesis_app::services::{
-    DefaultSearchProvider, EmbedBatchTask, GeminiBatchStructuredClient, GenerationJob,
-    GenerationJobStatus, GenerationJobStore, GenerationMode, GenerationProviderKind,
-    HYBRID_DEFAULT_RRF_K, HYBRID_PER_SOURCE_LIMIT_MAX, HybridFusion, HybridSearchParams,
-    KeywordSearchParams, MilliActorHandle, PipelineContext, PipelineError, ProviderJobState,
-    StructuredBatchInput, StructuredBatchRequest, StructuredExtractor, StructuredJobClient,
-    VectorSearchParams, build_pipeline_context, decision_content_hash, hybrid,
-    index_structured_with_embeddings, keyword, normalize_hybrid_weights, normalize_index_name,
-    open_index_read_only, project_value, resolve_index_dir, vector,
+    BackupConfig, BackupService, DefaultSearchProvider, EmbedBatchTask,
+    GeminiBatchStructuredClient, GenerationJob, GenerationJobStatus, GenerationJobStore,
+    GenerationMode, GenerationProviderKind, HYBRID_DEFAULT_RRF_K, HYBRID_PER_SOURCE_LIMIT_MAX,
+    HybridFusion, HybridSearchParams, KeywordSearchParams, MilliActorHandle, PipelineContext,
+    PipelineError, ProviderJobState, RetentionPolicy, StructuredBatchInput, StructuredBatchRequest,
+    StructuredExtractor, StructuredJobClient, VectorSearchParams, build_pipeline_context,
+    decision_content_hash, hybrid, index_structured_with_embeddings, keyword,
+    normalize_hybrid_weights, normalize_index_name, open_index_read_only, project_value,
+    resolve_index_dir, vector,
 };
 use zetesis_app::text::cleanup_text;
 use zetesis_app::{config, ingestion, paths::AppPaths, pipeline::Silo, server};
@@ -2372,7 +2373,7 @@ fn db_find(args: DbFindArgs, cli_silo: CliSilo) -> Result<(), AppError> {
 }
 
 fn db_backup(args: DbBackupArgs, cli_silo: CliSilo) -> Result<(), AppError> {
-    let index_slug = resolve_index(args.index, cli_silo, "db backup")?;
+    let index_slug = resolve_index(args.index.clone(), cli_silo, "db backup")?;
     let index_name = normalize_index_name(&index_slug)?;
     let paths = AppPaths::from_project_dirs()?;
     let base = paths.milli_base_dir()?;
@@ -2384,6 +2385,15 @@ fn db_backup(args: DbBackupArgs, cli_silo: CliSilo) -> Result<(), AppError> {
         });
     }
 
+    if args.restic {
+        restic_backup(&args, &index_name, &src)?;
+        return Ok(());
+    }
+
+    filesystem_backup(&args, &index_name, &src)
+}
+
+fn filesystem_backup(args: &DbBackupArgs, index_name: &str, src: &Path) -> Result<(), AppError> {
     let dest_root = match &args.out {
         Some(dir) => resolve_output_dir(dir.as_path())?,
         None => resolve_output_dir(Path::new("backups"))?,
@@ -2396,9 +2406,69 @@ fn db_backup(args: DbBackupArgs, cli_silo: CliSilo) -> Result<(), AppError> {
         return Err(AppError::BackupDestinationExists { path: dest });
     }
 
-    copy_directory(&src, &dest)?;
+    copy_directory(src, &dest)?;
     println!("backup complete: {} -> {}", src.display(), dest.display());
     Ok(())
+}
+
+fn restic_backup(args: &DbBackupArgs, index_name: &str, src: &Path) -> Result<(), AppError> {
+    let (repository, password) =
+        extract_restic_credentials(args.repository.clone(), args.password.clone())?;
+
+    if args.out.is_some() {
+        println!("ignoring --out because restic backups write to the repository");
+    }
+
+    let service = BackupService::new(BackupConfig {
+        repository,
+        password,
+        s3_config: None,
+    });
+
+    let snapshot_id = service.backup(&[src.to_path_buf()])?;
+    println!(
+        "restic snapshot {} created for `{}`",
+        snapshot_id, index_name
+    );
+
+    let policy = retention_policy_from_args(args);
+    let pruned = service.apply_retention(&policy)?;
+    if pruned > 0 {
+        println!("retention removed {} expired snapshot(s)", pruned);
+    }
+
+    if args.verify {
+        let verification = service.verify_snapshot(&snapshot_id)?;
+        debug_assert!(verification.valid);
+        println!("verification passed for snapshot {}", snapshot_id);
+    }
+
+    Ok(())
+}
+
+fn retention_policy_from_args(args: &DbBackupArgs) -> RetentionPolicy {
+    let mut policy = RetentionPolicy::default();
+    if let Some(daily) = args.keep_daily {
+        policy.daily = daily;
+    }
+    if let Some(weekly) = args.keep_weekly {
+        policy.weekly = weekly;
+    }
+    if let Some(monthly) = args.keep_monthly {
+        policy.monthly = monthly;
+    }
+    policy
+}
+
+fn extract_restic_credentials(
+    repository: Option<String>,
+    password: Option<String>,
+) -> Result<(String, String), AppError> {
+    let repository = repository
+        .ok_or_else(|| AppError::Config("--repository required when using --restic".to_string()))?;
+    let password = password
+        .ok_or_else(|| AppError::Config("--password required when using --restic".to_string()))?;
+    Ok((repository, password))
 }
 
 fn db_purge(args: DbPurgeArgs, cli_silo: CliSilo) -> Result<(), AppError> {
@@ -2491,9 +2561,90 @@ mod tests {
 }
 
 fn db_recover(args: DbRecoverArgs, cli_silo: CliSilo) -> Result<(), AppError> {
-    let index_slug = resolve_index(args.index, cli_silo, "db recover")?;
+    let DbRecoverArgs {
+        index,
+        from,
+        force,
+        restic,
+        repository,
+        password,
+        snapshot,
+        dry_run,
+    } = args;
+
+    let index_slug = resolve_index(index, cli_silo, "db recover")?;
     let index_name = normalize_index_name(&index_slug)?;
-    let raw_source = args.from.clone();
+    let paths = AppPaths::from_project_dirs()?;
+    let base = paths.milli_base_dir()?;
+    let target = base.join(&index_name);
+
+    if restic {
+        return recover_with_restic(
+            &index_name,
+            &target,
+            repository,
+            password,
+            snapshot,
+            force,
+            dry_run,
+        );
+    }
+
+    recover_from_directory(&index_name, &target, from, force)
+}
+
+fn recover_with_restic(
+    index_name: &str,
+    target: &Path,
+    repository: Option<String>,
+    password: Option<String>,
+    snapshot: Option<String>,
+    force: bool,
+    dry_run: bool,
+) -> Result<(), AppError> {
+    let (repository, password) = extract_restic_credentials(repository, password)?;
+    let snapshot_id = snapshot
+        .ok_or_else(|| AppError::Config("--snapshot required when using --restic".to_string()))?;
+    prepare_recover_target(target, force, dry_run, index_name)?;
+
+    let service = BackupService::new(BackupConfig {
+        repository,
+        password,
+        s3_config: None,
+    });
+
+    let summary = service.restore(&snapshot_id, target, dry_run)?;
+    if dry_run {
+        println!(
+            "DRY RUN: snapshot {} would write {} ({} reused) into {} ({} files)",
+            summary.snapshot_id,
+            human_size(summary.restore_size),
+            human_size(summary.matched_size),
+            target.display(),
+            summary.files.restore
+        );
+        return Ok(());
+    }
+
+    println!(
+        "restored snapshot {} into {} ({} copied, {} reused, {} files)",
+        summary.snapshot_id,
+        target.display(),
+        human_size(summary.restore_size),
+        human_size(summary.matched_size),
+        summary.files.restore
+    );
+    Ok(())
+}
+
+fn recover_from_directory(
+    index_name: &str,
+    target: &Path,
+    from: Option<PathBuf>,
+    force: bool,
+) -> Result<(), AppError> {
+    let raw_source = from
+        .ok_or_else(|| AppError::Config("--from required when not using --restic".to_string()))?;
     let source = raw_source
         .canonicalize()
         .map_err(|e| io_error(&raw_source, e))?;
@@ -2501,20 +2652,30 @@ fn db_recover(args: DbRecoverArgs, cli_silo: CliSilo) -> Result<(), AppError> {
         return Err(AppError::BackupSourceMissing { path: source });
     }
 
-    let paths = AppPaths::from_project_dirs()?;
-    let base = paths.milli_base_dir()?;
-    let target = base.join(&index_name);
-
-    if target.exists() {
-        if !args.force {
-            return Err(AppError::RecoverRequiresForce { index: index_name });
-        }
-        fs::remove_dir_all(&target).map_err(|e| io_error(&target, e))?;
-    }
-
-    copy_directory(&source, &target)?;
+    prepare_recover_target(target, force, false, index_name)?;
+    copy_directory(&source, target)?;
     println!("recovered index `{}` from {}", index_name, source.display());
     Ok(())
+}
+
+fn prepare_recover_target(
+    target: &Path,
+    force: bool,
+    dry_run: bool,
+    index_name: &str,
+) -> Result<(), AppError> {
+    if !target.exists() {
+        return Ok(());
+    }
+    if !force {
+        return Err(AppError::RecoverRequiresForce {
+            index: index_name.to_string(),
+        });
+    }
+    if dry_run {
+        return Ok(());
+    }
+    fs::remove_dir_all(target).map_err(|e| io_error(target, e))
 }
 
 async fn db_delete(args: DbDeleteArgs, cli_silo: CliSilo) -> Result<(), AppError> {

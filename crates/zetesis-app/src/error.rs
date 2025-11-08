@@ -14,7 +14,8 @@ use crate::pdf::{PdfRenderError, PdfTextError};
 use crate::server;
 use crate::services::blob_store::BlobError;
 use crate::services::{
-    GenerationJobStoreError, OcrError, PipelineError, ReaperError, StructuredExtractError,
+    BackupError, GenerationJobStoreError, OcrError, PipelineError, ReaperError,
+    StructuredExtractError,
 };
 
 #[derive(Debug, Error)]
@@ -28,6 +29,8 @@ pub enum AppError {
     Storage(String),
     #[error("blob store error: {0}")]
     BlobStore(#[from] BlobError),
+    #[error("backup error: {0}")]
+    Backup(#[from] BackupError),
     #[error(transparent)]
     Server(#[from] server::ServerError),
     #[error(transparent)]

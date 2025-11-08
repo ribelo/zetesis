@@ -109,6 +109,27 @@ pub struct DbBackupArgs {
     /// Destination directory for backups (defaults to ./backups).
     #[arg(long = "out", value_name = "DIR")]
     pub out: Option<PathBuf>,
+    /// Use restic-compatible encrypted backup (requires --repository and --password).
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub restic: bool,
+    /// Restic repository location (local path or S3 URI).
+    #[arg(long, value_name = "PATH")]
+    pub repository: Option<String>,
+    /// Restic repository password.
+    #[arg(long, value_name = "PASSWORD")]
+    pub password: Option<String>,
+    /// Verify backup integrity after completion.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub verify: bool,
+    /// Number of daily backups to keep (default: 7).
+    #[arg(long = "keep-daily", value_name = "N")]
+    pub keep_daily: Option<usize>,
+    /// Number of weekly backups to keep (default: 4).
+    #[arg(long = "keep-weekly", value_name = "N")]
+    pub keep_weekly: Option<usize>,
+    /// Number of monthly backups to keep (default: 6).
+    #[arg(long = "keep-monthly", value_name = "N")]
+    pub keep_monthly: Option<usize>,
 }
 
 /// Arguments for `db purge`.
@@ -127,8 +148,23 @@ pub struct DbRecoverArgs {
     pub index: Option<String>,
     /// Directory containing the backup to restore from.
     #[arg(long = "from", value_name = "DIR")]
-    pub from: PathBuf,
+    pub from: Option<PathBuf>,
     /// Allow overwriting the target index directory if it already exists.
     #[arg(long, action = ArgAction::SetTrue)]
     pub force: bool,
+    /// Use restic-compatible encrypted restore (requires --repository and --password).
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub restic: bool,
+    /// Restic repository location (local path or S3 URI).
+    #[arg(long, value_name = "PATH")]
+    pub repository: Option<String>,
+    /// Restic repository password.
+    #[arg(long, value_name = "PASSWORD")]
+    pub password: Option<String>,
+    /// Restic snapshot ID to restore.
+    #[arg(long, value_name = "ID")]
+    pub snapshot: Option<String>,
+    /// Perform dry-run without actually restoring files.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub dry_run: bool,
 }

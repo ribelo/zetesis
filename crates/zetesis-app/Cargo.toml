@@ -71,6 +71,8 @@ tower-http = { workspace = true }
 aws-config = { version = "1.5", optional = true }
 aws-sdk-s3 = { version = "1.69", optional = true }
 moka = { workspace = true }
+rustic_core = { workspace = true }
+rustic_backend = { workspace = true }
 zetesis-server = { path = "../zetesis-server" }
 
 [dev-dependencies]
