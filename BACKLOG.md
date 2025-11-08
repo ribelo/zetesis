@@ -312,25 +312,25 @@ Status: [ ] open · [~] in progress · [x] done
 
 ### Sprint 2025-W46 (2025-11-15 → 2025-11-28)
 
-- [ ] T-CLIRED-20251108-01 — Introduce `--silo <slug>` for dataset-scoped commands; keep positional `INDEX` as a deprecated alias with warning (P0)
+- [x] T-CLIRED-20251108-01 — Introduce `--silo <slug>` for dataset-scoped commands; keep positional `INDEX` as a deprecated alias with warning (P0)
   - Covers: [REQ-CLI-001](SPEC.md#req-cli-001)
 
-- [ ] T-CLIRED-20251108-02 — Add namespaces: `silo (list|create|stats|backup|recover|purge)`, `source (kio fetch)`, `index (alias for db)`, `sys (serve|init|doctor)` (P0)
+- [x] T-CLIRED-20251108-02 — Add namespaces: `silo (list|create|stats|backup|recover|purge)`, `source (kio fetch)`, `index (alias for db)`, `sys (serve|init|doctor)` (P0)
   - Covers: [REQ-CLI-001](SPEC.md#req-cli-001)
 
-- [ ] T-CLIRED-20251108-03 — Standardize flags across commands (`--limit/--offset/--fields/--pretty/--filter`); enforce bounds (`limit,k ≤ 100`) (P1)
+- [x] T-CLIRED-20251108-03 — Standardize flags across commands (`--limit/--offset/--fields/--pretty/--filter`); enforce bounds (`limit,k ≤ 100`) (P1)
   - Covers: [REQ-CLI-003](SPEC.md#req-cli-003)
 
-- [ ] T-CLIRED-20251108-04 — Implement `sys init` (create dirs, verify RW) and `sys doctor` (API keys, paths, map sizes, rate limits) with actionable output (P1)
+- [x] T-CLIRED-20251108-04 — Implement `sys init` (create dirs, verify RW) and `sys doctor` (API keys, paths, map sizes, rate limits) with actionable output (P1)
   - Covers: [REQ-ID-002](SPEC.md#req-id-002)
 
-- [ ] T-CLIRED-20251108-05 — Update help texts and examples to prefer `--silo`; add deprecation notes for old forms (P1)
+- [x] T-CLIRED-20251108-05 — Update help texts and examples to prefer `--silo`; add deprecation notes for old forms (P1)
   - Covers: [REQ-CLI-001](SPEC.md#req-cli-001)
 
-- [ ] T-CLIRED-20251108-06 — Docs: `docs/data-quickstart.md` with end-to-end flow (source→ingest→jobs→search→backup) (P1)
+- [x] T-CLIRED-20251108-06 — Docs: `docs/data-quickstart.md` with end-to-end flow (source→ingest→jobs→search→backup) (P1)
   - Covers: (none) — Documentation task
 
-- [ ] T-CLIRED-20251108-07 — Migration: keep old `db` as alias to `index` and positional `INDEX` for one release; add warnings and a removal date (P2)
+- [x] T-CLIRED-20251108-07 — Migration: keep old `db` as alias to `index` and positional `INDEX` for one release; add warnings and a removal date (P2)
   - Covers: [REQ-CLI-001](SPEC.md#req-cli-001)
 
 ## WP-DOCS — Spec and Architecture
