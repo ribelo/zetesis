@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, HashMap, hash_map::Entry},
+    collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry},
     env, fs,
     num::NonZeroUsize,
     path::Path,
@@ -24,16 +24,19 @@ use milli::vector::embedder::EmbedderOptions;
 use milli::{Filter, Search as MilliSearch, all_obkv_to_json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use strum::IntoEnumIterator;
 use tracing_subscriber::{filter::LevelFilter, fmt};
 use uuid::Uuid;
 use zetesis_app::cli::db_delete::DbDeleteArgs;
+use zetesis_app::cli::validators::validate_index_slug;
 use zetesis_app::cli::{
-    AuditArgs, AuditCommands, Cli, Commands, DEFAULT_KIO_SAOS_URL, DEFAULT_KIO_UZP_URL, DbArgs,
-    DbBackupArgs, DbCommands, DbFindArgs, DbGetArgs, DbPurgeArgs, DbRecoverArgs, DbStatsArgs,
-    FetchKioArgs, GenModeArg, HybridFusionArg, HybridSearchArgs, IngestArgs, JobsArgs,
+    AuditArgs, AuditCommands, Cli, CliSilo, Commands, DEFAULT_KIO_SAOS_URL, DEFAULT_KIO_UZP_URL,
+    DbArgs, DbBackupArgs, DbCommands, DbFindArgs, DbGetArgs, DbPurgeArgs, DbRecoverArgs,
+    DbStatsArgs, FetchKioArgs, GenModeArg, HybridFusionArg, HybridSearchArgs, IngestArgs, JobsArgs,
     JobsCommands, JobsGenArgs, JobsGenCommands, JobsGenFetchArgs, JobsGenSubmitArgs, JobsReapArgs,
-    JobsStatusArgs, KeywordSearchArgs, KioSource, SearchArgs, SearchCommands, StructuredAuditArgs,
-    VectorSearchArgs,
+    JobsStatusArgs, KeywordSearchArgs, KioSource, SearchArgs, SearchCommands, SiloArgs,
+    SiloCommands, SiloCreateArgs, SourceArgs, SourceCommands, SourceKioCommands,
+    StructuredAuditArgs, SysArgs, SysCommands, SysDoctorArgs, SysInitArgs, VectorSearchArgs,
 };
 #[cfg(feature = "cli-debug")]
 use zetesis_app::cli::{DebugArgs, DebugCommands};
@@ -64,6 +67,7 @@ const MAX_INLINE_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 /// Default maximum number of files to process in a single ingest when the
 /// environment variable `ZETESIS_MAX_INGEST_FILES` is not set or malformed.
 const DEFAULT_MAX_INGEST_FILES: usize = 10_000;
+const DEPRECATION_REMOVAL_DATE: &str = "2025-12-31";
 
 fn ingest_max_files_from_env() -> usize {
     // Prefer an explicit env var if set (backwards compatibility), otherwise
@@ -124,30 +128,49 @@ fn init_tracing(level: LevelFilter) {
 }
 
 async fn run(cli: Cli) -> Result<(), AppError> {
-    let verbosity = cli.verbose;
+    let Cli {
+        command,
+        silo,
+        verbose,
+    } = cli;
+    let verbosity = verbose;
 
-    match cli.command {
-        Some(Commands::Serve(_)) => {
-            let config = config::load()?;
-            server::serve(config).await?;
+    match command {
+        Some(Commands::Silo(args)) => {
+            run_silo(silo, args)?;
         }
-        Some(Commands::FetchKio(args)) => {
-            run_fetch_kio(args, verbosity).await?;
+        Some(Commands::Source(args)) => {
+            run_source(args, verbosity).await?;
+        }
+        Some(Commands::Index(args)) => {
+            run_db(silo, args).await?;
+        }
+        Some(Commands::Db(args)) => {
+            warn_deprecated_command("db", "index");
+            run_db(silo, args).await?;
+        }
+        Some(Commands::Sys(args)) => {
+            run_sys(args).await?;
         }
         Some(Commands::Ingest(args)) => {
-            run_ingest(args).await?;
+            run_ingest(silo, args).await?;
         }
         Some(Commands::Audit(args)) => {
             run_audit(args).await?;
         }
         Some(Commands::Search(args)) => {
-            run_search(args).await?;
-        }
-        Some(Commands::Db(args)) => {
-            run_db(args).await?;
+            run_search(silo, args).await?;
         }
         Some(Commands::Jobs(args)) => {
             run_jobs(args).await?;
+        }
+        Some(Commands::Serve(_)) => {
+            warn_deprecated_command("serve", "sys serve");
+            serve_command().await?;
+        }
+        Some(Commands::FetchKio(args)) => {
+            warn_deprecated_command("fetch-kio", "source kio fetch");
+            run_fetch_kio(args, verbosity).await?;
         }
         #[cfg(feature = "cli-debug")]
         Some(Commands::Debug(args)) => {
@@ -159,6 +182,179 @@ async fn run(cli: Cli) -> Result<(), AppError> {
     }
 
     Ok(())
+}
+
+async fn serve_command() -> Result<(), AppError> {
+    let cfg = config::load()?;
+    server::serve(cfg).await?;
+    Ok(())
+}
+
+async fn run_source(args: SourceArgs, verbosity: u8) -> Result<(), AppError> {
+    match args.command {
+        SourceCommands::Kio(kio) => match kio.command {
+            SourceKioCommands::Fetch(sub) => run_fetch_kio(sub, verbosity).await?,
+        },
+    }
+    Ok(())
+}
+
+async fn run_sys(args: SysArgs) -> Result<(), AppError> {
+    match args.command {
+        SysCommands::Serve(_) => {
+            serve_command().await?;
+        }
+        SysCommands::Init(sub) => {
+            sys_init(sub)?;
+        }
+        SysCommands::Doctor(sub) => {
+            sys_doctor(sub)?;
+        }
+    }
+    Ok(())
+}
+
+fn silo_create(args: SiloCreateArgs) -> Result<(), AppError> {
+    let paths = AppPaths::from_project_dirs()?;
+    ensure_index(&paths, &args.index, &args.embed_model, args.embed_dim)?;
+    println!(
+        "index `{}` initialized with embedder `{}`",
+        args.index, args.embed_model
+    );
+    Ok(())
+}
+
+fn sys_init(args: SysInitArgs) -> Result<(), AppError> {
+    let paths = AppPaths::from_project_dirs()?;
+    let mut directories = BTreeSet::new();
+
+    directories.insert(paths.data_dir());
+    directories.insert(paths.lmdb_env_dir()?);
+    directories.insert(paths.generation_jobs_lmdb_dir()?);
+    directories.insert(paths.milli_base_dir()?);
+
+    if !args.skip_nonessential {
+        directories.insert(paths.blobs_base_dir()?);
+        directories.insert(paths.generation_jobs_base_dir()?);
+        for silo in Silo::iter() {
+            directories.insert(paths.milli_dir(silo.slug())?);
+            directories.insert(paths.blobs_silo_dir(silo.slug())?);
+            directories.insert(paths.generation_jobs_payload_dir(silo.slug())?);
+            directories.insert(paths.generation_jobs_results_dir(silo.slug())?);
+        }
+    }
+
+    for directory in &directories {
+        fs::create_dir_all(directory).map_err(|e| io_error(directory, e))?;
+    }
+
+    println!("prepared filesystem layout:");
+    for directory in directories {
+        println!("  {}", directory.display());
+    }
+
+    Ok(())
+}
+
+fn sys_doctor(args: SysDoctorArgs) -> Result<(), AppError> {
+    let paths = AppPaths::from_project_dirs()?;
+    println!("system diagnostics:");
+    println!("  data directory: {}", paths.data_dir().display());
+
+    let mut checked_paths = Vec::new();
+    checked_paths.push(paths.data_dir());
+    checked_paths.push(paths.milli_base_dir()?);
+    checked_paths.push(paths.blobs_base_dir()?);
+    checked_paths.push(paths.generation_jobs_base_dir()?);
+    checked_paths.push(paths.lmdb_env_dir()?);
+    checked_paths.push(paths.generation_jobs_lmdb_dir()?);
+
+    for path in checked_paths {
+        if fs::metadata(&path).is_ok() {
+            println!("  ✓ {}", path.display());
+        } else {
+            println!("  ! {}", path.display());
+        }
+    }
+
+    for silo in Silo::iter() {
+        let path = paths.milli_dir(silo.slug())?;
+        println!("  silo `{}` index dir: {}", silo.slug(), path.display());
+    }
+
+    let cfg = config::load()?;
+    println!("  server listen addr: {}", cfg.server.listen_addr);
+    println!(
+        "  storage backend: {} ({})",
+        cfg.storage.backend,
+        cfg.storage.path.display()
+    );
+    if args.verbose {
+        let rl = &cfg.server.rate_limit;
+        println!(
+            "  rate limit window: {} ms (keyword {} req/{} burst)",
+            rl.window_ms.get(),
+            rl.keyword.max_requests.get(),
+            rl.keyword.burst.get()
+        );
+        println!(
+            "  vector limit: {} req/{} burst",
+            rl.vector.max_requests.get(),
+            rl.vector.burst.get()
+        );
+    }
+
+    match env::var("GEMINI_API_KEY").or_else(|_| env::var("GOOGLE_AI_API_KEY")) {
+        Ok(_) => {
+            println!("  AI key: configured");
+        }
+        Err(_) => {
+            println!(
+                "  ! missing Gemini/Google AI API key (set GEMINI_API_KEY or GOOGLE_AI_API_KEY)"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn warn_deprecated_command(old: &str, new: &str) {
+    tracing::warn!(
+        old = old,
+        new = new,
+        "warning: `{}` is deprecated and will be removed after {}; prefer `{}`.",
+        old,
+        DEPRECATION_REMOVAL_DATE,
+        new
+    );
+}
+
+fn resolve_index(
+    positional: Option<String>,
+    silo: CliSilo,
+    command: &str,
+) -> Result<String, AppError> {
+    match positional {
+        Some(index) => {
+            if index.trim().is_empty() {
+                return Err(AppError::InvalidIndexName { name: index });
+            }
+            warn_deprecated_index(command, &index);
+            Ok(index)
+        }
+        None => Ok(silo.slug().to_string()),
+    }
+}
+
+fn warn_deprecated_index(command: &str, index: &str) {
+    tracing::warn!(
+        command = command,
+        index = index,
+        "warning: positional INDEX `{}` for `{}` is deprecated and will be removed after {}; pass `--silo <slug>` instead.",
+        index,
+        command,
+        DEPRECATION_REMOVAL_DATE,
+    );
 }
 
 async fn build_blob_store(
@@ -337,7 +533,7 @@ struct IngestOutcome {
     provider_job_id: Option<String>,
 }
 
-async fn run_ingest(args: IngestArgs) -> Result<(), AppError> {
+async fn run_ingest(cli_silo: CliSilo, args: IngestArgs) -> Result<(), AppError> {
     let ctx = build_pipeline_context(&args.embed_model)?;
 
     // Validate CLI arguments early and fail fast with clear error messages.
@@ -361,10 +557,24 @@ async fn run_ingest(args: IngestArgs) -> Result<(), AppError> {
         "generation model must be present"
     );
 
+    let (legacy_index, document_path) = match args.args.as_slice() {
+        [path] => (None, PathBuf::from(path)),
+        [legacy, path] => (
+            Some(
+                validate_index_slug(legacy).map_err(|_| AppError::InvalidIndexName {
+                    name: legacy.clone(),
+                })?,
+            ),
+            PathBuf::from(path),
+        ),
+        _ => unreachable!("clap enforces 1 or 2 arguments for ingest"),
+    };
+
+    let index_slug = resolve_index(legacy_index, cli_silo, "ingest")?;
     tracing::info!(
         event = "ingest_start",
-        index = %args.index,
-        path = %args.path.display(),
+        index = %index_slug,
+        path = %document_path.display(),
         limit = ?args.limit,
         gen_mode = ?args.gen_mode,
         deprecated_batch_flag = args.batch,
@@ -373,8 +583,8 @@ async fn run_ingest(args: IngestArgs) -> Result<(), AppError> {
         "starting ingest"
     );
 
-    let silo = Silo::from_str(&args.index).map_err(|_| AppError::InvalidIndexName {
-        name: args.index.clone(),
+    let silo = Silo::from_str(&index_slug).map_err(|_| AppError::InvalidIndexName {
+        name: index_slug.clone(),
     })?;
     let slug = silo.slug();
 
@@ -408,7 +618,7 @@ async fn run_ingest(args: IngestArgs) -> Result<(), AppError> {
             ensure_index(&ctx.paths, slug, &ctx.embed.embedder_key, ctx.embed.dim)?;
         } else {
             return Err(AppError::MissingIndex {
-                index: args.index.clone(),
+                index: index_slug.clone(),
                 path: index_dir,
             });
         }
@@ -416,10 +626,17 @@ async fn run_ingest(args: IngestArgs) -> Result<(), AppError> {
         ensure_index(&ctx.paths, slug, &ctx.embed.embedder_key, ctx.embed.dim)?;
     }
 
-    let targets = collect_ingest_targets(&args.path, effective_limit)?;
+    let targets = collect_ingest_targets(&document_path, effective_limit)?;
     if targets.is_empty() {
-        tracing::info!(event = "ingest_nothing", path = %args.path.display(), "no supported documents found");
-        println!("no supported documents found at {}", args.path.display());
+        tracing::info!(
+            event = "ingest_nothing",
+            path = %document_path.display(),
+            "no supported documents found"
+        );
+        println!(
+            "no supported documents found at {}",
+            document_path.display()
+        );
         return Ok(());
     }
 
@@ -1165,7 +1382,18 @@ fn determine_log_level(cli: &Cli) -> LevelFilter {
             2 => LevelFilter::DEBUG,
             _ => LevelFilter::TRACE,
         },
+        Some(Commands::Source(_)) => match cli.verbose {
+            0 => LevelFilter::OFF,
+            1 => LevelFilter::INFO,
+            2 => LevelFilter::DEBUG,
+            _ => LevelFilter::TRACE,
+        },
         Some(Commands::Serve(_)) => match cli.verbose {
+            0 => LevelFilter::INFO,
+            1 => LevelFilter::DEBUG,
+            _ => LevelFilter::TRACE,
+        },
+        Some(Commands::Sys(_)) => match cli.verbose {
             0 => LevelFilter::INFO,
             1 => LevelFilter::DEBUG,
             _ => LevelFilter::TRACE,
@@ -1176,6 +1404,18 @@ fn determine_log_level(cli: &Cli) -> LevelFilter {
             _ => LevelFilter::TRACE,
         },
         Some(Commands::Audit(_)) => match cli.verbose {
+            0 => LevelFilter::OFF,
+            1 => LevelFilter::INFO,
+            2 => LevelFilter::DEBUG,
+            _ => LevelFilter::TRACE,
+        },
+        Some(Commands::Silo(_)) => match cli.verbose {
+            0 => LevelFilter::OFF,
+            1 => LevelFilter::INFO,
+            2 => LevelFilter::DEBUG,
+            _ => LevelFilter::TRACE,
+        },
+        Some(Commands::Index(_)) => match cli.verbose {
             0 => LevelFilter::OFF,
             1 => LevelFilter::INFO,
             2 => LevelFilter::DEBUG,
@@ -1306,11 +1546,11 @@ async fn run_audit_structured(args: StructuredAuditArgs) -> Result<(), AppError>
     Ok(())
 }
 
-async fn run_search(args: SearchArgs) -> Result<(), AppError> {
+async fn run_search(cli_silo: CliSilo, args: SearchArgs) -> Result<(), AppError> {
     match args.command {
-        SearchCommands::Keyword(sub) => search_keyword(sub).await?,
-        SearchCommands::Vector(sub) => search_vector(sub).await?,
-        SearchCommands::Hybrid(sub) => search_hybrid(sub).await?,
+        SearchCommands::Keyword(sub) => search_keyword(cli_silo, sub).await?,
+        SearchCommands::Vector(sub) => search_vector(cli_silo, sub).await?,
+        SearchCommands::Hybrid(sub) => search_hybrid(cli_silo, sub).await?,
     }
     Ok(())
 }
@@ -1807,21 +2047,33 @@ fn current_timestamp_ms() -> i64 {
         .as_millis() as i64
 }
 
-async fn run_db(args: DbArgs) -> Result<(), AppError> {
+fn run_silo(silo: CliSilo, args: SiloArgs) -> Result<(), AppError> {
     match args.command {
-        DbCommands::List => db_list()?,
-        DbCommands::Stats(sub) => db_stats(sub)?,
-        DbCommands::Get(sub) => db_get(sub)?,
-        DbCommands::Find(sub) => db_find(sub)?,
-        DbCommands::Backup(sub) => db_backup(sub)?,
-        DbCommands::Purge(sub) => db_purge(sub)?,
-        DbCommands::Recover(sub) => db_recover(sub)?,
-        DbCommands::Delete(sub) => db_delete(sub).await?,
+        SiloCommands::List => db_list()?,
+        SiloCommands::Create(sub) => silo_create(sub)?,
+        SiloCommands::Stats(sub) => db_stats(sub, silo)?,
+        SiloCommands::Backup(sub) => db_backup(sub, silo)?,
+        SiloCommands::Recover(sub) => db_recover(sub, silo)?,
+        SiloCommands::Purge(sub) => db_purge(sub, silo)?,
     }
     Ok(())
 }
 
-async fn search_keyword(args: KeywordSearchArgs) -> Result<(), AppError> {
+async fn run_db(silo: CliSilo, args: DbArgs) -> Result<(), AppError> {
+    match args.command {
+        DbCommands::List => db_list()?,
+        DbCommands::Stats(sub) => db_stats(sub, silo)?,
+        DbCommands::Get(sub) => db_get(sub, silo)?,
+        DbCommands::Find(sub) => db_find(sub, silo)?,
+        DbCommands::Backup(sub) => db_backup(sub, silo)?,
+        DbCommands::Purge(sub) => db_purge(sub, silo)?,
+        DbCommands::Recover(sub) => db_recover(sub, silo)?,
+        DbCommands::Delete(sub) => db_delete(sub, silo).await?,
+    }
+    Ok(())
+}
+
+async fn search_keyword(silo: CliSilo, args: KeywordSearchArgs) -> Result<(), AppError> {
     let KeywordSearchArgs {
         index,
         query,
@@ -1832,8 +2084,9 @@ async fn search_keyword(args: KeywordSearchArgs) -> Result<(), AppError> {
         fields,
         pretty,
     } = args;
+    let index_name = resolve_index(index, silo, "search keyword")?;
     let params = KeywordSearchParams {
-        index,
+        index: index_name,
         query,
         filter,
         sort,
@@ -1846,7 +2099,7 @@ async fn search_keyword(args: KeywordSearchArgs) -> Result<(), AppError> {
     Ok(())
 }
 
-async fn search_vector(args: VectorSearchArgs) -> Result<(), AppError> {
+async fn search_vector(silo: CliSilo, args: VectorSearchArgs) -> Result<(), AppError> {
     let VectorSearchArgs {
         index,
         query,
@@ -1856,8 +2109,9 @@ async fn search_vector(args: VectorSearchArgs) -> Result<(), AppError> {
         fields,
         pretty,
     } = args;
+    let index_name = resolve_index(index, silo, "search vector")?;
     let params = VectorSearchParams {
-        index,
+        index: index_name,
         query,
         embedder,
         filter,
@@ -1869,7 +2123,7 @@ async fn search_vector(args: VectorSearchArgs) -> Result<(), AppError> {
     Ok(())
 }
 
-async fn search_hybrid(args: HybridSearchArgs) -> Result<(), AppError> {
+async fn search_hybrid(silo: CliSilo, args: HybridSearchArgs) -> Result<(), AppError> {
     let HybridSearchArgs {
         index,
         query,
@@ -1882,9 +2136,10 @@ async fn search_hybrid(args: HybridSearchArgs) -> Result<(), AppError> {
         vector_weight,
         pretty,
     } = args;
+    let index_name = resolve_index(index, silo, "search hybrid")?;
     let per_branch_limit = limit.min(HYBRID_PER_SOURCE_LIMIT_MAX).max(1);
     let keyword_params = KeywordSearchParams {
-        index: index.clone(),
+        index: index_name.clone(),
         query: query.clone(),
         filter: filter.clone(),
         sort: Vec::new(),
@@ -1893,7 +2148,7 @@ async fn search_hybrid(args: HybridSearchArgs) -> Result<(), AppError> {
         offset: 0,
     };
     let vector_params = VectorSearchParams {
-        index,
+        index: index_name,
         query,
         embedder,
         filter,
@@ -1961,8 +2216,9 @@ fn db_list() -> Result<(), AppError> {
     Ok(())
 }
 
-fn db_stats(args: DbStatsArgs) -> Result<(), AppError> {
-    let index_name = normalize_index_name(&args.index)?;
+fn db_stats(args: DbStatsArgs, cli_silo: CliSilo) -> Result<(), AppError> {
+    let index_slug = resolve_index(args.index, cli_silo, "db stats")?;
+    let index_name = normalize_index_name(&index_slug)?;
     let paths = AppPaths::from_project_dirs()?;
     let base = paths.milli_base_dir()?;
     let index_path = base.join(&index_name);
@@ -2026,8 +2282,9 @@ fn db_stats(args: DbStatsArgs) -> Result<(), AppError> {
     Ok(())
 }
 
-fn db_get(args: DbGetArgs) -> Result<(), AppError> {
-    let (index_name, index_path) = resolve_index_dir(&args.index)?;
+fn db_get(args: DbGetArgs, cli_silo: CliSilo) -> Result<(), AppError> {
+    let index_slug = resolve_index(args.index, cli_silo, "db get")?;
+    let (index_name, index_path) = resolve_index_dir(&index_slug)?;
     let index = open_index_read_only(&index_path)?;
     let rtxn = index.read_txn()?;
     let fields_map = index.fields_ids_map(&rtxn)?;
@@ -2045,8 +2302,9 @@ fn db_get(args: DbGetArgs) -> Result<(), AppError> {
     Ok(())
 }
 
-fn db_find(args: DbFindArgs) -> Result<(), AppError> {
-    let (_index_name, index_path) = resolve_index_dir(&args.index)?;
+fn db_find(args: DbFindArgs, cli_silo: CliSilo) -> Result<(), AppError> {
+    let index_slug = resolve_index(args.index, cli_silo, "db find")?;
+    let (_index_name, index_path) = resolve_index_dir(&index_slug)?;
     let index = open_index_read_only(&index_path)?;
     let rtxn = index.read_txn()?;
     let fields_map = index.fields_ids_map(&rtxn)?;
@@ -2076,8 +2334,9 @@ fn db_find(args: DbFindArgs) -> Result<(), AppError> {
     Ok(())
 }
 
-fn db_backup(args: DbBackupArgs) -> Result<(), AppError> {
-    let index_name = normalize_index_name(&args.index)?;
+fn db_backup(args: DbBackupArgs, cli_silo: CliSilo) -> Result<(), AppError> {
+    let index_slug = resolve_index(args.index, cli_silo, "db backup")?;
+    let index_name = normalize_index_name(&index_slug)?;
     let paths = AppPaths::from_project_dirs()?;
     let base = paths.milli_base_dir()?;
     let src = base.join(&index_name);
@@ -2105,8 +2364,9 @@ fn db_backup(args: DbBackupArgs) -> Result<(), AppError> {
     Ok(())
 }
 
-fn db_purge(args: DbPurgeArgs) -> Result<(), AppError> {
-    let index_name = normalize_index_name(&args.index)?;
+fn db_purge(args: DbPurgeArgs, cli_silo: CliSilo) -> Result<(), AppError> {
+    let index_slug = resolve_index(args.index, cli_silo, "db purge")?;
+    let index_name = normalize_index_name(&index_slug)?;
     debug_assert!(!index_name.is_empty());
     let paths = AppPaths::from_project_dirs()?;
     let base = paths.milli_base_dir()?;
@@ -2193,8 +2453,9 @@ mod tests {
     }
 }
 
-fn db_recover(args: DbRecoverArgs) -> Result<(), AppError> {
-    let index_name = normalize_index_name(&args.index)?;
+fn db_recover(args: DbRecoverArgs, cli_silo: CliSilo) -> Result<(), AppError> {
+    let index_slug = resolve_index(args.index, cli_silo, "db recover")?;
+    let index_name = normalize_index_name(&index_slug)?;
     let raw_source = args.from.clone();
     let source = raw_source
         .canonicalize()
@@ -2219,8 +2480,9 @@ fn db_recover(args: DbRecoverArgs) -> Result<(), AppError> {
     Ok(())
 }
 
-async fn db_delete(args: DbDeleteArgs) -> Result<(), AppError> {
-    let (index_name, index_path) = resolve_index_dir(&args.index)?;
+async fn db_delete(args: DbDeleteArgs, cli_silo: CliSilo) -> Result<(), AppError> {
+    let index_slug = resolve_index(args.index, cli_silo, "db delete")?;
+    let (index_name, index_path) = resolve_index_dir(&index_slug)?;
     let index = open_index_without_config(&index_path)?;
     let deleter = DocumentDeleter::new(index);
 

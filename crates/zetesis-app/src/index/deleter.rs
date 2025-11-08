@@ -334,8 +334,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use milli::FilterableAttributesRule;
     use crate::index::writer::IndexWriter;
+    use milli::FilterableAttributesRule;
 
     fn sample_records(doc_id: &str) -> Vec<JsonMap<String, JsonValue>> {
         let cid = "0123456789abcdef0123456789abcdef";

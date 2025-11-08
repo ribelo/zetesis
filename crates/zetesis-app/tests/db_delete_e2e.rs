@@ -7,14 +7,14 @@ use zetesis_app::error::AppError;
 fn db_delete_dry_run_noop() -> Result<(), AppError> {
     // Test CLI argument parsing
     let args = DbDeleteArgs {
-        index: "test".to_string(),
+        index: Some("test".to_string()),
         id: "test-doc-id".to_string(),
         dry_run: true,
         assume_yes: true,
     };
 
     // Test that CLI arguments are parsed correctly
-    assert_eq!(args.index, "test");
+    assert_eq!(args.index, Some("test".to_string()));
     assert_eq!(args.id, "test-doc-id");
     assert!(args.dry_run);
     assert!(args.assume_yes);
@@ -26,7 +26,7 @@ fn db_delete_dry_run_noop() -> Result<(), AppError> {
 fn db_delete_with_cli_arguments() {
     // Test CLI argument parsing with all combinations
     let args1 = DbDeleteArgs {
-        index: "kio".to_string(),
+        index: Some("kio".to_string()),
         id: "doc123".to_string(),
         dry_run: true,
         assume_yes: false,
@@ -35,7 +35,7 @@ fn db_delete_with_cli_arguments() {
     assert!(!args1.assume_yes);
 
     let args2 = DbDeleteArgs {
-        index: "kio".to_string(),
+        index: Some("kio".to_string()),
         id: "doc456".to_string(),
         dry_run: false,
         assume_yes: true,
@@ -44,7 +44,7 @@ fn db_delete_with_cli_arguments() {
     assert!(args2.assume_yes);
 
     let args3 = DbDeleteArgs {
-        index: "kio".to_string(),
+        index: Some("kio".to_string()),
         id: "doc789".to_string(),
         dry_run: false,
         assume_yes: false,
@@ -57,34 +57,34 @@ fn db_delete_with_cli_arguments() {
 fn db_delete_index_validation() {
     // Test index name validation
     let valid_args = DbDeleteArgs {
-        index: "valid-index-name".to_string(),
+        index: Some("valid-index-name".to_string()),
         id: "test-doc".to_string(),
         dry_run: true,
         assume_yes: true,
     };
-    assert_eq!(valid_args.index, "valid-index-name");
+    assert_eq!(valid_args.index, Some("valid-index-name".to_string()));
 
     // Test with hyphenated index name (should be valid)
     let hyphenated_args = DbDeleteArgs {
-        index: "test-kio-2023".to_string(),
+        index: Some("test-kio-2023".to_string()),
         id: "test-doc".to_string(),
         dry_run: true,
         assume_yes: true,
     };
-    assert_eq!(hyphenated_args.index, "test-kio-2023");
+    assert_eq!(hyphenated_args.index, Some("test-kio-2023".to_string()));
 }
 
 #[test]
 fn db_delete_missing_index_error() {
     let args = DbDeleteArgs {
-        index: "non-existent-index".to_string(),
+        index: Some("non-existent-index".to_string()),
         id: "test-doc".to_string(),
         dry_run: false,
         assume_yes: true,
     };
 
     // Test the structure
-    assert_eq!(args.index, "non-existent-index");
+    assert_eq!(args.index, Some("non-existent-index".to_string()));
     assert_eq!(args.id, "test-doc");
     assert!(!args.dry_run);
     assert!(args.assume_yes);
@@ -94,7 +94,7 @@ fn db_delete_missing_index_error() {
 fn db_delete_argument_combinations() {
     // Test dry_run with assume_yes
     let args1 = DbDeleteArgs {
-        index: "test-index".to_string(),
+        index: Some("test-index".to_string()),
         id: "test-id".to_string(),
         dry_run: true,
         assume_yes: true,
@@ -104,7 +104,7 @@ fn db_delete_argument_combinations() {
 
     // Test no flags
     let args2 = DbDeleteArgs {
-        index: "test-index".to_string(),
+        index: Some("test-index".to_string()),
         id: "test-id".to_string(),
         dry_run: false,
         assume_yes: false,
@@ -114,7 +114,7 @@ fn db_delete_argument_combinations() {
 
     // Test only dry_run
     let args3 = DbDeleteArgs {
-        index: "test-index".to_string(),
+        index: Some("test-index".to_string()),
         id: "test-id".to_string(),
         dry_run: true,
         assume_yes: false,
@@ -124,7 +124,7 @@ fn db_delete_argument_combinations() {
 
     // Test only assume_yes
     let args4 = DbDeleteArgs {
-        index: "test-index".to_string(),
+        index: Some("test-index".to_string()),
         id: "test-id".to_string(),
         dry_run: false,
         assume_yes: true,
