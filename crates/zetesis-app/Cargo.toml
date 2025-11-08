@@ -62,16 +62,16 @@ uuid = { workspace = true }
 pulldown-cmark = { workspace = true }
 icu_segmenter = { workspace = true }
 image = { workspace = true }
-deepinfra-ox = { workspace = true }
 gemini-ox = { workspace = true }
 flume = "0.11"
 inquire = "0.9.1"
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["codec"] }
-tower-http = { version = "0.5", features = ["trace", "request-id", "cors"] }
+tower-http = { workspace = true }
 aws-config = { version = "1.5", optional = true }
 aws-sdk-s3 = { version = "1.69", optional = true }
-moka = { version = "0.12", features = ["future"] }
+moka = { workspace = true }
+zetesis-server = { path = "../zetesis-server" }
 
 [dev-dependencies]
 serde_yaml = "0.9"

@@ -9,7 +9,7 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Body,
     extract::{MatchedPath, Query, State, connect_info::ConnectInfo},
     http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header::RETRY_AFTER},
@@ -26,18 +26,18 @@ use std::num::NonZeroU32;
 use thiserror::Error;
 use tokio::{net::TcpListener, sync::watch};
 use tower_http::{
+    add_extension::AddExtensionLayer,
     classify::ServerErrorsFailureClass,
     cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer, ExposeHeaders},
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     trace::TraceLayer,
 };
 
-use crate::config::{AppConfig, CorsConfig, RateLimitConfig, RouteLimitConfig, ServerConfig};
-use crate::error::AppError;
-use crate::services::{
+use crate::config::{CorsConfig, ProxyMode, RateLimitConfig, RouteLimitConfig, ServerConfig};
+use crate::search::{
     HYBRID_DEFAULT_RRF_K, HYBRID_DEFAULT_WEIGHT, HYBRID_PER_SOURCE_LIMIT_MAX,
-    HYBRID_RESULT_LIMIT_MAX, HybridFusion, HybridSearchParams, KeywordSearchParams,
-    VectorSearchParams, hybrid, keyword, normalize_hybrid_weights, vector,
+    HYBRID_RESULT_LIMIT_MAX, HybridFusion, HybridSearchParams, KeywordSearchParams, SearchError,
+    SearchErrorKind, SearchProvider, VectorSearchParams, normalize_hybrid_weights,
 };
 
 const HEALTHZ_PATH: &str = "/v1/healthz";
@@ -173,6 +173,24 @@ struct TypeaheadState {
     cache: Cache<TypeaheadCacheKey, Arc<Vec<Value>>>,
 }
 
+type DynSearchProvider = Arc<dyn SearchProvider>;
+type ApiStateHandle = Arc<ApiState>;
+
+#[derive(Clone)]
+struct ApiState {
+    search: DynSearchProvider,
+    typeahead: Arc<TypeaheadState>,
+}
+
+impl ApiState {
+    fn new(search: DynSearchProvider) -> Self {
+        Self {
+            search,
+            typeahead: Arc::new(TypeaheadState::new()),
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum TypeaheadCacheStatus {
     Hit,
@@ -235,8 +253,7 @@ struct RateLimitState {
     vector: Arc<DefaultKeyedRateLimiter<String>>,
     hybrid: Arc<DefaultKeyedRateLimiter<String>>,
     typeahead: Arc<DefaultKeyedRateLimiter<String>>,
-    window_ms: u64,
-    proxy_mode: crate::config::ProxyMode,
+    proxy_mode: ProxyMode,
     trusted: Arc<HashSet<IpAddr>>,
 }
 
@@ -254,7 +271,6 @@ impl RateLimitState {
             vector: Arc::new(vec),
             hybrid: Arc::new(hybrid),
             typeahead: Arc::new(ta),
-            window_ms,
             proxy_mode: cfg.proxy_mode,
             trusted: Arc::new(cfg.trusted_proxies.iter().copied().collect()),
         }))
@@ -326,7 +342,7 @@ async fn rate_limit_middleware(
 
 fn extract_client_ip(
     req: &Request<Body>,
-    mode: crate::config::ProxyMode,
+    mode: ProxyMode,
     trusted: &HashSet<IpAddr>,
 ) -> Option<IpAddr> {
     let peer = req
@@ -339,8 +355,8 @@ fn extract_client_ip(
     };
 
     match mode {
-        crate::config::ProxyMode::Off => Some(peer_ip),
-        crate::config::ProxyMode::XForwardedFor => {
+        ProxyMode::Off => Some(peer_ip),
+        ProxyMode::XForwardedFor => {
             // Only trust headers from known proxy addresses.
             if trusted.contains(&peer_ip) {
                 parse_xff(req.headers()).or(Some(peer_ip))
@@ -348,7 +364,7 @@ fn extract_client_ip(
                 Some(peer_ip)
             }
         }
-        crate::config::ProxyMode::Forwarded => {
+        ProxyMode::Forwarded => {
             if trusted.contains(&peer_ip) {
                 parse_forwarded(req.headers()).or(Some(peer_ip))
             } else {
@@ -597,6 +613,7 @@ impl TypeaheadState {
 
     async fn lookup(
         &self,
+        provider: DynSearchProvider,
         key: TypeaheadCacheKey,
         params: &TypeaheadParams,
     ) -> Result<(Arc<Vec<Value>>, TypeaheadCacheStatus), ApiError> {
@@ -609,7 +626,10 @@ impl TypeaheadState {
 
         let keyword_params = params.to_keyword_params();
         let loader = async move {
-            let rows = keyword(&keyword_params).map_err(ApiError::from)?;
+            let rows = provider
+                .keyword(keyword_params)
+                .await
+                .map_err(ApiError::from)?;
             Ok::<Arc<Vec<Value>>, ApiError>(Arc::new(rows))
         };
 
@@ -705,32 +725,27 @@ impl ApiError {
     }
 }
 
-impl From<AppError> for ApiError {
-    fn from(error: AppError) -> Self {
-        match error {
-            AppError::MissingIndex { index, .. } => {
-                ApiError::not_found("index", format!("index `{index}` not found"))
+impl From<SearchError> for ApiError {
+    fn from(error: SearchError) -> Self {
+        match error.kind {
+            SearchErrorKind::InvalidParameter => {
+                let field = error.field.unwrap_or_else(|| "parameter".to_string());
+                ApiError::invalid_param(&field, error.message)
             }
-            AppError::InvalidIndexName { name } => {
-                ApiError::invalid_param("index", format!("invalid index `{name}`"))
+            SearchErrorKind::NotFound { resource } => ApiError::not_found(&resource, error.message),
+            SearchErrorKind::RateLimited { retry_after_ms } => {
+                let mut api = ApiError::new(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    ERROR_RATE_LIMITED,
+                    error.message,
+                );
+                if let Some(delay) = retry_after_ms {
+                    api = api.with_retry_after(delay);
+                }
+                api
             }
-            AppError::InvalidSort { spec, reason } => {
-                ApiError::invalid_param("sort", format!("invalid sort `{spec}`: {reason}"))
-            }
-            AppError::InvalidFilter { expression, reason } => ApiError::invalid_param(
-                "filter",
-                format!("invalid filter `{expression}`: {reason}"),
-            ),
-            AppError::EmbedderNotFound { name, .. } => ApiError::invalid_param(
-                "embedder",
-                format!("embedder `{name}` not configured for index"),
-            ),
-            AppError::UnsupportedEmbedder { name, .. } => ApiError::invalid_param(
-                "embedder",
-                format!("embedder `{name}` does not support vector search"),
-            ),
-            other => {
-                tracing::error!(error = %other, "search request failed");
+            SearchErrorKind::Internal => {
+                tracing::error!(message = %error.message, "search request failed");
                 ApiError::internal()
             }
         }
@@ -908,6 +923,27 @@ mod tests {
     use axum::http::header;
     use tower::ServiceExt;
 
+    struct MockSearchProvider;
+
+    #[async_trait::async_trait]
+    impl SearchProvider for MockSearchProvider {
+        async fn keyword(&self, _params: KeywordSearchParams) -> Result<Vec<Value>, SearchError> {
+            Ok(Vec::new())
+        }
+
+        async fn vector(&self, _params: VectorSearchParams) -> Result<Vec<Value>, SearchError> {
+            Ok(Vec::new())
+        }
+
+        async fn hybrid(&self, _params: HybridSearchParams) -> Result<Vec<Value>, SearchError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn mock_api_state() -> ApiStateHandle {
+        Arc::new(ApiState::new(Arc::new(MockSearchProvider)))
+    }
+
     #[test]
     fn keyword_query_allows_empty_fields() {
         let query = KeywordQuery {
@@ -1006,7 +1042,8 @@ mod tests {
     #[tokio::test]
     async fn cors_disabled_yields_no_headers() {
         let config = server_config_with(CorsConfig::default());
-        let router = build_app_router(&config).expect("router builds");
+        let state = mock_api_state();
+        let router = build_app_router(&config, state).expect("router builds");
 
         let response = router
             .clone()
@@ -1039,7 +1076,8 @@ mod tests {
             ..CorsConfig::default()
         };
         let config = server_config_with(cors);
-        let router = build_app_router(&config).expect("router builds");
+        let state = mock_api_state();
+        let router = build_app_router(&config, state).expect("router builds");
 
         let origin = "http://localhost:5173";
         let response = router
@@ -1082,7 +1120,8 @@ mod tests {
             ..CorsConfig::default()
         };
         let config = server_config_with(cors);
-        let router = build_app_router(&config).expect("router builds");
+        let state = mock_api_state();
+        let router = build_app_router(&config, state).expect("router builds");
 
         let origin = "http://localhost:5173";
         let get_response = router
@@ -1186,8 +1225,6 @@ pub fn build_api_router() -> Router {
     debug_assert!(HEALTHZ_PATH.ends_with("healthz"));
     debug_assert!(TYPEAHEAD_LIMIT_DEFAULT <= TYPEAHEAD_LIMIT_MAX);
 
-    let typeahead_state = Arc::new(TypeaheadState::new());
-
     Router::new()
         .route(
             HEALTHZ_PATH,
@@ -1207,17 +1244,16 @@ pub fn build_api_router() -> Router {
         )
         .route(
             TYPEAHEAD_PATH,
-            get(typeahead_search)
-                .with_state(typeahead_state)
-                .fallback(method_not_allowed_handler),
+            get(typeahead_search).fallback(method_not_allowed_handler),
         )
 }
 
-pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
-    debug_assert!(config.server.listen_addr.len() <= 128);
-    debug_assert!(!config.server.listen_addr.contains('\n'));
+pub async fn serve(config: ServerConfig, search: DynSearchProvider) -> Result<(), ServerError> {
+    debug_assert!(config.listen_addr.len() <= 128);
+    debug_assert!(!config.listen_addr.contains('\n'));
 
-    let listen_addr = parse_listen_addr(&config.server.listen_addr)?;
+    let api_state: ApiStateHandle = Arc::new(ApiState::new(search));
+    let listen_addr = parse_listen_addr(&config.listen_addr)?;
 
     let listener = bind_listener(listen_addr).await?;
 
@@ -1230,7 +1266,7 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
 
     let shutdown_future = broadcast_shutdown(shutdown_tx);
 
-    let app = build_app_router(&config.server)?;
+    let app = build_app_router(&config, api_state.clone())?;
     let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
 
     let mut server_future = Box::pin(async move {
@@ -1264,7 +1300,7 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
     Ok(())
 }
 
-fn build_app_router(config: &ServerConfig) -> Result<Router, ServerError> {
+fn build_app_router(config: &ServerConfig, state: ApiStateHandle) -> Result<Router, ServerError> {
     debug_assert!(HEALTHZ_PATH.starts_with('/'));
     debug_assert_eq!(HEALTHZ_STATUS, "ok");
 
@@ -1317,7 +1353,7 @@ fn build_app_router(config: &ServerConfig) -> Result<Router, ServerError> {
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
         .layer(SetRequestIdLayer::new(request_id_header, make_request_id));
 
-    Ok(router)
+    Ok(router.layer(AddExtensionLayer::new(state)))
 }
 
 fn build_cors_layer(config: &CorsConfig) -> Result<CorsLayer, ServerError> {
@@ -1380,14 +1416,17 @@ fn build_cors_layer(config: &CorsConfig) -> Result<CorsLayer, ServerError> {
 }
 
 async fn typeahead_search(
-    State(state): State<Arc<TypeaheadState>>,
+    Extension(state): Extension<ApiStateHandle>,
     Query(query): Query<TypeaheadQuery>,
 ) -> Result<axum::response::Response, ApiError> {
     debug_assert!(!TYPEAHEAD_PATH.is_empty());
     debug_assert!(TYPEAHEAD_LIMIT_MAX >= TYPEAHEAD_MIN_QUERY_LEN);
     let params = query.into_params()?;
     let key = params.cache_key();
-    let (rows, status) = state.lookup(key, &params).await?;
+    let (rows, status) = state
+        .typeahead
+        .lookup(Arc::clone(&state.search), key, &params)
+        .await?;
     let payload = take_arc_vec(rows);
     let mut response = Json(payload).into_response();
     let headers = response.headers_mut();
@@ -1400,24 +1439,33 @@ async fn typeahead_search(
     Ok(response)
 }
 
-async fn keyword_search(Query(query): Query<KeywordQuery>) -> Result<Json<Vec<Value>>, ApiError> {
+async fn keyword_search(
+    Extension(state): Extension<ApiStateHandle>,
+    Query(query): Query<KeywordQuery>,
+) -> Result<Json<Vec<Value>>, ApiError> {
     debug_assert!(!KEYWORD_PATH.is_empty());
     let params = query.into_params()?;
-    let rows = keyword(&params).map_err(ApiError::from)?;
+    let rows = state.search.keyword(params).await.map_err(ApiError::from)?;
     Ok(Json(rows))
 }
 
-async fn vector_search(Query(query): Query<VectorQuery>) -> Result<Json<Vec<Value>>, ApiError> {
+async fn vector_search(
+    Extension(state): Extension<ApiStateHandle>,
+    Query(query): Query<VectorQuery>,
+) -> Result<Json<Vec<Value>>, ApiError> {
     debug_assert!(!VECTOR_PATH.is_empty());
     let params = query.into_params()?;
-    let rows = vector(&params).await.map_err(ApiError::from)?;
+    let rows = state.search.vector(params).await.map_err(ApiError::from)?;
     Ok(Json(rows))
 }
 
-async fn hybrid_search(Query(query): Query<HybridQuery>) -> Result<Json<Vec<Value>>, ApiError> {
+async fn hybrid_search(
+    Extension(state): Extension<ApiStateHandle>,
+    Query(query): Query<HybridQuery>,
+) -> Result<Json<Vec<Value>>, ApiError> {
     debug_assert!(!HYBRID_PATH.is_empty());
     let params = query.into_params()?;
-    let rows = hybrid(&params).await.map_err(ApiError::from)?;
+    let rows = state.search.hybrid(params).await.map_err(ApiError::from)?;
     Ok(Json(rows))
 }
 

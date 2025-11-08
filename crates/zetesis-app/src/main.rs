@@ -30,33 +30,35 @@ use uuid::Uuid;
 use zetesis_app::cli::db_delete::DbDeleteArgs;
 use zetesis_app::cli::validators::validate_index_slug;
 use zetesis_app::cli::{
-    AuditArgs, AuditCommands, Cli, CliSilo, Commands, DEFAULT_KIO_SAOS_URL, DEFAULT_KIO_UZP_URL,
-    DbArgs, DbBackupArgs, DbCommands, DbFindArgs, DbGetArgs, DbPurgeArgs, DbRecoverArgs,
-    DbStatsArgs, FetchKioArgs, GenModeArg, HybridFusionArg, HybridSearchArgs, IngestArgs, JobsArgs,
-    JobsCommands, JobsGenArgs, JobsGenCommands, JobsGenFetchArgs, JobsGenSubmitArgs, JobsReapArgs,
-    JobsStatusArgs, KeywordSearchArgs, KioSource, SearchArgs, SearchCommands, SiloArgs,
-    SiloCommands, SiloCreateArgs, SourceArgs, SourceCommands, SourceKioCommands,
-    StructuredAuditArgs, SysArgs, SysCommands, SysDoctorArgs, SysInitArgs, VectorSearchArgs,
+    AuditArgs, AuditCommands, Cli, CliSilo, Commands, DbArgs, DbBackupArgs, DbCommands,
+    DbCreateArgs, DbFindArgs, DbGetArgs, DbPurgeArgs, DbRecoverArgs, DbStatsArgs, FetchKioArgs,
+    GenModeArg, HybridFusionArg, HybridSearchArgs, IngestArgs, JobsArgs, JobsCommands, JobsGenArgs,
+    JobsGenCommands, JobsGenFetchArgs, JobsGenSubmitArgs, JobsReapArgs, JobsStatusArgs,
+    KeywordSearchArgs, KioSource, SearchArgs, SearchCommands, SiloArgs, SiloCommands,
+    SiloCreateArgs, SourceArgs, SourceCommands, SourceKioCommands, StructuredAuditArgs, SysArgs,
+    SysCommands, SysDoctorArgs, SysInitArgs, VectorSearchArgs,
 };
 #[cfg(feature = "cli-debug")]
 use zetesis_app::cli::{DebugArgs, DebugCommands};
 use zetesis_app::error::AppError;
 use zetesis_app::index::deleter::DocumentDeleter;
 use zetesis_app::index::milli::{ensure_index, open_existing_index};
+use zetesis_app::ingestion::kio_saos::DEFAULT_KIO_SAOS_URL;
+use zetesis_app::ingestion::kio_uzp::DEFAULT_KIO_UZP_URL;
 use zetesis_app::ingestion::{
     KioEvent, KioSaosScraper, KioScrapeOptions, KioScraperSummary, KioUzpScraper,
 };
 use zetesis_app::pdf::extract_text_from_pdf;
 use zetesis_app::pipeline::structured::StructuredDecision;
 use zetesis_app::services::{
-    EmbedBatchTask, GeminiBatchStructuredClient, GenerationJob, GenerationJobStatus,
-    GenerationJobStore, GenerationMode, GenerationProviderKind, HYBRID_DEFAULT_RRF_K,
-    HYBRID_PER_SOURCE_LIMIT_MAX, HybridFusion, HybridSearchParams, KeywordSearchParams,
-    MilliActorHandle, PipelineContext, PipelineError, ProviderJobState, StructuredBatchInput,
-    StructuredBatchRequest, StructuredExtractor, StructuredJobClient, VectorSearchParams,
-    build_pipeline_context, decision_content_hash, hybrid, index_structured_with_embeddings,
-    keyword, normalize_hybrid_weights, normalize_index_name, open_index_read_only, project_value,
-    resolve_index_dir, vector,
+    DefaultSearchProvider, EmbedBatchTask, GeminiBatchStructuredClient, GenerationJob,
+    GenerationJobStatus, GenerationJobStore, GenerationMode, GenerationProviderKind,
+    HYBRID_DEFAULT_RRF_K, HYBRID_PER_SOURCE_LIMIT_MAX, HybridFusion, HybridSearchParams,
+    KeywordSearchParams, MilliActorHandle, PipelineContext, PipelineError, ProviderJobState,
+    StructuredBatchInput, StructuredBatchRequest, StructuredExtractor, StructuredJobClient,
+    VectorSearchParams, build_pipeline_context, decision_content_hash, hybrid,
+    index_structured_with_embeddings, keyword, normalize_hybrid_weights, normalize_index_name,
+    open_index_read_only, project_value, resolve_index_dir, vector,
 };
 use zetesis_app::text::cleanup_text;
 use zetesis_app::{config, ingestion, paths::AppPaths, pipeline::Silo, server};
@@ -186,7 +188,8 @@ async fn run(cli: Cli) -> Result<(), AppError> {
 
 async fn serve_command() -> Result<(), AppError> {
     let cfg = config::load()?;
-    server::serve(cfg).await?;
+    let search = Arc::new(DefaultSearchProvider::new());
+    server::serve(cfg.server, search).await?;
     Ok(())
 }
 
@@ -2061,6 +2064,7 @@ fn run_silo(silo: CliSilo, args: SiloArgs) -> Result<(), AppError> {
 
 async fn run_db(silo: CliSilo, args: DbArgs) -> Result<(), AppError> {
     match args.command {
+        DbCommands::Create(sub) => db_create(sub, silo)?,
         DbCommands::List => db_list()?,
         DbCommands::Stats(sub) => db_stats(sub, silo)?,
         DbCommands::Get(sub) => db_get(sub, silo)?,
@@ -2176,6 +2180,39 @@ async fn search_hybrid(silo: CliSilo, args: HybridSearchArgs) -> Result<(), AppE
     };
     let rows = hybrid(&params).await?;
     emit_json_rows(&rows, pretty)?;
+    Ok(())
+}
+
+fn db_create(args: DbCreateArgs, cli_silo: CliSilo) -> Result<(), AppError> {
+    let index_slug = resolve_index(args.index, cli_silo, "db create")?;
+    let index_name = normalize_index_name(&index_slug)?;
+    debug_assert!(!index_name.is_empty());
+
+    let paths = AppPaths::from_project_dirs()?;
+    let base = paths.milli_base_dir()?;
+    let target = base.join(&index_name);
+
+    // Check if index already exists
+    if target.is_dir() && !args.force {
+        return Err(AppError::Storage(format!(
+            "index `{}` already exists at {}. Use --force to overwrite.",
+            index_name,
+            target.display()
+        )));
+    }
+
+    // If force flag is set and index exists, remove it first
+    if target.is_dir() && args.force {
+        fs::remove_dir_all(&target).map_err(|e| io_error(&target, e))?;
+    }
+
+    // Create the index
+    ensure_index(&paths, &index_slug, &args.embed_model, args.embed_dim)?;
+
+    println!(
+        "index `{}` created with embedder `{}` (dimensionality: {})",
+        index_name, args.embed_model, args.embed_dim
+    );
     Ok(())
 }
 

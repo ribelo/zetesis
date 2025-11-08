@@ -7,6 +7,6 @@ pub mod ingestion;
 pub mod paths;
 pub mod pdf;
 pub mod pipeline;
-pub mod server;
 pub mod services;
 pub mod text;
+pub use zetesis_server as server;

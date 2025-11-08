@@ -1,17 +1,16 @@
 [workspace]
 members = [
-    "crates/zetesis-app",
+    "crates/zetesis-app", "crates/zetesis-server",
 ]
 resolver = "2"
 
 [workspace.package]
 edition = "2024"
 license = "MIT"
-rust-version = "1.82"
+rust-version = "1.85"
 
 [workspace.dependencies]
 ai-ox = { path = "../ai-ox/crates/ai-ox" }
-deepinfra-ox = { path = "../ai-ox/crates/deepinfra-ox" }
 gemini-ox = { path = "../ai-ox/crates/gemini-ox" }
 async-stream = "0.3.5"
 async-trait = "0.1.88"
@@ -69,3 +68,5 @@ uuid = { version = "1.7.0", features = ["serde", "v7"] }
 indicatif = "0.17.9"
 icu_segmenter = { version = "2.0.0", default-features = false, features = ["compiled_data"] }
 image = { version = "0.25.4", default-features = false, features = ["png", "jpeg"] }
+tower-http = { version = "0.5", features = ["trace", "request-id", "cors", "add-extension"] }
+moka = { version = "0.12", features = ["future"] }
