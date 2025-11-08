@@ -32,7 +32,36 @@ Zetesis is a lightweight SaaS for full-text and similarity search over documents
 ## 5. Interfaces
 - **HTTP API**: Axum routes for search, document management, and health checks. Use Tower middleware for tracing and auth when defined.
 - **CLI**: Clap commands for operational tasks (document ingestion, scrapers, migrations, job orchestration). Notable flows: `ingest --gen-mode sync|batch` (legacy `--batch` prints a deprecation warning and forwards to `--gen-mode batch`), `jobs status`, `jobs gen submit|gen fetch`, and `jobs reap`.
-- **Web UI**: TBD (Svelte vs Dioxus). Scaffold will reserve a `web/` entry point once the framework decision is made.
+- **Web UI**: Dioxus 0.7.1 with SSR + Islands architecture, served under `/ui/*` routes separate from `/v1/*` API routes.
+
+## 5.1 Web UI Architecture (Dioxus 0.7.1 + SSR + Islands)
+
+### Technology Stack
+- **Framework**: Dioxus 0.7.1 with SSR and Web features
+- **Server**: Axum 0.8 integration via `dioxus-fullstack`
+- **CSS**: Native Tailwind CSS support via dx-cli 0.7
+- **Components**: Dioxus first-party primitives (Radix-like headless components)
+
+### Crate Structure
+```
+crates/
+├── zetesis-ui/          # Dioxus UI components (SSR + Web features)
+├── zetesis-server/      # Axum 0.8 server (API + SSR serving)
+├── zetesis-shared/      # Shared types, utilities, API types
+└── zetesis-app/         # Main binary (minimal launcher)
+```
+
+### Architecture Pattern
+- **SSR Strategy**: Server-side rendering with selective hydration
+- **Islands Pattern**: Only interactive components get client-side JavaScript
+- **Bundle Optimization**: ≤ 150 KiB gzipped initial bundle size limit
+- **Asset Pipeline**: Static asset optimization with fingerprinting and caching
+
+### Performance Targets
+- **Bundle Size**: ≤ 150 KiB gzipped for initial page load
+- **Time to Interactive**: ≤ 100ms for typeahead functionality
+- **First Contentful Paint**: ≤ 1.5s on 3G connection
+- **Hydration Time**: ≤ 50ms for individual islands
 
 ## 6. Observability & Operations
 - Use `tracing` + `tracing-subscriber` for structured logs; default to info level.
